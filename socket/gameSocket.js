@@ -4,7 +4,7 @@ const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
 
-const activeRooms = new Map();
+const activeRooms = new Map(); 
 
 module.exports = (io) => {
   io.use(async (socket, next) => {
