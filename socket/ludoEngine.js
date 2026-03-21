@@ -1,14 +1,11 @@
 const BOARD_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH;
-
 const START_POSITIONS = {
   red: 0,
   blue: 26
 };
-
 const SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
-
 const HOME_ENTRY = {
   red: 51,
   blue: 25
@@ -18,7 +15,6 @@ class LudoEngine {
   static getGlobalPosition(color, progress) {
     if (progress < 0) return -1;
     if (progress > TOTAL_PATH) return 57;
-
     const start = START_POSITIONS[color];
     if (progress <= BOARD_PATH_LENGTH - 1) {
       return (start + progress) % BOARD_PATH_LENGTH;
@@ -37,7 +33,10 @@ class LudoEngine {
     tokens.forEach((token, index) => {
       if (token.isFinished) return;
 
-      const progress = token.position;
+      // ✅ Fix: safely get position
+      const progress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
+        ? token.position
+        : -1;
 
       if (progress === -1) {
         if (diceRoll === 6) {
@@ -83,11 +82,26 @@ class LudoEngine {
   }
 
   static applyMove(playerState, opponentState, tokenIndex, diceRoll) {
-    const newPlayerTokens = playerState.tokens.map(t => ({ ...t }));
-    const newOpponentTokens = opponentState.tokens.map(t => ({ ...t }));
+    // ✅ Fix: properly extract values from Mongoose subdocuments
+    const newPlayerTokens = playerState.tokens.map(t => ({
+      position: (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1,
+      isHome: t.isHome ?? true,
+      isFinished: t.isFinished ?? false
+    }));
+
+    const newOpponentTokens = opponentState.tokens.map(t => ({
+      position: (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1,
+      isHome: t.isHome ?? true,
+      isFinished: t.isFinished ?? false
+    }));
 
     const token = newPlayerTokens[tokenIndex];
-    const oldProgress = token.position;
+
+    // ✅ Fix: safely get oldProgress
+    const oldProgress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
+      ? token.position
+      : -1;
+
     const newProgress = oldProgress === -1 ? 0 : oldProgress + diceRoll;
 
     token.position = newProgress;
@@ -97,6 +111,7 @@ class LudoEngine {
     let gameOver = false;
 
     const newGlobalPos = this.getGlobalPosition(playerState.color, newProgress);
+
     if (typeof newGlobalPos === 'number' && !SAFE_SQUARES.has(newGlobalPos)) {
       newOpponentTokens.forEach(opToken => {
         if (!opToken.isFinished && opToken.position >= 0) {
