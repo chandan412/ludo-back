@@ -4,7 +4,7 @@ const gameRoutes = require('./routes/game');
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings'); // ✅ NEW
 
-// ... rest of code ...
+// ... rest of code ..
 
 app.use('/api/auth', authRoutes);
 app.use('/api/wallet', walletRoutes);
