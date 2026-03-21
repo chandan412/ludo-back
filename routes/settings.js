@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
 const { adminAuth } = require('../middleware/auth');
-
+ 
 // Simple Setting schema
 const settingSchema = new mongoose.Schema({
   key: { type: String, unique: true },
