@@ -376,26 +376,3 @@ function sanitizeGame(game, userId) {
     isMyTurn: gameObj.currentTurn?.toString() === userId?.toString()
   };
 }
-```
-
-Click **"Commit changes"** → **"Commit directly to main"** → **"Commit changes"** ✅
-
----
-
-## 🎉 Backend is DONE!
-
-Your `ludo-backend` repo now has all 13 files:
-```
-package.json
-server.js
-railway.json
-middleware/auth.js
-models/User.js
-models/Transaction.js
-models/Game.js
-routes/auth.js
-routes/wallet.js
-routes/game.js
-routes/admin.js
-socket/ludoEngine.js
-socket/gameSocket.js
