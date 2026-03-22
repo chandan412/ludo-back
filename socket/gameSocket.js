@@ -4,7 +4,7 @@ const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
 
-const activeRooms = new Map(); 
+const activeRooms = new Map();
 
 module.exports = (io) => {
   io.use(async (socket, next) => {
@@ -70,14 +70,16 @@ module.exports = (io) => {
           game.consecutiveSixes = 0;
         }
 
-        const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
-        const playerState = game.players[playerIdx];
+        const playerState   = game.players[playerIdx];
         const opponentState = game.players[opponentIdx];
 
+        // 3 consecutive sixes — forfeit turn instantly
         if (game.consecutiveSixes >= 3) {
           game.consecutiveSixes = 0;
           game.currentTurn = opponentState.user._id;
+          game.lastDiceRoll = null;
           await game.save();
           io.to(roomCode).emit('dice-rolled', {
             diceRoll,
@@ -85,34 +87,54 @@ module.exports = (io) => {
             playerUsername: socket.user.username,
             consecutiveSixes: true,
             message: '3 consecutive sixes! Turn forfeited.',
-            nextTurn: opponentState.user._id
+            nextTurn: opponentState.user._id.toString(),
+            hasValidMoves: false,
           });
           return;
         }
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
+
+        // ✅ If no valid moves — pass turn INSTANTLY (no setTimeout)
+        if (validMoves.length === 0) {
+          game.currentTurn  = opponentState.user._id;
+          game.lastDiceRoll = null;
+          await game.save();
+
+          // Tell both players dice result + that turn is passing immediately
+          io.to(roomCode).emit('dice-rolled', {
+            diceRoll,
+            playerId: socket.user._id,
+            playerUsername: socket.user.username,
+            validMoves: [],
+            hasValidMoves: false,
+            currentTurn: game.currentTurn.toString(),
+          });
+
+          // ✅ Emit turn-passed immediately — no delay
+          io.to(roomCode).emit('turn-passed', {
+            reason: 'No valid moves',
+            nextTurn: opponentState.user._id.toString(),
+            nextTurnUsername: opponentState.user.username,
+          });
+          return;
+        }
+
         await game.save();
 
         io.to(roomCode).emit('dice-rolled', {
           diceRoll,
           playerId: socket.user._id,
           playerUsername: socket.user.username,
-          validMoves: validMoves.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
-          hasValidMoves: validMoves.length > 0,
-          currentTurn: game.currentTurn
+          validMoves: validMoves.map(m => ({
+            tokenIndex: m.tokenIndex,
+            newProgress: m.newProgress,
+            canCapture: m.canCapture,
+          })),
+          hasValidMoves: true,
+          currentTurn: game.currentTurn.toString(),
         });
 
-        if (validMoves.length === 0) {
-          game.currentTurn = opponentState.user._id;
-          await game.save();
-          setTimeout(() => {
-            io.to(roomCode).emit('turn-passed', {
-              reason: 'No valid moves',
-              nextTurn: opponentState.user._id,
-              nextTurnUsername: opponentState.user.username
-            });
-          }, 1000);
-        }
       } catch (err) {
         console.error('roll-dice error:', err);
         socket.emit('error', { message: 'Server error' });
@@ -133,9 +155,9 @@ module.exports = (io) => {
         if (game.lastDiceRoll === null)
           return socket.emit('error', { message: 'Roll dice first' });
 
-        const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
-        const playerState = game.players[playerIdx];
+        const playerState   = game.players[playerIdx];
         const opponentState = game.players[opponentIdx];
 
         const validMoves = LudoEngine.getValidMoves(playerState, game.lastDiceRoll, opponentState);
@@ -144,53 +166,61 @@ module.exports = (io) => {
 
         const result = LudoEngine.applyMove(playerState, opponentState, tokenIndex, game.lastDiceRoll);
 
-        game.players[playerIdx].tokens = result.newPlayerTokens;
+        game.players[playerIdx].tokens       = result.newPlayerTokens;
         game.players[playerIdx].finishedTokens = result.finishedCount;
-        game.players[opponentIdx].tokens = result.newOpponentTokens;
+        game.players[opponentIdx].tokens     = result.newOpponentTokens;
 
         game.moveHistory.push({
           player: socket.user._id,
           dice: game.lastDiceRoll,
           tokenIndex,
           fromPosition: move.currentProgress,
-          toPosition: move.newProgress
+          toPosition:   move.newProgress,
         });
 
         game.lastDiceRoll = null;
 
         const moveData = {
-          playerId: socket.user._id,
+          playerId: socket.user._id.toString(),
           playerUsername: socket.user.username,
           tokenIndex,
           fromProgress: move.currentProgress,
-          toProgress: move.newProgress,
-          captured: result.captured,
-          extraTurn: result.extraTurn,
-          finishedCount: result.finishedCount
+          toProgress:   move.newProgress,
+          captured:     result.captured,
+          extraTurn:    result.extraTurn,
+          finishedCount: result.finishedCount,
         };
 
+        // ✅ GAME OVER — emit to ENTIRE room so BOTH players see result
         if (result.gameOver) {
-          game.status = 'finished';
-          game.winner = socket.user._id;
-          game.loser = opponentState.user._id;
+          game.status     = 'finished';
+          game.winner     = socket.user._id;
+          game.loser      = opponentState.user._id;
           game.finishedAt = new Date();
 
-          const pot = game.betAmount * 2;
+          const pot         = game.betAmount * 2;
           const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
-          const winAmount = pot - platformFee;
-          game.winAmount = winAmount;
-          game.platformFee = platformFee;
+          const winAmount   = pot - platformFee;
+          game.winAmount    = winAmount;
+          game.platformFee  = platformFee;
 
           await game.save();
           await settleGame(game, socket.user._id, opponentState.user._id, winAmount, platformFee);
 
+          // ✅ io.to(roomCode) sends to ALL players in room — winner AND loser
           io.to(roomCode).emit('game-over', {
             ...moveData,
-            winner: { id: socket.user._id, username: socket.user.username },
-            loser: { id: opponentState.user._id, username: opponentState.user.username },
+            winner: {
+              id:       socket.user._id.toString(),
+              username: socket.user.username,
+            },
+            loser: {
+              id:       opponentState.user._id.toString(),
+              username: opponentState.user.username,
+            },
             winAmount,
             platformFee,
-            pot
+            pot,
           });
           return;
         }
@@ -198,7 +228,7 @@ module.exports = (io) => {
         if (result.extraTurn) {
           game.currentTurn = socket.user._id;
         } else {
-          game.currentTurn = opponentState.user._id;
+          game.currentTurn      = opponentState.user._id;
           game.consecutiveSixes = 0;
         }
 
@@ -208,16 +238,20 @@ module.exports = (io) => {
           ...moveData,
           gameState: {
             players: game.players.map(p => ({
-              userId: p.user._id,
-              username: p.user.username,
-              color: p.color,
-              tokens: p.tokens,
-              finishedTokens: p.finishedTokens
+              userId:         p.user._id.toString(),
+              username:       p.user.username,
+              color:          p.color,
+              tokens:         p.tokens,
+              finishedTokens: p.finishedTokens,
             })),
-            currentTurn: game.currentTurn,
-            nextTurnUsername: result.extraTurn ? socket.user.username : opponentState.user.username
-          }
+            // ✅ Always send currentTurn as plain string
+            currentTurn:     game.currentTurn.toString(),
+            nextTurnUsername: result.extraTurn
+              ? socket.user.username
+              : opponentState.user.username,
+          },
         });
+
       } catch (err) {
         console.error('move-token error:', err);
         socket.emit('error', { message: 'Server error' });
@@ -231,7 +265,7 @@ module.exports = (io) => {
       try {
         const game = await Game.findOne({
           roomCode: socket.currentRoom,
-          status: 'active'
+          status: 'active',
         }).populate('players.user', 'username');
 
         if (!game) return;
@@ -244,28 +278,30 @@ module.exports = (io) => {
 
         socket.to(socket.currentRoom).emit('player-disconnected', {
           username: socket.user.username,
-          message: `${socket.user.username} disconnected. Waiting 60 seconds for reconnect...`
+          message:  `${socket.user.username} disconnected. Waiting 60 seconds for reconnect...`,
         });
 
         const timer = setTimeout(async () => {
           const freshGame = await Game.findOne({ roomCode: socket.currentRoom, status: 'active' });
           if (!freshGame) return;
 
-          const disconnectedIdx = freshGame.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+          const disconnectedIdx = freshGame.players.findIndex(
+            p => p.user._id.toString() === socket.user._id.toString()
+          );
           if (disconnectedIdx === -1 || freshGame.players[disconnectedIdx].isConnected) return;
 
           const opponentIdx = disconnectedIdx === 0 ? 1 : 0;
-          const winnerId = freshGame.players[opponentIdx].user;
-          const loserId = socket.user._id;
+          const winnerId    = freshGame.players[opponentIdx].user;
+          const loserId     = socket.user._id;
 
-          const pot = freshGame.betAmount * 2;
+          const pot         = freshGame.betAmount * 2;
           const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
-          const winAmount = pot - platformFee;
+          const winAmount   = pot - platformFee;
 
-          freshGame.status = 'finished';
-          freshGame.winner = winnerId;
-          freshGame.loser = loserId;
-          freshGame.winAmount = winAmount;
+          freshGame.status     = 'finished';
+          freshGame.winner     = winnerId;
+          freshGame.loser      = loserId;
+          freshGame.winAmount  = winAmount;
           freshGame.platformFee = platformFee;
           freshGame.finishedAt = new Date();
           await freshGame.save();
@@ -273,11 +309,11 @@ module.exports = (io) => {
           await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
 
           io.to(socket.currentRoom).emit('game-over', {
-            reason: 'opponent_disconnected',
-            winner: { id: winnerId },
-            loser: { id: loserId, username: socket.user.username },
+            reason:  'opponent_disconnected',
+            winner:  { id: winnerId.toString() },
+            loser:   { id: loserId.toString(), username: socket.user.username },
             winAmount,
-            message: `${socket.user.username} disconnected. You win!`
+            message: `${socket.user.username} disconnected. You win!`,
           });
         }, 60000);
 
@@ -298,7 +334,9 @@ module.exports = (io) => {
       const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
       if (!game) return;
 
-      const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+      const playerIdx = game.players.findIndex(
+        p => p.user._id.toString() === socket.user._id.toString()
+      );
       if (playerIdx !== -1) {
         game.players[playerIdx].isConnected = true;
         await game.save();
@@ -314,19 +352,20 @@ module.exports = (io) => {
 async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
   try {
     const winner = await User.findById(winnerId);
-    const loser = await User.findById(loserId);
+    const loser  = await User.findById(loserId);
 
     winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
-    loser.lockedBalance = Math.max(0, loser.lockedBalance - game.betAmount);
-    loser.balance = Math.max(0, loser.balance - game.betAmount);
+    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
+    loser.balance        = Math.max(0, loser.balance - game.betAmount);
 
     const winnerBalanceBefore = winner.balance;
-    winner.balance += winAmount;
-    winner.gamesWon += 1;
-    winner.totalEarned += winAmount;
-    loser.gamesPlayed += 1;
+    const netWin = game.betAmount - platformFee;
+    winner.balance    += netWin;
+    winner.gamesWon   += 1;
     winner.gamesPlayed += 1;
-    loser.totalLost += game.betAmount;
+    winner.totalEarned += netWin;
+    loser.gamesPlayed  += 1;
+    loser.totalLost    += game.betAmount;
 
     await winner.save();
     await loser.save();
@@ -334,11 +373,11 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
     await Transaction.create({
       user: winnerId,
       type: 'game_win',
-      amount: winAmount,
+      amount: netWin,
       balanceBefore: winnerBalanceBefore,
-      balanceAfter: winner.balance,
+      balanceAfter:  winner.balance,
       status: 'completed',
-      gameId: game._id
+      gameId: game._id,
     });
 
     const loserBalanceBefore = loser.balance + game.betAmount;
@@ -347,9 +386,9 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
       type: 'game_loss',
       amount: game.betAmount,
       balanceBefore: loserBalanceBefore,
-      balanceAfter: loser.balance,
+      balanceAfter:  loser.balance,
       status: 'completed',
-      gameId: game._id
+      gameId: game._id,
     });
 
     await Transaction.create({
@@ -357,12 +396,12 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
       type: 'platform_fee',
       amount: platformFee,
       balanceBefore: winner.balance,
-      balanceAfter: winner.balance,
+      balanceAfter:  winner.balance,
       status: 'completed',
-      gameId: game._id
+      gameId: game._id,
     });
 
-    console.log(`Game settled: Winner ${winner.username} +₹${winAmount}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
+    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
   } catch (err) {
     console.error('Game settlement error:', err);
   }
@@ -372,7 +411,8 @@ function sanitizeGame(game, userId) {
   const gameObj = game.toObject ? game.toObject() : game;
   return {
     ...gameObj,
+    // ✅ Always return currentTurn as plain string
+    currentTurn: gameObj.currentTurn?.toString(),
     myColor: gameObj.players.find(p => p.user._id?.toString() === userId?.toString())?.color,
-    isMyTurn: gameObj.currentTurn?.toString() === userId?.toString()
   };
 }
