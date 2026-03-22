@@ -29,6 +29,21 @@ router.get('/lobby', auth, async (req, res) => {
   }
 });
 
+// ✅ GET /api/game/my-active-game — Check if player has an active game to rejoin
+router.get('/my-active-game', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      'players.user': req.user._id,
+      status: 'active'
+    }).populate('players.user', 'username');
+
+    if (!game) return res.status(404).json(null);
+    res.json(game);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // POST /api/game/create
 router.post('/create', auth, async (req, res) => {
   try {
