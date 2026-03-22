@@ -1,25 +1,22 @@
 const BOARD_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
-const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH;
-const START_POSITIONS = {
-  red: 0,
-  blue: 26
-};
+const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 58
+const START_POSITIONS = { red: 0, blue: 26 };
 const SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
-const HOME_ENTRY = {
-  red: 51,
-  blue: 25
-};
 
 class LudoEngine {
+
+  // ✅ FIXED: progress is 1-indexed (1=first square, 58=finished)
+  // progress 1 → array index 0, progress 2 → index 1, etc.
   static getGlobalPosition(color, progress) {
-    if (progress < 0) return -1;
-    if (progress > TOTAL_PATH) return 57;
+    if (progress <= 0) return -1;
+    if (progress > TOTAL_PATH) return TOTAL_PATH + 1;
+    const idx = progress - 1; // 1-indexed → 0-indexed
     const start = START_POSITIONS[color];
-    if (progress <= BOARD_PATH_LENGTH - 1) {
-      return (start + progress) % BOARD_PATH_LENGTH;
+    if (idx < BOARD_PATH_LENGTH) {
+      return (start + idx) % BOARD_PATH_LENGTH;
     }
-    return `home_${color}_${progress - BOARD_PATH_LENGTH}`;
+    return `home_${color}_${idx - BOARD_PATH_LENGTH}`;
   }
 
   static rollDice() {
@@ -33,18 +30,17 @@ class LudoEngine {
     tokens.forEach((token, index) => {
       if (token.isFinished) return;
 
-      // ✅ Fix: safely get position
       const progress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
-        ? token.position
-        : -1;
+        ? token.position : -1;
 
       if (progress === -1) {
         if (diceRoll === 6) {
+          // ✅ FIXED: exit home = position 1 (first square on board)
           validMoves.push({
             tokenIndex: index,
             currentProgress: -1,
-            newProgress: 0,
-            canCapture: this.canCapture(0, color, opponentState),
+            newProgress: 1,
+            canCapture: this.canCapture(this.getGlobalPosition(color, 1), color, opponentState),
             willFinish: false
           });
         }
@@ -56,7 +52,8 @@ class LudoEngine {
 
       const willFinish = newProgress === TOTAL_PATH;
       const newGlobalPos = this.getGlobalPosition(color, newProgress);
-      const canCapture = !willFinish && typeof newGlobalPos === 'number' &&
+      const canCapture = !willFinish &&
+        typeof newGlobalPos === 'number' &&
         !SAFE_SQUARES.has(newGlobalPos) &&
         this.canCapture(newGlobalPos, color, opponentState);
 
@@ -82,7 +79,6 @@ class LudoEngine {
   }
 
   static applyMove(playerState, opponentState, tokenIndex, diceRoll) {
-    // ✅ Fix: properly extract values from Mongoose subdocuments
     const newPlayerTokens = playerState.tokens.map(t => ({
       position: (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1,
       isHome: t.isHome ?? true,
@@ -96,13 +92,11 @@ class LudoEngine {
     }));
 
     const token = newPlayerTokens[tokenIndex];
-
-    // ✅ Fix: safely get oldProgress
     const oldProgress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
-      ? token.position
-      : -1;
+      ? token.position : -1;
 
-    const newProgress = oldProgress === -1 ? 0 : oldProgress + diceRoll;
+    // ✅ FIXED: exit home → position 1 (not 0)
+    const newProgress = oldProgress === -1 ? 1 : oldProgress + diceRoll;
 
     token.position = newProgress;
     token.isHome = false;
