@@ -7,6 +7,8 @@ const { auth } = require('../middleware/auth');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
+// ✅ ALL specific named routes MUST come before /:roomCode
+
 // GET /api/game/lobby
 router.get('/lobby', auth, async (req, res) => {
   try {
@@ -18,7 +20,6 @@ router.get('/lobby', auth, async (req, res) => {
       if (maxBet) query.betAmount.$lte = parseInt(maxBet);
     }
     query.createdBy = { $ne: req.user._id };
-
     const games = await Game.find(query)
       .populate('createdBy', 'username gamesPlayed gamesWon')
       .sort({ createdAt: -1 })
@@ -29,16 +30,32 @@ router.get('/lobby', auth, async (req, res) => {
   }
 });
 
-// ✅ GET /api/game/my-active-game — Check if player has an active game to rejoin
+// GET /api/game/my-active-game ✅ before /:roomCode
 router.get('/my-active-game', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
       'players.user': req.user._id,
       status: 'active'
     }).populate('players.user', 'username');
-
     if (!game) return res.status(404).json(null);
     res.json(game);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/game/my-games/history ✅ before /:roomCode
+router.get('/my-games/history', auth, async (req, res) => {
+  try {
+    const games = await Game.find({
+      'players.user': req.user._id,
+      status: { $in: ['finished', 'cancelled'] }
+    })
+      .populate('players.user', 'username')
+      .populate('winner', 'username')
+      .sort({ createdAt: -1 })
+      .limit(20);
+    res.json(games);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -134,24 +151,6 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/:roomCode
-router.get('/:roomCode', auth, async (req, res) => {
-  try {
-    const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase() })
-      .populate('players.user', 'username')
-      .populate('winner', 'username')
-      .populate('createdBy', 'username');
-    if (!game) return res.status(404).json({ message: 'Game not found' });
-
-    const isPlayer = game.players.some(p => p.user._id.toString() === req.user._id.toString());
-    if (!isPlayer) return res.status(403).json({ message: 'Not a player in this game' });
-
-    res.json(game);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
 // POST /api/game/cancel/:roomCode
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
@@ -172,18 +171,19 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-games/history
-router.get('/my-games/history', auth, async (req, res) => {
+// GET /api/game/:roomCode ✅ ALWAYS LAST — wildcard catches everything
+router.get('/:roomCode', auth, async (req, res) => {
   try {
-    const games = await Game.find({
-      'players.user': req.user._id,
-      status: { $in: ['finished', 'cancelled'] }
-    })
+    const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase() })
       .populate('players.user', 'username')
       .populate('winner', 'username')
-      .sort({ createdAt: -1 })
-      .limit(20);
-    res.json(games);
+      .populate('createdBy', 'username');
+    if (!game) return res.status(404).json({ message: 'Game not found' });
+
+    const isPlayer = game.players.some(p => p.user._id.toString() === req.user._id.toString());
+    if (!isPlayer) return res.status(403).json({ message: 'Not a player in this game' });
+
+    res.json(game);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
