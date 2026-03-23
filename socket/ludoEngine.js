@@ -6,17 +6,15 @@ const SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
 
 class LudoEngine {
 
-  // ✅ FIXED: progress is 1-indexed (1=first square, 58=finished)
-  // progress 1 → array index 0, progress 2 → index 1, etc.
+  // progress is 0-indexed (0 = first square, 57 = last home square)
   static getGlobalPosition(color, progress) {
-    if (progress <= 0) return -1;
-    if (progress > TOTAL_PATH) return TOTAL_PATH + 1;
-    const idx = progress - 1; // 1-indexed → 0-indexed
+    if (progress < 0) return -1;
+    if (progress >= TOTAL_PATH) return TOTAL_PATH;
     const start = START_POSITIONS[color];
-    if (idx < BOARD_PATH_LENGTH) {
-      return (start + idx) % BOARD_PATH_LENGTH;
+    if (progress < BOARD_PATH_LENGTH) {
+      return (start + progress) % BOARD_PATH_LENGTH;
     }
-    return `home_${color}_${idx - BOARD_PATH_LENGTH}`;
+    return `home_${color}_${progress - BOARD_PATH_LENGTH}`;
   }
 
   static rollDice() {
@@ -31,26 +29,27 @@ class LudoEngine {
       if (token.isFinished) return;
 
       const progress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
-        ? token.position : -1;
+        ? Number(token.position) : -1;
 
       if (progress === -1) {
+        // ✅ Exit home on dice=6 → goes to position 0 (first cell)
         if (diceRoll === 6) {
-          // ✅ FIXED: exit home = position 1 (first square on board)
           validMoves.push({
             tokenIndex: index,
             currentProgress: -1,
-            newProgress: 1,
-            canCapture: this.canCapture(this.getGlobalPosition(color, 1), color, opponentState),
+            newProgress: 0,
+            canCapture: this.canCapture(this.getGlobalPosition(color, 0), color, opponentState),
             willFinish: false
           });
         }
         return;
       }
 
+      // ✅ dice=N moves exactly N squares forward
       const newProgress = progress + diceRoll;
-      if (newProgress > TOTAL_PATH) return;
+      if (newProgress > TOTAL_PATH - 1) return; // can't overshoot
 
-      const willFinish = newProgress === TOTAL_PATH;
+      const willFinish = newProgress === TOTAL_PATH - 1;
       const newGlobalPos = this.getGlobalPosition(color, newProgress);
       const canCapture = !willFinish &&
         typeof newGlobalPos === 'number' &&
@@ -84,7 +83,6 @@ class LudoEngine {
       isHome: t.isHome ?? true,
       isFinished: t.isFinished ?? false
     }));
-
     const newOpponentTokens = opponentState.tokens.map(t => ({
       position: (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1,
       isHome: t.isHome ?? true,
@@ -93,10 +91,10 @@ class LudoEngine {
 
     const token = newPlayerTokens[tokenIndex];
     const oldProgress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
-      ? token.position : -1;
+      ? Number(token.position) : -1;
 
-    // ✅ FIXED: exit home → position 1 (not 0)
-    const newProgress = oldProgress === -1 ? 1 : oldProgress + diceRoll;
+    // ✅ Exit home → position 0. Normal move → position + dice
+    const newProgress = oldProgress === -1 ? 0 : oldProgress + diceRoll;
 
     token.position = newProgress;
     token.isHome = false;
@@ -119,8 +117,9 @@ class LudoEngine {
       });
     }
 
-    if (newProgress >= TOTAL_PATH) {
-      token.position = TOTAL_PATH;
+    // Finish if reached last cell
+    if (newProgress >= TOTAL_PATH - 1) {
+      token.position = TOTAL_PATH - 1;
       token.isFinished = true;
     }
 
@@ -129,14 +128,7 @@ class LudoEngine {
 
     const extraTurn = diceRoll === 6 || captured;
 
-    return {
-      newPlayerTokens,
-      newOpponentTokens,
-      captured,
-      extraTurn,
-      gameOver,
-      finishedCount
-    };
+    return { newPlayerTokens, newOpponentTokens, captured, extraTurn, gameOver, finishedCount };
   }
 
   static hasValidMoves(playerState, diceRoll, opponentState) {
