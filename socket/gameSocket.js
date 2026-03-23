@@ -1,418 +1,277 @@
 const Game = require('../models/Game');
 const User = require('../models/User');
-const Transaction = require('../models/Transaction');
-const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
+const LudoEngine = require('./ludoEngine');
 
 const activeRooms = new Map();
 
 module.exports = (io) => {
+
+  // ================= AUTH =================
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth.token;
-      if (!token) return next(new Error('Authentication required'));
+      if (!token) return next(new Error('Auth required'));
+
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       const user = await User.findById(decoded.id).select('-password');
+
       if (!user || user.isBanned) return next(new Error('Unauthorized'));
+
       socket.user = user;
       next();
-    } catch (err) {
+    } catch {
       next(new Error('Invalid token'));
     }
   });
 
   io.on('connection', (socket) => {
-    console.log(`User connected: ${socket.user.username} (${socket.id})`);
+    console.log(`✅ ${socket.user.username} connected`);
 
+    // ================= JOIN =================
     socket.on('join-room', async ({ roomCode }) => {
       try {
-        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
-          .populate('players.user', 'username gamesPlayed gamesWon');
+        roomCode = roomCode.toUpperCase();
 
-        if (!game) return socket.emit('error', { message: 'Game not found' });
+        // 🚫 Prevent multi-tab login
+        const sockets = await io.in(roomCode).fetchSockets();
+        if (sockets.find(s => s.user._id.toString() === socket.user._id.toString())) {
+          return socket.emit('error', { message: 'Already connected in another tab' });
+        }
 
-        const isPlayer = game.players.some(p => p.user._id.toString() === socket.user._id.toString());
-        if (!isPlayer) return socket.emit('error', { message: 'Not a player in this game' });
+        let game = activeRooms.get(roomCode);
+
+        if (!game) {
+          const dbGame = await Game.findOne({ roomCode })
+            .populate('players.user', 'username');
+
+          if (!dbGame) return socket.emit('error', { message: 'Game not found' });
+
+          game = dbGame.toObject();
+
+          // 🔒 Security + state
+          game.isProcessing = false;
+          game.expectedAction = 'roll';
+          game.actionId = 0;
+          game.lastEvents = [];
+          game.moveTimer = null;
+
+          activeRooms.set(roomCode, game);
+        }
 
         socket.join(roomCode);
         socket.currentRoom = roomCode;
 
-        const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-        game.players[playerIdx].isConnected = true;
-        await game.save();
-
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
-        socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
-        console.log(`${socket.user.username} joined room ${roomCode}`);
-      } catch (err) {
-        socket.emit('error', { message: 'Failed to join room' });
+        // 🔁 Replay events for recovery
+        game.lastEvents.forEach(e => {
+          socket.emit(e.type, e.payload);
+        });
+
+      } catch {
+        socket.emit('error', { message: 'Join failed' });
       }
     });
 
-    socket.on('roll-dice', async ({ roomCode }) => {
-      try {
-        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
-          .populate('players.user', 'username');
-
-        if (!game || game.status !== 'active')
-          return socket.emit('error', { message: 'Game not active' });
-
-        if (game.currentTurn.toString() !== socket.user._id.toString())
-          return socket.emit('error', { message: 'Not your turn' });
-
-        const diceRoll = LudoEngine.rollDice();
-        game.lastDiceRoll = diceRoll;
-
-        if (diceRoll === 6) {
-          game.consecutiveSixes = (game.consecutiveSixes || 0) + 1;
-        } else {
-          game.consecutiveSixes = 0;
-        }
-
-        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-        const opponentIdx = playerIdx === 0 ? 1 : 0;
-        const playerState   = game.players[playerIdx];
-        const opponentState = game.players[opponentIdx];
-
-        // 3 consecutive sixes — forfeit turn instantly
-        if (game.consecutiveSixes >= 3) {
-          game.consecutiveSixes = 0;
-          game.currentTurn = opponentState.user._id;
-          game.lastDiceRoll = null;
-          await game.save();
-          io.to(roomCode).emit('dice-rolled', {
-            diceRoll,
-            playerId: socket.user._id,
-            playerUsername: socket.user.username,
-            consecutiveSixes: true,
-            message: '3 consecutive sixes! Turn forfeited.',
-            nextTurn: opponentState.user._id.toString(),
-            hasValidMoves: false,
-          });
-          return;
-        }
-
-        const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
-
-        // ✅ If no valid moves — pass turn INSTANTLY (no setTimeout)
-        if (validMoves.length === 0) {
-          game.currentTurn  = opponentState.user._id;
-          game.lastDiceRoll = null;
-          await game.save();
-
-          // Tell both players dice result + that turn is passing immediately
-          io.to(roomCode).emit('dice-rolled', {
-            diceRoll,
-            playerId: socket.user._id,
-            playerUsername: socket.user.username,
-            validMoves: [],
-            hasValidMoves: false,
-            currentTurn: game.currentTurn.toString(),
-          });
-
-          // ✅ Emit turn-passed immediately — no delay
-          io.to(roomCode).emit('turn-passed', {
-            reason: 'No valid moves',
-            nextTurn: opponentState.user._id.toString(),
-            nextTurnUsername: opponentState.user.username,
-          });
-          return;
-        }
-
-        await game.save();
-
-        io.to(roomCode).emit('dice-rolled', {
-          diceRoll,
-          playerId: socket.user._id,
-          playerUsername: socket.user.username,
-          validMoves: validMoves.map(m => ({
-            tokenIndex: m.tokenIndex,
-            newProgress: m.newProgress,
-            canCapture: m.canCapture,
-          })),
-          hasValidMoves: true,
-          currentTurn: game.currentTurn.toString(),
-        });
-
-      } catch (err) {
-        console.error('roll-dice error:', err);
-        socket.emit('error', { message: 'Server error' });
-      }
-    });
-
-    socket.on('move-token', async ({ roomCode, tokenIndex }) => {
-      try {
-        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
-          .populate('players.user', 'username');
-
-        if (!game || game.status !== 'active')
-          return socket.emit('error', { message: 'Game not active' });
-
-        if (game.currentTurn.toString() !== socket.user._id.toString())
-          return socket.emit('error', { message: 'Not your turn' });
-
-        if (game.lastDiceRoll === null)
-          return socket.emit('error', { message: 'Roll dice first' });
-
-        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-        const opponentIdx = playerIdx === 0 ? 1 : 0;
-        const playerState   = game.players[playerIdx];
-        const opponentState = game.players[opponentIdx];
-
-        const validMoves = LudoEngine.getValidMoves(playerState, game.lastDiceRoll, opponentState);
-        const move = validMoves.find(m => m.tokenIndex === tokenIndex);
-        if (!move) return socket.emit('error', { message: 'Invalid move' });
-
-        const result = LudoEngine.applyMove(playerState, opponentState, tokenIndex, game.lastDiceRoll);
-
-        game.players[playerIdx].tokens       = result.newPlayerTokens;
-        game.players[playerIdx].finishedTokens = result.finishedCount;
-        game.players[opponentIdx].tokens     = result.newOpponentTokens;
-
-        game.moveHistory.push({
-          player: socket.user._id,
-          dice: game.lastDiceRoll,
-          tokenIndex,
-          fromPosition: move.currentProgress,
-          toPosition:   move.newProgress,
-        });
-
-        game.lastDiceRoll = null;
-
-        const moveData = {
-          playerId: socket.user._id.toString(),
-          playerUsername: socket.user.username,
-          tokenIndex,
-          fromProgress: move.currentProgress,
-          toProgress:   move.newProgress,
-          captured:     result.captured,
-          extraTurn:    result.extraTurn,
-          finishedCount: result.finishedCount,
-        };
-
-        // ✅ GAME OVER — emit to ENTIRE room so BOTH players see result
-        if (result.gameOver) {
-          game.status     = 'finished';
-          game.winner     = socket.user._id;
-          game.loser      = opponentState.user._id;
-          game.finishedAt = new Date();
-
-          const pot         = game.betAmount * 2;
-          const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
-          const winAmount   = pot - platformFee;
-          game.winAmount    = winAmount;
-          game.platformFee  = platformFee;
-
-          await game.save();
-          await settleGame(game, socket.user._id, opponentState.user._id, winAmount, platformFee);
-
-          // ✅ io.to(roomCode) sends to ALL players in room — winner AND loser
-          io.to(roomCode).emit('game-over', {
-            ...moveData,
-            winner: {
-              id:       socket.user._id.toString(),
-              username: socket.user.username,
-            },
-            loser: {
-              id:       opponentState.user._id.toString(),
-              username: opponentState.user.username,
-            },
-            winAmount,
-            platformFee,
-            pot,
-          });
-          return;
-        }
-
-        if (result.extraTurn) {
-          game.currentTurn = socket.user._id;
-        } else {
-          game.currentTurn      = opponentState.user._id;
-          game.consecutiveSixes = 0;
-        }
-
-        await game.save();
-
-        io.to(roomCode).emit('token-moved', {
-          ...moveData,
-          gameState: {
-            players: game.players.map(p => ({
-              userId:         p.user._id.toString(),
-              username:       p.user.username,
-              color:          p.color,
-              tokens:         p.tokens,
-              finishedTokens: p.finishedTokens,
-            })),
-            // ✅ Always send currentTurn as plain string
-            currentTurn:     game.currentTurn.toString(),
-            nextTurnUsername: result.extraTurn
-              ? socket.user.username
-              : opponentState.user.username,
-          },
-        });
-
-      } catch (err) {
-        console.error('move-token error:', err);
-        socket.emit('error', { message: 'Server error' });
-      }
-    });
-
-    socket.on('disconnect', async () => {
-      console.log(`User disconnected: ${socket.user.username}`);
-      if (!socket.currentRoom) return;
-
-      try {
-        const game = await Game.findOne({
-          roomCode: socket.currentRoom,
-          status: 'active',
-        }).populate('players.user', 'username');
-
-        if (!game) return;
-
-        const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-        if (playerIdx === -1) return;
-
-        game.players[playerIdx].isConnected = false;
-        await game.save();
-
-        socket.to(socket.currentRoom).emit('player-disconnected', {
-          username: socket.user.username,
-          message:  `${socket.user.username} disconnected. Waiting 60 seconds for reconnect...`,
-        });
-
-        const timer = setTimeout(async () => {
-          const freshGame = await Game.findOne({ roomCode: socket.currentRoom, status: 'active' });
-          if (!freshGame) return;
-
-          const disconnectedIdx = freshGame.players.findIndex(
-            p => p.user._id.toString() === socket.user._id.toString()
-          );
-          if (disconnectedIdx === -1 || freshGame.players[disconnectedIdx].isConnected) return;
-
-          const opponentIdx = disconnectedIdx === 0 ? 1 : 0;
-          const winnerId    = freshGame.players[opponentIdx].user;
-          const loserId     = socket.user._id;
-
-          const pot         = freshGame.betAmount * 2;
-          const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
-          const winAmount   = pot - platformFee;
-
-          freshGame.status     = 'finished';
-          freshGame.winner     = winnerId;
-          freshGame.loser      = loserId;
-          freshGame.winAmount  = winAmount;
-          freshGame.platformFee = platformFee;
-          freshGame.finishedAt = new Date();
-          await freshGame.save();
-
-          await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
-
-          io.to(socket.currentRoom).emit('game-over', {
-            reason:  'opponent_disconnected',
-            winner:  { id: winnerId.toString() },
-            loser:   { id: loserId.toString(), username: socket.user.username },
-            winAmount,
-            message: `${socket.user.username} disconnected. You win!`,
-          });
-        }, 60000);
-
-        if (!activeRooms.has(socket.currentRoom)) activeRooms.set(socket.currentRoom, {});
-        activeRooms.get(socket.currentRoom).disconnectTimer = timer;
-      } catch (err) {
-        console.error('disconnect handler error:', err);
-      }
-    });
-
-    socket.on('reconnect-room', async ({ roomCode }) => {
-      const room = activeRooms.get(roomCode);
-      if (room?.disconnectTimer) {
-        clearTimeout(room.disconnectTimer);
-        room.disconnectTimer = null;
-      }
-
-      const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
+    // ================= ROLL DICE =================
+    socket.on('roll-dice', ({ roomCode, actionId }) => {
+      const game = activeRooms.get(roomCode);
       if (!game) return;
 
-      const playerIdx = game.players.findIndex(
-        p => p.user._id.toString() === socket.user._id.toString()
-      );
-      if (playerIdx !== -1) {
-        game.players[playerIdx].isConnected = true;
-        await game.save();
-        socket.join(roomCode);
-        socket.currentRoom = roomCode;
-        socket.emit('game-state', sanitizeGame(game, socket.user._id));
-        socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
+      if (game.isProcessing) return;
+      game.isProcessing = true;
+
+      // 🔒 Anti-cheat checks
+      if (game.expectedAction !== 'roll') {
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'Invalid flow' });
       }
+
+      if (actionId !== game.actionId) {
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'Outdated action' });
+      }
+
+      if (game.currentTurn !== socket.user._id.toString()) {
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'Not your turn' });
+      }
+
+      const diceRoll = LudoEngine.rollDice();
+      game.lastDiceRoll = diceRoll;
+
+      const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+      const opponentIdx = playerIdx === 0 ? 1 : 0;
+
+      const player = game.players[playerIdx];
+      const opponent = game.players[opponentIdx];
+
+      const validMoves = LudoEngine.getValidMoves(player, diceRoll, opponent);
+
+      game.expectedAction = 'move';
+      game.actionId++;
+
+      // ⏱️ Timeout
+      game.moveTimer = setTimeout(() => {
+        game.currentTurn = opponent.user._id.toString();
+        game.expectedAction = 'roll';
+        game.lastDiceRoll = null;
+
+        emitEvent(io, roomCode, game, 'turn-timeout', {
+          nextTurn: game.currentTurn
+        });
+      }, 15000);
+
+      emitEvent(io, roomCode, game, 'dice-rolled', {
+        diceRoll,
+        playerId: socket.user._id.toString(),
+        validMoves,
+        actionId: game.actionId
+      });
+
+      game.isProcessing = false;
     });
+
+    // ================= MOVE TOKEN =================
+    socket.on('move-token', ({ roomCode, tokenIndex, actionId }) => {
+      const game = activeRooms.get(roomCode);
+      if (!game) return;
+
+      if (game.isProcessing) return;
+      game.isProcessing = true;
+
+      clearTimeout(game.moveTimer);
+
+      // 🔒 Anti-cheat
+      if (game.expectedAction !== 'move') {
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'Roll dice first' });
+      }
+
+      if (actionId !== game.actionId) {
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'Outdated action' });
+      }
+
+      if (typeof tokenIndex !== 'number') {
+        game.isProcessing = false;
+        return;
+      }
+
+      if (!game.lastDiceRoll) {
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'No dice' });
+      }
+
+      const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+      const opponentIdx = playerIdx === 0 ? 1 : 0;
+
+      const player = game.players[playerIdx];
+      const opponent = game.players[opponentIdx];
+
+      // ✅ Server validation
+      const validMoves = LudoEngine.getValidMoves(player, game.lastDiceRoll, opponent);
+      const move = validMoves.find(m => m.tokenIndex === tokenIndex);
+
+      if (!move) {
+        console.log('🚨 Cheat attempt:', socket.user._id);
+        game.isProcessing = false;
+        return socket.emit('error', { message: 'Invalid move' });
+      }
+
+      const result = LudoEngine.applyMove(player, opponent, tokenIndex, game.lastDiceRoll);
+
+      game.lastDiceRoll = null;
+
+      if (!result.extraTurn) {
+        game.currentTurn = opponent.user._id.toString();
+        game.expectedAction = 'roll';
+      } else {
+        game.expectedAction = 'roll';
+      }
+
+      game.actionId++;
+
+      // 🏁 Game Over
+      if (result.gameOver) {
+        emitEvent(io, roomCode, game, 'game-over', {
+          winner: socket.user._id.toString()
+        });
+
+        activeRooms.delete(roomCode);
+        game.isProcessing = false;
+        return;
+      }
+
+      emitEvent(io, roomCode, game, 'token-moved', {
+        playerId: socket.user._id.toString(),
+        tokenIndex,
+        gameState: game,
+        actionId: game.actionId
+      });
+
+      game.isProcessing = false;
+    });
+
+    // ================= DISCONNECT =================
+    socket.on('disconnect', () => {
+      const roomCode = socket.currentRoom;
+      if (!roomCode) return;
+
+      const game = activeRooms.get(roomCode);
+      if (!game) return;
+
+      const userId = socket.user._id.toString();
+
+      const timer = setTimeout(() => {
+        const g = activeRooms.get(roomCode);
+        if (!g) return;
+
+        emitEvent(io, roomCode, g, 'game-over', {
+          reason: 'disconnect'
+        });
+
+        activeRooms.delete(roomCode);
+
+      }, 60000);
+
+      game.disconnectTimer = timer;
+    });
+
+    // ================= RECONNECT =================
+    socket.on('reconnect-room', ({ roomCode }) => {
+      const game = activeRooms.get(roomCode);
+      if (!game) return;
+
+      clearTimeout(game.disconnectTimer);
+
+      socket.join(roomCode);
+      socket.currentRoom = roomCode;
+
+      socket.emit('game-state', sanitizeGame(game, socket.user._id));
+
+      game.lastEvents.forEach(e => {
+        socket.emit(e.type, e.payload);
+      });
+    });
+
   });
 };
 
-async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
-  try {
-    const winner = await User.findById(winnerId);
-    const loser  = await User.findById(loserId);
+// ================= EVENT HELPER =================
+function emitEvent(io, roomCode, game, type, payload) {
+  io.to(roomCode).emit(type, payload);
 
-    winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
-    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
-    loser.balance        = Math.max(0, loser.balance - game.betAmount);
-
-    const winnerBalanceBefore = winner.balance;
-    const netWin = game.betAmount - platformFee;
-    winner.balance    += netWin;
-    winner.gamesWon   += 1;
-    winner.gamesPlayed += 1;
-    winner.totalEarned += netWin;
-    loser.gamesPlayed  += 1;
-    loser.totalLost    += game.betAmount;
-
-    await winner.save();
-    await loser.save();
-
-    await Transaction.create({
-      user: winnerId,
-      type: 'game_win',
-      amount: netWin,
-      balanceBefore: winnerBalanceBefore,
-      balanceAfter:  winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    const loserBalanceBefore = loser.balance + game.betAmount;
-    await Transaction.create({
-      user: loserId,
-      type: 'game_loss',
-      amount: game.betAmount,
-      balanceBefore: loserBalanceBefore,
-      balanceAfter:  loser.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    await Transaction.create({
-      user: winnerId,
-      type: 'platform_fee',
-      amount: platformFee,
-      balanceBefore: winner.balance,
-      balanceAfter:  winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
-  } catch (err) {
-    console.error('Game settlement error:', err);
-  }
+  game.lastEvents.push({ type, payload });
+  if (game.lastEvents.length > 10) game.lastEvents.shift();
 }
 
+// ================= SANITIZE =================
 function sanitizeGame(game, userId) {
-  const gameObj = game.toObject ? game.toObject() : game;
   return {
-    ...gameObj,
-    // ✅ Always return currentTurn as plain string
-    currentTurn: gameObj.currentTurn?.toString(),
-    myColor: gameObj.players.find(p => p.user._id?.toString() === userId?.toString())?.color,
+    ...game,
+    currentTurn: game.currentTurn,
+    myColor: game.players.find(p => p.user._id.toString() === userId.toString())?.color
   };
 }
