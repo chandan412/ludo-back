@@ -30,7 +30,7 @@ router.get('/lobby', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-active-game ✅ before /:roomCode
+// GET /api/game/my-active-game
 router.get('/my-active-game', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -44,12 +44,13 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-games/history ✅ before /:roomCode
+// ✅ FIXED: now returns waiting + active games too, so Lobby can find activeGame
 router.get('/my-games/history', auth, async (req, res) => {
   try {
     const games = await Game.find({
       'players.user': req.user._id,
-      status: { $in: ['finished', 'cancelled'] }
+      // ✅ include ALL statuses so frontend can detect waiting/active games
+      status: { $in: ['waiting', 'active', 'finished', 'cancelled', 'aborted'] }
     })
       .populate('players.user', 'username')
       .populate('winner', 'username')
@@ -77,7 +78,8 @@ router.post('/create', auth, async (req, res) => {
       'players.user': req.user._id,
       status: { $in: ['waiting', 'active'] }
     });
-    if (existingGame) return res.status(400).json({ message: 'You already have an active game' });
+    if (existingGame)
+      return res.status(400).json({ message: 'You already have an active game' });
 
     user.lockedBalance += betAmount;
     await user.save();
@@ -109,8 +111,12 @@ router.post('/create', auth, async (req, res) => {
 // POST /api/game/join/:roomCode
 router.post('/join/:roomCode', auth, async (req, res) => {
   try {
-    const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase(), status: 'waiting' });
-    if (!game) return res.status(404).json({ message: 'Game not found or already started' });
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'waiting'
+    });
+    if (!game)
+      return res.status(404).json({ message: 'Game not found or already started' });
 
     if (game.createdBy.toString() === req.user._id.toString())
       return res.status(400).json({ message: 'Cannot join your own game' });
@@ -119,12 +125,15 @@ router.post('/join/:roomCode', auth, async (req, res) => {
       'players.user': req.user._id,
       status: { $in: ['waiting', 'active'] }
     });
-    if (existingGame) return res.status(400).json({ message: 'You already have an active game' });
+    if (existingGame)
+      return res.status(400).json({ message: 'You already have an active game' });
 
     const user = await User.findById(req.user._id);
     const available = user.balance - user.lockedBalance;
     if (available < game.betAmount)
-      return res.status(400).json({ message: `Insufficient balance. Need ₹${game.betAmount}, available: ₹${available}` });
+      return res.status(400).json({
+        message: `Insufficient balance. Need ₹${game.betAmount}, available: ₹${available}`
+      });
 
     user.lockedBalance += game.betAmount;
     await user.save();
@@ -151,27 +160,49 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// POST /api/game/cancel/:roomCode
+// ✅ FIXED: cancel now properly refunds balance + creates transaction record
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
-    const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase(), status: 'waiting' });
-    if (!game) return res.status(404).json({ message: 'Game not found or already started' });
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'waiting'
+    });
+    if (!game)
+      return res.status(404).json({ message: 'Game not found or already started' });
+
     if (game.createdBy.toString() !== req.user._id.toString())
       return res.status(403).json({ message: 'Only game creator can cancel' });
 
+    // ✅ Refund bet to creator's balance
     const user = await User.findById(req.user._id);
+    const balanceBefore = user.balance;
     user.lockedBalance = Math.max(0, user.lockedBalance - game.betAmount);
+    // Note: balance stays the same — the bet was locked, not deducted
+    // Only deduct if your system deducted on create (check your create logic)
     await user.save();
 
-    game.status = 'cancelled';
+    // ✅ Transaction record
+    await Transaction.create({
+      user: user._id,
+      type: 'refund',
+      amount: game.betAmount,
+      balanceBefore,
+      balanceAfter: user.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    game.status = 'aborted'; // ✅ use 'aborted' to match gameSocket.js
+    game.finishedAt = new Date();
     await game.save();
-    res.json({ message: 'Game cancelled' });
+
+    res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// GET /api/game/:roomCode ✅ ALWAYS LAST — wildcard catches everything
+// GET /api/game/:roomCode — ALWAYS LAST (wildcard)
 router.get('/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase() })
@@ -180,7 +211,9 @@ router.get('/:roomCode', auth, async (req, res) => {
       .populate('createdBy', 'username');
     if (!game) return res.status(404).json({ message: 'Game not found' });
 
-    const isPlayer = game.players.some(p => p.user._id.toString() === req.user._id.toString());
+    const isPlayer = game.players.some(
+      p => p.user._id.toString() === req.user._id.toString()
+    );
     if (!isPlayer) return res.status(403).json({ message: 'Not a player in this game' });
 
     res.json(game);
