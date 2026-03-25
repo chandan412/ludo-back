@@ -252,6 +252,11 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const opponentIdx = playerIdx === 0 ? 1 : 0;
+        const playerState   = game.players[playerIdx];
+        const opponentState = game.players[opponentIdx];
+
         // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
         let diceRoll = LudoEngine.rollDice();
         if ((game.consecutiveSixes || 0) >= 2) {
