@@ -7,8 +7,6 @@ const { auth } = require('../middleware/auth');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
-// ✅ ALL specific named routes MUST come before /:roomCode
-
 // GET /api/game/lobby
 router.get('/lobby', auth, async (req, res) => {
   try {
@@ -44,12 +42,11 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: now returns waiting + active games too, so Lobby can find activeGame
+// ✅ FIXED: returns all statuses so Lobby can detect waiting/active games
 router.get('/my-games/history', auth, async (req, res) => {
   try {
     const games = await Game.find({
       'players.user': req.user._id,
-      // ✅ include ALL statuses so frontend can detect waiting/active games
       status: { $in: ['waiting', 'active', 'finished', 'cancelled', 'aborted'] }
     })
       .populate('players.user', 'username')
@@ -160,7 +157,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: cancel now properly refunds balance + creates transaction record
+// ✅ FIXED: cancel uses 'aborted' status + creates transaction record
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -173,15 +170,11 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
     if (game.createdBy.toString() !== req.user._id.toString())
       return res.status(403).json({ message: 'Only game creator can cancel' });
 
-    // ✅ Refund bet to creator's balance
     const user = await User.findById(req.user._id);
     const balanceBefore = user.balance;
     user.lockedBalance = Math.max(0, user.lockedBalance - game.betAmount);
-    // Note: balance stays the same — the bet was locked, not deducted
-    // Only deduct if your system deducted on create (check your create logic)
     await user.save();
 
-    // ✅ Transaction record
     await Transaction.create({
       user: user._id,
       type: 'refund',
@@ -192,7 +185,7 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
       gameId: game._id,
     });
 
-    game.status = 'aborted'; // ✅ use 'aborted' to match gameSocket.js
+    game.status = 'aborted';
     game.finishedAt = new Date();
     await game.save();
 
@@ -202,7 +195,7 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/:roomCode — ALWAYS LAST (wildcard)
+// GET /api/game/:roomCode — ALWAYS LAST
 router.get('/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase() })
