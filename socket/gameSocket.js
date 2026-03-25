@@ -252,37 +252,19 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
-        const diceRoll = LudoEngine.rollDice();
+        // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
+        let diceRoll = LudoEngine.rollDice();
+        if ((game.consecutiveSixes || 0) >= 2) {
+          while (diceRoll === 6) {
+            diceRoll = LudoEngine.rollDice();
+          }
+        }
         game.lastDiceRoll = diceRoll;
 
         if (diceRoll === 6) {
           game.consecutiveSixes = (game.consecutiveSixes || 0) + 1;
         } else {
           game.consecutiveSixes = 0;
-        }
-
-        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-        const opponentIdx = playerIdx === 0 ? 1 : 0;
-        const playerState   = game.players[playerIdx];
-        const opponentState = game.players[opponentIdx];
-
-        // 3 consecutive sixes — forfeit turn instantly
-        if (game.consecutiveSixes >= 3) {
-          game.consecutiveSixes = 0;
-          game.currentTurn = opponentState.user._id;
-          game.lastDiceRoll = null;
-          await game.save();
-
-          io.to(roomCode).emit('dice-rolled', {
-            diceRoll,
-            playerId: socket.user._id,
-            playerUsername: socket.user.username,
-            consecutiveSixes: true,
-            message: '3 consecutive sixes! Turn forfeited.',
-            nextTurn: opponentState.user._id.toString(),
-            hasValidMoves: false,
-          });
-          return;
         }
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
@@ -413,9 +395,14 @@ module.exports = (io) => {
 
         if (result.extraTurn) {
           game.currentTurn = socket.user._id;
+          // ✅ Keep consecutiveSixes count going — it was already incremented on roll
+          // Only reset if extra turn was from capture (not a six)
+          if (game.lastDiceRoll !== 6 && result.captured) {
+            game.consecutiveSixes = 0;
+          }
         } else {
           game.currentTurn      = opponentState.user._id;
-          game.consecutiveSixes = 0;
+          game.consecutiveSixes = 0; // ✅ reset when turn passes to opponent
         }
 
         await game.save();
