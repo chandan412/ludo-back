@@ -332,7 +332,9 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
-        if (game.lastDiceRoll === null)
+        // ✅ FIX: Capture diceRoll into a local variable FIRST before nulling game.lastDiceRoll
+        const diceRoll = game.lastDiceRoll;
+        if (diceRoll === null || diceRoll === undefined)
           return socket.emit('error', { message: 'Roll dice first' });
 
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
@@ -340,11 +342,13 @@ module.exports = (io) => {
         const playerState   = game.players[playerIdx];
         const opponentState = game.players[opponentIdx];
 
-        const validMoves = LudoEngine.getValidMoves(playerState, game.lastDiceRoll, opponentState);
+        // ✅ FIX: Use local diceRoll variable (not game.lastDiceRoll) for all validation & logic
+        const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
         const move = validMoves.find(m => m.tokenIndex === tokenIndex);
         if (!move) return socket.emit('error', { message: 'Invalid move' });
 
-        const result = LudoEngine.applyMove(playerState, opponentState, tokenIndex, game.lastDiceRoll);
+        // ✅ FIX: Use local diceRoll variable here too
+        const result = LudoEngine.applyMove(playerState, opponentState, tokenIndex, diceRoll);
 
         game.players[playerIdx].tokens         = result.newPlayerTokens;
         game.players[playerIdx].finishedTokens = result.finishedCount;
@@ -352,12 +356,13 @@ module.exports = (io) => {
 
         game.moveHistory.push({
           player: socket.user._id,
-          dice: game.lastDiceRoll,
+          dice: diceRoll, // ✅ FIX: use local variable
           tokenIndex,
           fromPosition: move.currentProgress,
           toPosition:   move.newProgress,
         });
 
+        // ✅ FIX: Null lastDiceRoll AFTER all logic that depends on it is done
         game.lastDiceRoll = null;
 
         const moveData = {
@@ -400,9 +405,8 @@ module.exports = (io) => {
 
         if (result.extraTurn) {
           game.currentTurn = socket.user._id;
-          // ✅ Keep consecutiveSixes count going — it was already incremented on roll
-          // Only reset if extra turn was from capture (not a six)
-          if (game.lastDiceRoll !== 6 && result.captured) {
+          // ✅ FIX: Use local diceRoll variable (game.lastDiceRoll is already null here)
+          if (diceRoll !== 6 && result.captured) {
             game.consecutiveSixes = 0;
           }
         } else {
