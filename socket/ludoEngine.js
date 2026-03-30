@@ -2,6 +2,7 @@ const BOARD_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
 const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 58
 
+
 const START_POSITIONS = { red: 0, blue: 26 };
 
 // Safe squares by GLOBAL board position (0-51)
