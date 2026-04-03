@@ -24,8 +24,7 @@ router.get('/lobby', auth, async (req, res) => {
       .limit(50);
     res.json(games);
   } catch (err) {
-    console.error('Lobby route error:', err);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -39,8 +38,7 @@ router.get('/my-active-game', auth, async (req, res) => {
     if (!game) return res.status(404).json(null);
     res.json(game);
   } catch (err) {
-    console.error('Route error:', err.message, err.stack);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -57,8 +55,7 @@ router.get('/my-games/history', auth, async (req, res) => {
       .limit(20);
     res.json(games);
   } catch (err) {
-    console.error('Route error:', err.message, err.stack);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -104,8 +101,7 @@ router.post('/create', auth, async (req, res) => {
     await game.populate('createdBy', 'username');
     res.status(201).json({ message: 'Game created! Share the room code.', game });
   } catch (err) {
-    console.error('Route error:', err.message, err.stack);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -157,8 +153,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
     await game.populate('players.user', 'username');
     res.json({ message: 'Joined game! Starting now.', game });
   } catch (err) {
-    console.error('Route error:', err.message, err.stack);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -196,8 +191,7 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
 
     res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
-    console.error('Route error:', err.message, err.stack);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
@@ -217,8 +211,7 @@ router.get('/:roomCode', auth, async (req, res) => {
 
     res.json(game);
   } catch (err) {
-    console.error('Route error:', err.message, err.stack);
-    res.status(500).json({ message: 'Server error', detail: err.message });
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
