@@ -304,6 +304,70 @@ module.exports = (io) => {
 
         await game.save();
 
+        // If only 1 valid move — auto-play it, no need for player to tap
+        if (validMoves.length === 1) {
+          const autoMove = validMoves[0];
+          const result = LudoEngine.applyMove(playerState, opponentState, autoMove.tokenIndex, diceRoll);
+
+          game.players[playerIdx].tokens         = result.newPlayerTokens;
+          game.players[playerIdx].finishedTokens = result.finishedCount;
+          game.players[opponentIdx].tokens       = result.newOpponentTokens;
+          game.moveHistory.push({
+            player: socket.user._id, dice: diceRoll,
+            tokenIndex: autoMove.tokenIndex,
+            fromPosition: autoMove.currentProgress,
+            toPosition: autoMove.newProgress,
+          });
+          game.lastDiceRoll = null;
+
+          const moveData = {
+            playerId: socket.user._id.toString(),
+            playerUsername: socket.user.username,
+            tokenIndex: autoMove.tokenIndex,
+            fromProgress: autoMove.currentProgress,
+            toProgress: autoMove.newProgress,
+            captured: result.captured,
+            extraTurn: result.extraTurn,
+            finishedCount: result.finishedCount,
+            autoPlayed: true,
+          };
+
+          if (result.gameOver) {
+            game.status = 'finished'; game.winner = socket.user._id;
+            game.loser = opponentState.user._id; game.finishedAt = new Date();
+            const pot = game.betAmount * 2;
+            const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+            const winAmount = pot - platformFee;
+            game.winAmount = winAmount; game.platformFee = platformFee;
+            await game.save();
+            await settleGame(game, socket.user._id, opponentState.user._id, winAmount, platformFee);
+            io.to(roomCode).emit('dice-rolled', { diceRoll, playerId: socket.user._id, playerUsername: socket.user.username, validMoves: [], hasValidMoves: true, currentTurn: game.currentTurn.toString() });
+            io.to(roomCode).emit('game-over', { ...moveData, winner: { id: socket.user._id.toString(), username: socket.user.username }, loser: { id: opponentState.user._id.toString(), username: opponentState.user.username }, winAmount, platformFee });
+            return;
+          }
+
+          if (result.extraTurn) {
+            game.currentTurn = socket.user._id;
+            if (diceRoll !== 6 && result.captured) game.consecutiveSixes = 0;
+          } else {
+            game.currentTurn = opponentState.user._id;
+            game.consecutiveSixes = 0;
+          }
+          await game.save();
+
+          // Emit dice-rolled first so frontend shows the dice value, then token-moved
+          io.to(roomCode).emit('dice-rolled', { diceRoll, playerId: socket.user._id, playerUsername: socket.user.username, validMoves: [], hasValidMoves: true, autoPlayed: true, currentTurn: game.currentTurn.toString() });
+          io.to(roomCode).emit('token-moved', {
+            ...moveData,
+            gameState: {
+              players: game.players.map(p => ({ userId: p.user._id.toString(), username: p.user.username, color: p.color, tokens: p.tokens, finishedTokens: p.finishedTokens })),
+              currentTurn: game.currentTurn.toString(),
+              nextTurnUsername: result.extraTurn ? socket.user.username : opponentState.user.username,
+            },
+          });
+          return;
+        }
+
         io.to(roomCode).emit('dice-rolled', {
           diceRoll,
           playerId: socket.user._id,
