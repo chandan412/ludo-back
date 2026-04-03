@@ -1,79 +1,33 @@
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
 
-const userSchema = new mongoose.Schema({
-  username: {
+const transactionSchema = new mongoose.Schema({
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  type: {
     type: String,
-    required: true,
-    unique: true,
-    trim: true,
-    minlength: 3,
-    maxlength: 20
+    enum: ['recharge', 'withdraw', 'game_win', 'game_loss', 'game_lock', 'game_unlock', 'platform_fee'],
+    required: true
   },
-  email: {
+  amount: { type: Number, required: true },
+  balanceBefore: { type: Number, required: true },
+  balanceAfter: { type: Number, required: true },
+  status: {
     type: String,
-    required: true,
-    unique: true,
-    lowercase: true,
-    trim: true
+    enum: ['pending', 'approved', 'rejected', 'completed'],
+    default: 'completed'
   },
-  phone: {
-    type: String,
-    required: true,
-    unique: true,
-    trim: true
+  rechargeNote: { type: String },
+  bankDetails: {
+    accountHolderName: { type: String },
+    accountNumber: { type: String },
+    ifscCode: { type: String },
+    bankName: { type: String },
+    upiId: { type: String }
   },
-  password: {
-    type: String,
-    required: true,
-    minlength: 6
-  },
-  role: {
-    type: String,
-    enum: ['player', 'admin'],
-    default: 'player'
-  },
-  balance: {
-    type: Number,
-    default: 0,
-    min: 0
-  },
-  lockedBalance: {
-    type: Number,
-    default: 0
-  },
-  isActive: {
-    type: Boolean,
-    default: true
-  },
-  isBanned: {
-    type: Boolean,
-    default: false
-  },
-  gamesPlayed: { type: Number, default: 0 },
-  gamesWon: { type: Number, default: 0 },
-  totalEarned: { type: Number, default: 0 },
-  totalLost: { type: Number, default: 0 },
-  createdAt: {
-    type: Date,
-    default: Date.now
-  }
+  withdrawNote: { type: String },
+  gameId: { type: mongoose.Schema.Types.ObjectId, ref: 'Game' },
+  processedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  processedAt: { type: Date },
+  createdAt: { type: Date, default: Date.now }
 });
 
-userSchema.pre('save', async function (next) {
-  if (!this.isModified('password')) return next();
-  this.password = await bcrypt.hash(this.password, 12);
-  next();
-});
-
-userSchema.methods.comparePassword = async function (candidatePassword) {
-  return bcrypt.compare(candidatePassword, this.password);
-};
-
-userSchema.methods.toSafeObject = function () {
-  const obj = this.toObject();
-  delete obj.password;
-  return obj;
-};
-
-module.exports = mongoose.model('User', userSchema);
+module.exports = mongoose.model('Transaction', transactionSchema);
