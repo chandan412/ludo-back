@@ -10,8 +10,13 @@ const auth = async (req, res, next) => {
     const user = await User.findById(decoded.id).select('-password');
 
     if (!user) return res.status(401).json({ message: 'Token invalid' });
-    if (user.isBanned) return res.status(403).json({ message: 'Your account has been banned' });
+    if (user.isBanned)  return res.status(403).json({ message: 'Your account has been banned' });
     if (!user.isActive) return res.status(403).json({ message: 'Account inactive' });
+
+    // Single-device check: if sessionToken in JWT doesn't match DB, this device was logged out
+    if (decoded.sessionToken && user.sessionToken !== decoded.sessionToken) {
+      return res.status(401).json({ message: 'Session expired. Please login again.', code: 'SESSION_EXPIRED' });
+    }
 
     req.user = user;
     next();
