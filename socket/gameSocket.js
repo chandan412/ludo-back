@@ -437,6 +437,46 @@ module.exports = (io) => {
       }
     });
 
+
+    // ============================
+    // forfeit-game: player intentionally exits
+    // ============================
+    socket.on('forfeit-game', async ({ roomCode }) => {
+      try {
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username');
+        if (!game || game.status !== 'active') return;
+        const playerIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        if (playerIdx === -1) return;
+        const opponentIdx = playerIdx === 0 ? 1 : 0;
+        const winnerId    = game.players[opponentIdx].user._id;
+        const loserId     = socket.user._id;
+        const pot         = game.betAmount * 2;
+        const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+        const winAmount   = pot - platformFee;
+        game.status      = 'finished';
+        game.winner      = winnerId;
+        game.loser       = loserId;
+        game.winAmount   = winAmount;
+        game.platformFee = platformFee;
+        game.finishedAt  = new Date();
+        await game.save();
+        await settleGame(game, winnerId, loserId, winAmount, platformFee);
+        socket.intentionalExit = true;
+        io.to(roomCode).emit('game-over', {
+          reason:      'forfeit',
+          winner:      { id: winnerId.toString(), username: game.players[opponentIdx].user.username },
+          loser:       { id: loserId.toString(),  username: socket.user.username },
+          winAmount,
+          platformFee,
+        });
+        console.log(socket.user.username + ' forfeited game ' + roomCode);
+      } catch (err) {
+        console.error('forfeit-game error:', err);
+        socket.emit('error', { message: 'Server error during forfeit' });
+      }
+    });
+
     // ============================
     // disconnect
     // ============================
@@ -490,7 +530,15 @@ module.exports = (io) => {
           return; // stop here — no 60s timer needed
         }
 
-        // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
+        // SCENARIO 2: Intentional exit — game already settled by forfeit-game handler
+        // Just mark disconnected, skip reconnect window entirely
+        if (socket.intentionalExit) {
+          game.players[playerIdx].isConnected = false;
+          await game.save();
+          return;
+        }
+
+        // SCENARIO 3: Accidental disconnect during active game → 60s reconnect window
         game.players[playerIdx].isConnected = false;
         await game.save();
 
