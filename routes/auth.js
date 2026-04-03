@@ -1,10 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const User = require('../models/User');
 const { auth } = require('../middleware/auth');
 
-const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+// Generate JWT with sessionToken embedded
+const generateToken = (id, sessionToken) =>
+  jwt.sign({ id, sessionToken }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+// Generate a random session token
+const generateSessionToken = () => crypto.randomBytes(32).toString('hex');
 
 router.post('/register', async (req, res) => {
   try {
@@ -14,13 +20,14 @@ router.post('/register', async (req, res) => {
 
     const exists = await User.findOne({ $or: [{ email }, { username }, { phone }] });
     if (exists) {
-      if (exists.email === email) return res.status(400).json({ message: 'Email already registered' });
+      if (exists.email === email)     return res.status(400).json({ message: 'Email already registered' });
       if (exists.username === username) return res.status(400).json({ message: 'Username taken' });
-      if (exists.phone === phone) return res.status(400).json({ message: 'Phone already registered' });
+      if (exists.phone === phone)     return res.status(400).json({ message: 'Phone already registered' });
     }
 
-    const user = await User.create({ username, email, phone, password });
-    const token = generateToken(user._id);
+    const sessionToken = generateSessionToken();
+    const user = await User.create({ username, email, phone, password, sessionToken });
+    const token = generateToken(user._id, sessionToken);
     res.status(201).json({ token, user: user.toSafeObject() });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -36,8 +43,9 @@ router.post('/register-admin', async (req, res) => {
     const exists = await User.findOne({ $or: [{ email }, { username }, { phone }] });
     if (exists) return res.status(400).json({ message: 'User already exists' });
 
-    const user = await User.create({ username, email, phone, password, role: 'admin' });
-    const token = generateToken(user._id);
+    const sessionToken = generateSessionToken();
+    const user = await User.create({ username, email, phone, password, role: 'admin', sessionToken });
+    const token = generateToken(user._id, sessionToken);
     res.status(201).json({ token, user: user.toSafeObject() });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -59,7 +67,12 @@ router.post('/login', async (req, res) => {
     const isMatch = await user.comparePassword(password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
-    const token = generateToken(user._id);
+    // Rotate session token — invalidates ALL existing sessions on other devices
+    const sessionToken = generateSessionToken();
+    user.sessionToken = sessionToken;
+    await user.save();
+
+    const token = generateToken(user._id, sessionToken);
     res.json({ token, user: user.toSafeObject() });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
