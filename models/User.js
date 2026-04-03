@@ -54,6 +54,8 @@ const userSchema = new mongoose.Schema({
   gamesWon: { type: Number, default: 0 },
   totalEarned: { type: Number, default: 0 },
   totalLost: { type: Number, default: 0 },
+  // Single-device session control — regenerated on every login
+  sessionToken: { type: String, default: null },
   createdAt: {
     type: Date,
     default: Date.now
@@ -76,4 +78,4 @@ userSchema.methods.toSafeObject = function () {
   return obj;
 };
 
-module.exports = mongoose.models.User || mongoose.model('User', userSchema);
+module.exports = mongoose.model('User', userSchema);
