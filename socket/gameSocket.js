@@ -158,7 +158,10 @@ function sanitizeGame(game, userId) {
 // ============================
 module.exports = (io) => {
 
-  // Auth middleware
+  // Track connected sockets per user: userId -> socketId
+  const userSockets = new Map();
+
+  // Auth middleware — validates JWT + sessionToken (single device enforcement)
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth.token;
@@ -166,7 +169,14 @@ module.exports = (io) => {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       const user = await User.findById(decoded.id).select('-password');
       if (!user || user.isBanned) return next(new Error('Unauthorized'));
+
+      // Single-device check: reject if session token doesn't match
+      if (decoded.sessionToken && user.sessionToken !== decoded.sessionToken) {
+        return next(new Error('SESSION_EXPIRED'));
+      }
+
       socket.user = user;
+      socket.sessionToken = decoded.sessionToken;
       next();
     } catch (err) {
       next(new Error('Invalid token'));
@@ -175,6 +185,23 @@ module.exports = (io) => {
 
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.user.username} (${socket.id})`);
+
+    const userId = socket.user._id.toString();
+
+    // If this user already has a socket connected (another device/tab), kick it
+    const existingSocketId = userSockets.get(userId);
+    if (existingSocketId && existingSocketId !== socket.id) {
+      const existingSocket = io.sockets.sockets.get(existingSocketId);
+      if (existingSocket) {
+        existingSocket.emit('force-logout', {
+          message: 'You have been logged in from another device.',
+        });
+        existingSocket.disconnect(true);
+        console.log(`Kicked old socket ${existingSocketId} for user ${socket.user.username}`);
+      }
+    }
+    // Register this socket as the active one for this user
+    userSockets.set(userId, socket.id);
 
     // ============================
     // created-room: fired by creator right after creating a game
@@ -551,6 +578,13 @@ module.exports = (io) => {
     // ============================
     socket.on('disconnect', async () => {
       console.log(`User disconnected: ${socket.user.username}`);
+
+      // Clean up active socket map
+      const uid = socket.user._id.toString();
+      if (userSockets.get(uid) === socket.id) {
+        userSockets.delete(uid);
+      }
+
       if (!socket.currentRoom) return;
 
       try {
