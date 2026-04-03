@@ -26,7 +26,7 @@ const gameSchema = new mongoose.Schema({
   roomCode:  { type: String, required: true, unique: true },
   betAmount: { type: Number, required: true, min: 10 },
 
-  // ✅ 'aborted' added — used when creator leaves or no opponent joins in 2 mins
+  // 'aborted' used when creator leaves or no opponent joins in 2 mins
   status: {
     type: String,
     enum: ['waiting', 'active', 'finished', 'cancelled', 'aborted'],
@@ -58,4 +58,4 @@ const gameSchema = new mongoose.Schema({
   createdAt:  { type: Date, default: Date.now }
 });
 
-module.exports = mongoose.model('Game', gameSchema);
+module.exports = mongoose.models.Game || mongoose.model('Game', gameSchema);
