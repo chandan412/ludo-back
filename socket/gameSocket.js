@@ -210,6 +210,11 @@ module.exports = (io) => {
         );
         if (!isPlayer) return socket.emit('error', { message: 'Not a player in this game' });
 
+        // Block rejoining a finished/forfeited/cancelled game
+        if (['finished', 'cancelled', 'aborted'].includes(game.status)) {
+          return socket.emit('game-finished', { message: 'This game has already ended.' });
+        }
+
         socket.join(roomCode);
         socket.currentRoom = roomCode;
 
@@ -604,6 +609,11 @@ module.exports = (io) => {
 
         const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
         if (!game) return;
+
+        // Do not allow reconnecting to a finished game
+        if (['finished', 'cancelled', 'aborted'].includes(game.status)) {
+          return socket.emit('game-finished', { message: 'This game has already ended.' });
+        }
 
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
