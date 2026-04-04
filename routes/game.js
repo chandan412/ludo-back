@@ -28,12 +28,26 @@ router.get('/lobby', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-active-game
+// GET /api/game/my-active-game — strictly active games only
 router.get('/my-active-game', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
       'players.user': req.user._id,
       status: 'active'
+    }).populate('players.user', 'username');
+    if (!game) return res.status(404).json(null);
+    res.json(game);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/game/my-waiting-game — strictly waiting games only (creator waiting for opponent)
+router.get('/my-waiting-game', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      'players.user': req.user._id,
+      status: 'waiting'
     }).populate('players.user', 'username');
     if (!game) return res.status(404).json(null);
     res.json(game);
