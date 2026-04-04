@@ -598,8 +598,26 @@ module.exports = (io) => {
         if (playerIdx === -1) return;
 
         // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
+        // BUT skip if player already reconnected with a new socket (navigation between pages)
         if (game.status === 'waiting') {
-          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
+          // Wait briefly to allow new socket to connect and set isConnected=true
+          // This handles the case where player navigates from Lobby → Game page
+          await new Promise(resolve => setTimeout(resolve, 1500));
+
+          // Re-fetch fresh game state after delay
+          const freshGame = await Game.findOne({ roomCode: socket.currentRoom });
+          if (!freshGame || freshGame.status !== 'waiting') return; // game moved on
+
+          const freshPlayerIdx = freshGame.players.findIndex(
+            p => p.user._id.toString() === socket.user._id.toString()
+          );
+          if (freshPlayerIdx !== -1 && freshGame.players[freshPlayerIdx].isConnected) {
+            // Player reconnected with a new socket — just navigation, not abandonment
+            console.log(`${socket.user.username} reconnected — skipping abort`);
+            return;
+          }
+
+          cancelWaitingTimer(socket.currentRoom);
 
           game.status = 'aborted';
           game.finishedAt = new Date();
