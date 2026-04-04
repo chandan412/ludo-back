@@ -30,4 +30,11 @@ const transactionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
-module.exports = mongoose.models.Transaction || mongoose.model('Transaction', transactionSchema);
+let Transaction;
+try {
+  Transaction = mongoose.model('Transaction');
+} catch {
+  Transaction = mongoose.model('Transaction', transactionSchema);
+}
+
+module.exports = Transaction;
