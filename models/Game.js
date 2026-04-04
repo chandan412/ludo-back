@@ -83,17 +83,24 @@ router.post('/create', auth, async (req, res) => {
     if (available < betAmount)
       return res.status(400).json({ message: `Insufficient balance. Available: ₹${available}` });
 
+    // Check for existing active/waiting game
     const existingGame = await Game.findOne({
       'players.user': req.user._id,
       status: { $in: ['waiting', 'active'] }
     });
     if (existingGame)
-      return res.status(400).json({ message: 'You already have an active game' });
+      return res.status(400).json({ message: 'You already have an active game', roomCode: existingGame.roomCode });
 
     user.lockedBalance += betAmount;
     await user.save();
 
-    const roomCode = generateRoomCode();
+    // Generate unique room code with retry
+    let roomCode, attempts = 0;
+    do {
+      roomCode = generateRoomCode();
+      attempts++;
+    } while (await Game.findOne({ roomCode }) && attempts < 10);
+
     const game = await Game.create({
       roomCode,
       betAmount,
@@ -113,7 +120,20 @@ router.post('/create', auth, async (req, res) => {
     await game.populate('createdBy', 'username');
     res.status(201).json({ message: 'Game created! Share the room code.', game });
   } catch (err) {
-    res.status(500).json({ message: 'Server error' });
+    console.error('Create game error:', err.message, err.code);
+    // Rollback lockedBalance if game creation failed
+    try {
+      const { betAmount } = req.body;
+      if (betAmount) {
+        await User.findByIdAndUpdate(req.user._id, { $inc: { lockedBalance: -betAmount } });
+      }
+    } catch (rollbackErr) {
+      console.error('Rollback error:', rollbackErr.message);
+    }
+    if (err.code === 11000) {
+      return res.status(500).json({ message: 'Room code collision, please try again.' });
+    }
+    res.status(500).json({ message: err.message || 'Server error' });
   }
 });
 
