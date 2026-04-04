@@ -193,11 +193,10 @@ module.exports = (io) => {
     if (existingSocketId && existingSocketId !== socket.id) {
       const existingSocket = io.sockets.sockets.get(existingSocketId);
       if (existingSocket) {
-        existingSocket.emit('force-logout', {
-          message: 'You have been logged in from another device.',
-        });
+        // Silently disconnect old socket — no force-logout event
+        // Old device detects session expiry via HTTP 401 on next API call
         existingSocket.disconnect(true);
-        console.log(`Kicked old socket ${existingSocketId} for user ${socket.user.username}`);
+        console.log(`Silently disconnected old socket ${existingSocketId} for user ${socket.user.username}`);
       }
     }
     // Register this socket as the active one for this user
