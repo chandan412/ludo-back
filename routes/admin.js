@@ -81,7 +81,29 @@ router.post('/add-balance', adminAuth, async (req, res) => {
   }
 });
 
-// POST /api/admin/process-withdrawal
+// POST /api/admin/reject-recharge
+// Reject a fake/invalid recharge request — no balance added
+router.post('/reject-recharge', adminAuth, async (req, res) => {
+  try {
+    const { transactionId, reason } = req.body;
+    if (!transactionId) return res.status(400).json({ message: 'transactionId required' });
+
+    const transaction = await Transaction.findById(transactionId).populate('user');
+    if (!transaction) return res.status(404).json({ message: 'Transaction not found' });
+    if (transaction.type !== 'recharge') return res.status(400).json({ message: 'Not a recharge transaction' });
+    if (transaction.status !== 'pending') return res.status(400).json({ message: 'Already processed' });
+
+    transaction.status = 'rejected';
+    transaction.rechargeNote = reason || 'Rejected by admin — payment not received';
+    transaction.processedBy = req.user._id;
+    transaction.processedAt = new Date();
+    await transaction.save();
+
+    res.json({ message: `Recharge request rejected for ${transaction.user?.username}` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 router.post('/process-withdrawal', adminAuth, async (req, res) => {
   try {
     const { transactionId, action, adminNote } = req.body;
