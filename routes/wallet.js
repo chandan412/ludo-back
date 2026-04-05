@@ -40,6 +40,18 @@ router.post('/recharge-request', auth, async (req, res) => {
     const { amount, paymentNote } = req.body;
     if (!amount || amount < 10)
       return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
+
+    // Block if player already has a pending recharge request
+    const pending = await Transaction.findOne({
+      user: req.user._id,
+      type: 'recharge',
+      status: 'pending'
+    });
+    if (pending)
+      return res.status(400).json({
+        message: `You already have a pending recharge request of ₹${pending.amount}. Please wait for admin to approve it before submitting another.`
+      });
+
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'recharge',
