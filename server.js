@@ -30,9 +30,11 @@ const io = new Server(server, {
 
 app.use(cors({
   origin: function(origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error('Not allowed by CORS'));
+    // Block unknown origins silently — don't throw, just deny
+    return callback(null, false);
   },
   credentials: true,
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
