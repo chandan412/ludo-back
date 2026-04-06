@@ -80,23 +80,14 @@ mongoose.connect(process.env.MONGODB_URI, MONGO_OPTS)
       console.log(`✅ Server running on port ${PORT}`);
 
       // ── Keep-alive ping every 4 min ──────────────────────
-      // Prevents Railway from sleeping the server
-      const SELF_URL = process.env.RAILWAY_STATIC_URL
-        || process.env.RENDER_EXTERNAL_URL
-        || `http://localhost:${PORT}`;
-
+      const PING_URL = 'https://ludo-back-production.up.railway.app/health';
       setInterval(() => {
-        const url = SELF_URL.startsWith('https')
-          ? `${SELF_URL}/health`
-          : `http://localhost:${PORT}/health`;
-
-        const client = url.startsWith('https') ? https : http;
-        client.get(url, (res) => {
+        https.get(PING_URL, (res) => {
           console.log(`💓 Keep-alive ping: ${res.statusCode}`);
         }).on('error', (err) => {
           console.warn('Keep-alive ping failed:', err.message);
         });
-      }, 4 * 60 * 1000); // every 4 minutes
+      }, 4 * 60 * 1000);
     });
   })
   .catch(err => {
