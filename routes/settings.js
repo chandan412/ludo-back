@@ -52,8 +52,29 @@ router.post('/qr-code', adminAuth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// APK Download URL
+// WhatsApp Support Number
 // ─────────────────────────────────────────
+// GET /api/settings/support-number — public, no auth needed
+router.get('/support-number', async (req, res) => {
+  try {
+    const s = await Setting.findOne({ key: 'whatsapp_number' });
+    res.json({ number: s?.value || null });
+  } catch { res.status(500).json({ message: 'Server error' }); }
+});
+
+// POST /api/settings/support-number — admin only
+router.post('/support-number', adminAuth, async (req, res) => {
+  try {
+    const { number } = req.body;
+    if (!number) return res.status(400).json({ message: 'Number required' });
+    await Setting.findOneAndUpdate(
+      { key: 'whatsapp_number' },
+      { key: 'whatsapp_number', value: number.replace(/\D/g, '') },
+      { upsert: true, new: true }
+    );
+    res.json({ message: 'WhatsApp number updated' });
+  } catch { res.status(500).json({ message: 'Server error' }); }
+});
 // GET /api/settings/apk — public, players fetch the APK link
 router.get('/apk', async (req, res) => {
   try {
