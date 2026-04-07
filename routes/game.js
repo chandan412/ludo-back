@@ -4,6 +4,7 @@ const Game = require('../models/Game');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
+const { startWaitingTimer, cancelWaitingTimer } = require('../socket/waitingTimer');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -18,28 +19,11 @@ router.get('/lobby', auth, async (req, res) => {
       if (maxBet) query.betAmount.$lte = parseInt(maxBet);
     }
     query.createdBy = { $ne: req.user._id };
-
-    const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
-    const now = Date.now();
-
-    // ✅ Only fetch games created within the last 2 minutes
-    query.createdAt = { $gte: new Date(now - WAIT_DURATION) };
-
     const games = await Game.find(query)
       .populate('createdBy', 'username gamesPlayed gamesWon')
       .sort({ createdAt: -1 })
       .limit(50);
-
-    // Add secondsLeft and filter out any already expired
-    const gamesWithTimer = games
-      .map(g => {
-        const elapsed = now - new Date(g.createdAt).getTime();
-        const secondsLeft = Math.max(0, Math.floor((WAIT_DURATION - elapsed) / 1000));
-        return { ...g.toObject(), secondsLeft };
-      })
-      .filter(g => g.secondsLeft > 0);
-
-    res.json(gamesWithTimer);
+    res.json(games);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -116,6 +100,11 @@ router.post('/create', auth, async (req, res) => {
     });
 
     await game.populate('createdBy', 'username');
+
+    // ✅ Start 2-min timer immediately at HTTP create — no socket needed
+    // Timer is server-authoritative. Page refreshes have zero effect.
+    startWaitingTimer(game.roomCode, 120);
+
     res.status(201).json({ message: 'Game created! Share the room code.', game });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -134,11 +123,6 @@ router.post('/join/:roomCode', auth, async (req, res) => {
 
     if (game.createdBy.toString() === req.user._id.toString())
       return res.status(400).json({ message: 'Cannot join your own game' });
-
-    // ✅ Check if game has expired (older than 2 minutes)
-    const elapsed = Date.now() - new Date(game.createdAt).getTime();
-    if (elapsed > 2 * 60 * 1000)
-      return res.status(400).json({ message: 'This game has expired' });
 
     const existingGame = await Game.findOne({
       'players.user': req.user._id,
@@ -171,6 +155,9 @@ router.post('/join/:roomCode', auth, async (req, res) => {
     game.currentTurn = game.players[0].user;
     game.startedAt = new Date();
     await game.save();
+
+    // ✅ Cancel the waiting timer — opponent joined
+    cancelWaitingTimer(req.params.roomCode.toUpperCase());
 
     await game.populate('players.user', 'username');
     res.json({ message: 'Joined game! Starting now.', game });
@@ -210,6 +197,9 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
     game.status = 'aborted';
     game.finishedAt = new Date();
     await game.save();
+
+    // ✅ Cancel the waiting timer
+    cancelWaitingTimer(req.params.roomCode.toUpperCase());
 
     res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
