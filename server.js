@@ -4,39 +4,39 @@ const http = require('http');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
-const authRoutes     = require('./routes/auth');
-const walletRoutes   = require('./routes/wallet');
-const gameRoutes     = require('./routes/game');
-const adminRoutes    = require('./routes/admin');
+const authRoutes = require('./routes/auth');
+const walletRoutes = require('./routes/wallet');
+const gameRoutes = require('./routes/game');
+const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
-const cricketRoutes  = require('./routes/cricket');
-const gameSocket     = require('./socket/gameSocket');
+const cricketRoutes = require('./routes/cricket');
+const gameSocket = require('./socket/gameSocket');
+const { setIO, resumeTimersOnStartup } = require('./socket/waitingTimer');
 
-const app    = express();
+const app = express();
 const server = http.createServer(app);
 
-// ✅ Allow any *.vercel.app + localhost
-const isAllowedOrigin = (origin) => {
-  if (!origin) return true;
-  if (origin === 'http://localhost:3000') return true;
-  if (origin.endsWith('.vercel.app')) return true;
-  return false;
-};
+// ✅ Fixed CORS
+const allowedOrigins = [
+  'https://ludo-fron.vercel.app',
+  'http://localhost:3000'
+];
 
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (isAllowedOrigin(origin)) callback(null, true);
-      else callback(new Error('Not allowed by CORS'));
-    },
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true
   }
 });
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (isAllowedOrigin(origin)) return callback(null, true);
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -48,6 +48,17 @@ app.use(express.json({ limit: '10mb' }));
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
+app.use('/api/auth', authRoutes);
+app.use('/api/wallet', walletRoutes);
+app.use('/api/game', gameRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/settings', settingsRoutes);
+
+gameSocket(io);
+
+// ✅ Wire io into the timer module so it can broadcast countdowns
+setIO(io);
+
 app.use('/api/auth',     authRoutes);
 app.use('/api/wallet',   walletRoutes);
 app.use('/api/game',     gameRoutes);
@@ -55,16 +66,12 @@ app.use('/api/admin',    adminRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/cricket',  cricketRoutes);
 
-gameSocket(io);
-
 const PORT = process.env.PORT || 5000;
 
-// ✅ Start server immediately — don't block on DB
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
 
-// ✅ MongoDB with retry — never crashes the server
 const connectDB = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI, {
@@ -73,6 +80,8 @@ const connectDB = async () => {
       socketTimeoutMS: 45000,
     });
     console.log('✅ MongoDB connected');
+    // ✅ Resume timers for any waiting games after DB connects
+    await resumeTimersOnStartup();
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
     setTimeout(connectDB, 5000);
