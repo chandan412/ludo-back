@@ -18,21 +18,11 @@ router.get('/lobby', auth, async (req, res) => {
       if (maxBet) query.betAmount.$lte = parseInt(maxBet);
     }
     query.createdBy = { $ne: req.user._id };
-    const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
     const games = await Game.find(query)
       .populate('createdBy', 'username gamesPlayed gamesWon')
       .sort({ createdAt: -1 })
       .limit(50);
-
-    // Add secondsLeft so frontend can show countdown without socket
-    const now = Date.now();
-    const gamesWithTimer = games.map(g => {
-      const elapsed = now - new Date(g.createdAt).getTime();
-      const secondsLeft = Math.max(0, Math.floor((WAIT_DURATION - elapsed) / 1000));
-      return { ...g.toObject(), secondsLeft };
-    });
-
-    res.json(gamesWithTimer);
+    res.json(games);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -99,6 +89,7 @@ router.post('/create', auth, async (req, res) => {
       players: [{
         user: req.user._id,
         color: 'red',
+        isConnected: false, // ✅ always start as false — socket sets it on join-room
         tokens: [
           { position: -1, isHome: true, isFinished: false },
           { position: -1, isHome: true, isFinished: false },
