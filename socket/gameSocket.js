@@ -35,11 +35,10 @@ function startWaitingTimer(io, roomCode) {
       game.finishedAt = new Date();
       await game.save();
 
-      // Refund creator
+      // ✅ Only unlock lockedBalance — do NOT add to balance
       const creator = await User.findById(game.players[0].user);
       if (creator) {
-        const before = creator.balance;
-        creator.balance += game.betAmount;
+        const availableBefore = creator.balance - creator.lockedBalance;
         creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
         await creator.save();
 
@@ -47,8 +46,8 @@ function startWaitingTimer(io, roomCode) {
           user: creator._id,
           type: 'refund',
           amount: game.betAmount,
-          balanceBefore: before,
-          balanceAfter: creator.balance,
+          balanceBefore: availableBefore,
+          balanceAfter: creator.balance - creator.lockedBalance,
           status: 'completed',
           gameId: game._id,
         });
@@ -456,11 +455,10 @@ module.exports = (io) => {
           game.finishedAt = new Date();
           await game.save();
 
-          // Refund creator (only creator has paid at this point)
+          // ✅ Only unlock lockedBalance — do NOT add to balance
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
-            const before = creator.balance;
-            creator.balance += game.betAmount;
+            const availableBefore = creator.balance - creator.lockedBalance;
             creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
             await creator.save();
 
@@ -468,8 +466,8 @@ module.exports = (io) => {
               user: creator._id,
               type: 'refund',
               amount: game.betAmount,
-              balanceBefore: before,
-              balanceAfter: creator.balance,
+              balanceBefore: availableBefore,
+              balanceAfter: creator.balance - creator.lockedBalance,
               status: 'completed',
               gameId: game._id,
             });
