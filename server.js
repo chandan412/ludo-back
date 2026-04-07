@@ -16,38 +16,32 @@ const gameSocket     = require('./socket/gameSocket');
 const app    = express();
 const server = http.createServer(app);
 
-// ✅ Allow any *.vercel.app + localhost — no hardcoded URLs
+// ✅ FIX 1: CORS — allow any *.vercel.app, no hardcoded URLs
 const isAllowedOrigin = (origin) => {
-  if (!origin) return true;
+  if (!origin) return true;                        // mobile / curl
   if (origin === 'http://localhost:3000') return true;
-  if (origin.endsWith('.vercel.app')) return true;
+  if (origin.endsWith('.vercel.app')) return true; // all vercel deployments
   return false;
 };
 
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (isAllowedOrigin(origin)) callback(null, true);
-      else callback(new Error('Not allowed by CORS'));
-    },
+    origin: (origin, cb) => isAllowedOrigin(origin) ? cb(null, true) : cb(new Error('CORS')),
     methods: ['GET', 'POST'],
-    credentials: true
+    credentials: true,
   }
 });
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (isAllowedOrigin(origin)) return callback(null, true);
-    return callback(new Error('Not allowed by CORS'));
-  },
+  origin: (origin, cb) => isAllowedOrigin(origin) ? cb(null, true) : cb(new Error('CORS')),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 app.use(express.json({ limit: '10mb' }));
 
-app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use('/api/auth',     authRoutes);
 app.use('/api/wallet',   walletRoutes);
@@ -60,12 +54,14 @@ app.use('/api/chat',     chatRoutes);
 gameSocket(io);
 setChatIO(io);
 
+// ✅ FIX 2: Start server immediately — don't wait for MongoDB
+// Railway health checks pass right away, no downtime
 const PORT = process.env.PORT || 5000;
-
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
 
+// ✅ FIX 2: MongoDB never crashes the server — auto-retries forever
 const connectDB = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI, {
@@ -75,11 +71,13 @@ const connectDB = async () => {
     });
     console.log('✅ MongoDB connected');
   } catch (err) {
-    console.error('❌ MongoDB connection failed:', err.message);
-    setTimeout(connectDB, 5000);
+    console.error('❌ MongoDB failed:', err.message);
+    console.log('🔄 Retrying in 5s...');
+    setTimeout(connectDB, 5000); // retry instead of process.exit(1)
   }
 };
 
+// Auto-reconnect on disconnect
 mongoose.connection.on('disconnected', () => {
   console.warn('⚠️ MongoDB disconnected — retrying in 3s...');
   setTimeout(connectDB, 3000);
