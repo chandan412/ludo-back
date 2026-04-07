@@ -5,7 +5,8 @@ const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
 
 const activeRooms = new Map();
-const roomTimers = new Map(); // tracks 2-min auto-abort timers
+const roomTimers  = new Map();
+const moveTimers  = new Map(); // tracks inactivity after dice rolled
 
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
@@ -84,50 +85,57 @@ function cancelWaitingTimer(roomCode) {
 // ============================
 async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
   try {
-    // ✅ Fetch both users in parallel — 2x faster
-    const [winner, loser] = await Promise.all([
-      User.findById(winnerId),
-      User.findById(loserId),
-    ]);
-
-    const netWin = game.betAmount - platformFee;
-    const winnerBalanceBefore = winner.balance;
-    const loserBalanceBefore  = loser.balance;
+    const winner = await User.findById(winnerId);
+    const loser  = await User.findById(loserId);
 
     winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
-    winner.balance      += netWin;
-    winner.gamesWon     += 1;
-    winner.gamesPlayed  += 1;
-    winner.totalEarned  += netWin;
-
-    loser.lockedBalance  = Math.max(0, loser.lockedBalance - game.betAmount);
+    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
     loser.balance        = Math.max(0, loser.balance - game.betAmount);
-    loser.gamesPlayed   += 1;
-    loser.totalLost     += game.betAmount;
 
-    // ✅ Save both users in parallel
-    await Promise.all([winner.save(), loser.save()]);
+    const winnerBalanceBefore = winner.balance;
+    const netWin = game.betAmount - platformFee;
+    winner.balance     += netWin;
+    winner.gamesWon    += 1;
+    winner.gamesPlayed += 1;
+    winner.totalEarned += netWin;
+    loser.gamesPlayed  += 1;
+    loser.totalLost    += game.betAmount;
 
-    // ✅ Create all 3 transactions in parallel
-    await Promise.all([
-      Transaction.create({
-        user: winnerId, type: 'game_win', amount: netWin,
-        balanceBefore: winnerBalanceBefore, balanceAfter: winner.balance,
-        status: 'completed', gameId: game._id,
-      }),
-      Transaction.create({
-        user: loserId, type: 'game_loss', amount: game.betAmount,
-        balanceBefore: loserBalanceBefore, balanceAfter: loser.balance,
-        status: 'completed', gameId: game._id,
-      }),
-      Transaction.create({
-        user: winnerId, type: 'platform_fee', amount: platformFee,
-        balanceBefore: winner.balance, balanceAfter: winner.balance,
-        status: 'completed', gameId: game._id,
-      }),
-    ]);
+    await winner.save();
+    await loser.save();
 
-    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}`);
+    await Transaction.create({
+      user: winnerId,
+      type: 'game_win',
+      amount: netWin,
+      balanceBefore: winnerBalanceBefore,
+      balanceAfter:  winner.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    const loserBalanceBefore = loser.balance + game.betAmount;
+    await Transaction.create({
+      user: loserId,
+      type: 'game_loss',
+      amount: game.betAmount,
+      balanceBefore: loserBalanceBefore,
+      balanceAfter:  loser.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    await Transaction.create({
+      user: winnerId,
+      type: 'platform_fee',
+      amount: platformFee,
+      balanceBefore: winner.balance,
+      balanceAfter:  winner.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
   } catch (err) {
     console.error('Game settlement error:', err);
   }
@@ -304,6 +312,63 @@ module.exports = (io) => {
           currentTurn: game.currentTurn.toString(),
         });
 
+        // ✅ Start 1-min inactivity timer after dice rolled
+        // If player doesn't move a token in 1 minute — warn at 45s, abort at 60s
+        const timerKey = `move_${roomCode}`;
+        if (moveTimers.has(timerKey)) {
+          clearTimeout(moveTimers.get(timerKey).warn);
+          clearTimeout(moveTimers.get(timerKey).abort);
+        }
+
+        const warnTimer = setTimeout(() => {
+          io.to(roomCode).emit('move-warning', {
+            message: '⚠️ Move your token! Game will be aborted in 15 seconds.',
+            secondsLeft: 15,
+          });
+        }, 45 * 1000);
+
+        const abortTimer = setTimeout(async () => {
+          moveTimers.delete(timerKey);
+          try {
+            const freshGame = await Game.findOne({ roomCode: roomCode.toUpperCase(), status: 'active' });
+            if (!freshGame) return;
+            if (freshGame.lastDiceRoll === null || freshGame.lastDiceRoll === undefined) return;
+            if (freshGame.currentTurn.toString() !== socket.user._id.toString()) return;
+
+            // Abort game — inactive player loses
+            const pIdx = freshGame.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+            const oIdx = pIdx === 0 ? 1 : 0;
+            const winnerId = freshGame.players[oIdx].user._id;
+            const loserId  = socket.user._id;
+
+            const pot         = freshGame.betAmount * 2;
+            const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+            const winAmount   = pot - platformFee;
+
+            freshGame.status      = 'finished';
+            freshGame.winner      = winnerId;
+            freshGame.loser       = loserId;
+            freshGame.winAmount   = winAmount;
+            freshGame.platformFee = platformFee;
+            freshGame.finishedAt  = new Date();
+            await freshGame.save();
+
+            await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
+
+            io.to(roomCode).emit('game-over', {
+              reason:   'inactivity',
+              winner:   { id: winnerId.toString() },
+              loser:    { id: loserId.toString(), username: socket.user.username },
+              winAmount,
+              message:  `${socket.user.username} didn't move. Opponent wins!`,
+            });
+          } catch (err) {
+            console.error('Inactivity abort error:', err);
+          }
+        }, 60 * 1000);
+
+        moveTimers.set(timerKey, { warn: warnTimer, abort: abortTimer });
+
       } catch (err) {
         console.error('roll-dice error:', err);
         socket.emit('error', { message: 'Server error' });
@@ -328,6 +393,14 @@ module.exports = (io) => {
         const diceRoll = game.lastDiceRoll;
         if (diceRoll === null || diceRoll === undefined)
           return socket.emit('error', { message: 'Roll dice first' });
+
+        // ✅ Clear inactivity timer — player moved in time
+        const timerKey = `move_${roomCode}`;
+        if (moveTimers.has(timerKey)) {
+          clearTimeout(moveTimers.get(timerKey).warn);
+          clearTimeout(moveTimers.get(timerKey).abort);
+          moveTimers.delete(timerKey);
+        }
 
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
