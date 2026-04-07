@@ -11,10 +11,15 @@ const roomTimers = new Map(); // tracks 2-min auto-abort timers
 // Helper: Start 2-min waiting timer with live countdown
 // ============================
 function startWaitingTimer(io, roomCode) {
+  // ✅ Guard — if timer already running for this room, don't start another
+  if (roomTimers.has(roomCode)) {
+    console.log(`Timer already running for ${roomCode} — skipping duplicate`);
+    return;
+  }
+
   const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
   let remainingSeconds = 120;
 
-  // Emit countdown every second
   const tickInterval = setInterval(() => {
     remainingSeconds -= 1;
     io.to(roomCode).emit('waiting-countdown', {
@@ -24,7 +29,6 @@ function startWaitingTimer(io, roomCode) {
     if (remainingSeconds <= 0) clearInterval(tickInterval);
   }, 1000);
 
-  // Auto-abort after 2 minutes
   const abortTimer = setTimeout(async () => {
     clearInterval(tickInterval);
     try {
@@ -35,7 +39,7 @@ function startWaitingTimer(io, roomCode) {
       game.finishedAt = new Date();
       await game.save();
 
-      // Unlock creator's bet — do NOT add to balance (was never deducted)
+      // ✅ Only unlock lockedBalance — do NOT add to balance
       const creator = await User.findById(game.players[0].user);
       if (creator) {
         const availableBefore = creator.balance - creator.lockedBalance;
@@ -55,7 +59,7 @@ function startWaitingTimer(io, roomCode) {
 
       io.to(roomCode).emit('game-aborted', {
         reason: 'no_opponent',
-        message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
+        message: 'No opponent joined in 2 minutes. Game aborted. Bet unlocked.',
       });
     } catch (err) {
       console.error('Auto-abort error:', err);
@@ -462,7 +466,7 @@ module.exports = (io) => {
           game.finishedAt = new Date();
           await game.save();
 
-          // Unlock creator's bet — do NOT add to balance (was never deducted)
+          // ✅ Only unlock lockedBalance — do NOT add to balance
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
             const availableBefore = creator.balance - creator.lockedBalance;
