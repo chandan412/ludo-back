@@ -3,66 +3,132 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
-const { cancelWaitingTimer } = require('./waitingTimer');
 
 const activeRooms = new Map();
+const roomTimers = new Map(); // tracks 2-min auto-abort timers
+
+// ============================
+// Helper: Start 2-min waiting timer with live countdown
+// ============================
+function startWaitingTimer(io, roomCode) {
+  const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
+  let remainingSeconds = 120;
+
+  // Emit countdown every second
+  const tickInterval = setInterval(() => {
+    remainingSeconds -= 1;
+    io.to(roomCode).emit('waiting-countdown', {
+      secondsLeft: remainingSeconds,
+      message: `Waiting for opponent... ${remainingSeconds}s`,
+    });
+    if (remainingSeconds <= 0) clearInterval(tickInterval);
+  }, 1000);
+
+  // Auto-abort after 2 minutes
+  const abortTimer = setTimeout(async () => {
+    clearInterval(tickInterval);
+    try {
+      const game = await Game.findOne({ roomCode, status: 'waiting' });
+      if (!game) return; // already started or aborted
+
+      game.status = 'aborted';
+      game.finishedAt = new Date();
+      await game.save();
+
+      // Refund creator
+      const creator = await User.findById(game.players[0].user);
+      if (creator) {
+        const before = creator.balance;
+        creator.balance += game.betAmount;
+        creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
+        await creator.save();
+
+        await Transaction.create({
+          user: creator._id,
+          type: 'refund',
+          amount: game.betAmount,
+          balanceBefore: before,
+          balanceAfter: creator.balance,
+          status: 'completed',
+          gameId: game._id,
+        });
+      }
+
+      io.to(roomCode).emit('game-aborted', {
+        reason: 'no_opponent',
+        message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
+      });
+    } catch (err) {
+      console.error('Auto-abort error:', err);
+    } finally {
+      roomTimers.delete(roomCode);
+    }
+  }, WAIT_DURATION);
+
+  roomTimers.set(roomCode, { abortTimer, tickInterval });
+}
+
+// ============================
+// Helper: Cancel waiting timer (when opponent joins)
+// ============================
+function cancelWaitingTimer(roomCode) {
+  const timers = roomTimers.get(roomCode);
+  if (timers) {
+    clearTimeout(timers.abortTimer);
+    clearInterval(timers.tickInterval);
+    roomTimers.delete(roomCode);
+  }
+}
 
 // ============================
 // Helper: Settle game finances
 // ============================
 async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
   try {
-    const winner = await User.findById(winnerId);
-    const loser  = await User.findById(loserId);
+    // ✅ Fetch both users in parallel — 2x faster
+    const [winner, loser] = await Promise.all([
+      User.findById(winnerId),
+      User.findById(loserId),
+    ]);
+
+    const netWin = game.betAmount - platformFee;
+    const winnerBalanceBefore = winner.balance;
+    const loserBalanceBefore  = loser.balance;
 
     winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
-    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
+    winner.balance      += netWin;
+    winner.gamesWon     += 1;
+    winner.gamesPlayed  += 1;
+    winner.totalEarned  += netWin;
+
+    loser.lockedBalance  = Math.max(0, loser.lockedBalance - game.betAmount);
     loser.balance        = Math.max(0, loser.balance - game.betAmount);
+    loser.gamesPlayed   += 1;
+    loser.totalLost     += game.betAmount;
 
-    const winnerBalanceBefore = winner.balance;
-    const netWin = game.betAmount - platformFee;
-    winner.balance     += netWin;
-    winner.gamesWon    += 1;
-    winner.gamesPlayed += 1;
-    winner.totalEarned += netWin;
-    loser.gamesPlayed  += 1;
-    loser.totalLost    += game.betAmount;
+    // ✅ Save both users in parallel
+    await Promise.all([winner.save(), loser.save()]);
 
-    await winner.save();
-    await loser.save();
+    // ✅ Create all 3 transactions in parallel
+    await Promise.all([
+      Transaction.create({
+        user: winnerId, type: 'game_win', amount: netWin,
+        balanceBefore: winnerBalanceBefore, balanceAfter: winner.balance,
+        status: 'completed', gameId: game._id,
+      }),
+      Transaction.create({
+        user: loserId, type: 'game_loss', amount: game.betAmount,
+        balanceBefore: loserBalanceBefore, balanceAfter: loser.balance,
+        status: 'completed', gameId: game._id,
+      }),
+      Transaction.create({
+        user: winnerId, type: 'platform_fee', amount: platformFee,
+        balanceBefore: winner.balance, balanceAfter: winner.balance,
+        status: 'completed', gameId: game._id,
+      }),
+    ]);
 
-    await Transaction.create({
-      user: winnerId,
-      type: 'game_win',
-      amount: netWin,
-      balanceBefore: winnerBalanceBefore,
-      balanceAfter:  winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    const loserBalanceBefore = loser.balance + game.betAmount;
-    await Transaction.create({
-      user: loserId,
-      type: 'game_loss',
-      amount: game.betAmount,
-      balanceBefore: loserBalanceBefore,
-      balanceAfter:  loser.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    await Transaction.create({
-      user: winnerId,
-      type: 'platform_fee',
-      amount: platformFee,
-      balanceBefore: winner.balance,
-      balanceAfter:  winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
+    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}`);
   } catch (err) {
     console.error('Game settlement error:', err);
   }
@@ -112,17 +178,13 @@ module.exports = (io) => {
         socket.join(roomCode);
         socket.currentRoom = roomCode;
 
-        // ✅ Timer already started at HTTP create — just send current remaining time to UI
-        const game = await Game.findOne({ roomCode, status: 'waiting' });
-        if (!game) return;
+        // Start 2-minute auto-abort countdown
+        startWaitingTimer(io, roomCode);
 
-        const elapsed   = Math.floor((Date.now() - new Date(game.createdAt).getTime()) / 1000);
-        const remaining = Math.max(0, 120 - elapsed);
-        socket.emit('waiting-countdown', { secondsLeft: remaining });
-
-        console.log(`${socket.user.username} in room ${roomCode} as creator, ${remaining}s remaining`);
+        console.log(`${socket.user.username} created room ${roomCode}, waiting timer started`);
       } catch (err) {
         console.error('created-room error:', err);
+        socket.emit('error', { message: 'Failed to initialize room' });
       }
     });
 
@@ -388,25 +450,26 @@ module.exports = (io) => {
 
         // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
         if (game.status === 'waiting') {
-          // ✅ Cancel the server timer — waitingTimer module handles the abort
-          cancelWaitingTimer(socket.currentRoom);
+          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
 
           game.status = 'aborted';
           game.finishedAt = new Date();
           await game.save();
 
-          // ✅ Only unlock lockedBalance — do NOT add to balance
+          // Refund creator (only creator has paid at this point)
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
-            const availableBefore = creator.balance - creator.lockedBalance;
+            const before = creator.balance;
+            creator.balance += game.betAmount;
             creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
             await creator.save();
+
             await Transaction.create({
               user: creator._id,
               type: 'refund',
               amount: game.betAmount,
-              balanceBefore: availableBefore,
-              balanceAfter: creator.balance - creator.lockedBalance,
+              balanceBefore: before,
+              balanceAfter: creator.balance,
               status: 'completed',
               gameId: game._id,
             });
@@ -414,10 +477,10 @@ module.exports = (io) => {
 
           io.to(socket.currentRoom).emit('game-aborted', {
             reason: 'creator_left',
-            message: 'Room creator left. Game aborted. Bet unlocked.',
+            message: 'Room creator left. Game aborted. Bet refunded.',
           });
 
-          return;
+          return; // stop here — no 60s timer needed
         }
 
         // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
