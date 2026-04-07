@@ -14,27 +14,28 @@ const gameSocket = require('./socket/gameSocket');
 const app = express();
 const server = http.createServer(app);
 
-// ✅ Fixed CORS
-const allowedOrigins = [
-  'https://ludo-fron.vercel.app',
-  'http://localhost:3000'
-];
+// ✅ CORS origin checker — allows localhost + any vercel.app deployment
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true; // curl, mobile apps, server-to-server
+  if (origin === 'http://localhost:3000') return true;
+  if (origin.endsWith('.vercel.app')) return true;
+  return false;
+};
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) callback(null, true);
+      else callback(new Error('Not allowed by CORS'));
+    },
     methods: ['GET', 'POST'],
     credentials: true
   }
 });
 
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -55,37 +56,16 @@ app.use('/api/settings', settingsRoutes);
 gameSocket(io);
 
 const PORT = process.env.PORT || 5000;
-
-// Start HTTP server immediately — don't block on DB
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
-
-// MongoDB with robust options and auto-reconnect
-const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI, {
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-      heartbeatFrequencyMS: 10000,
-    });
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => {
     console.log('✅ MongoDB connected');
-  } catch (err) {
-    console.error('❌ MongoDB connection failed:', err.message);
-    setTimeout(connectDB, 5000); // retry after 5s instead of crashing
-  }
-};
-
-mongoose.connection.on('disconnected', () => {
-  console.warn('⚠️ MongoDB disconnected — retrying in 3s...');
-  setTimeout(connectDB, 3000);
-});
-
-mongoose.connection.on('error', (err) => {
-  console.error('❌ MongoDB error:', err.message);
-});
-
-connectDB();
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`✅ Server running on port ${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ MongoDB Connection Error:', err.message);
+    process.exit(1);
+  });
 
 module.exports = { app, io };
