@@ -4,14 +4,14 @@ const http = require('http');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
-const authRoutes = require('./routes/auth');
-const walletRoutes = require('./routes/wallet');
-const gameRoutes = require('./routes/game');
-const adminRoutes = require('./routes/admin');
+const authRoutes     = require('./routes/auth');
+const walletRoutes   = require('./routes/wallet');
+const gameRoutes     = require('./routes/game');
+const adminRoutes    = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
-const cricketRoutes = require('./routes/cricket');
-const gameSocket = require('./socket/gameSocket');
-const { setIO, resumeTimersOnStartup } = require('./socket/waitingTimer');
+const cricketRoutes  = require('./routes/cricket');
+const { router: chatRoutes, setIO: setChatIO } = require('./routes/chat');
+const gameSocket     = require('./socket/gameSocket');
 
 const app = express();
 const server = http.createServer(app);
@@ -53,46 +53,23 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/game', gameRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/cricket',  cricketRoutes);
+app.use('/api/chat',     chatRoutes);
 
 gameSocket(io);
-
-// ✅ Wire io into the timer module so it can broadcast countdowns
-setIO(io);
-
-app.use('/api/auth',     authRoutes);
-app.use('/api/wallet',   walletRoutes);
-app.use('/api/game',     gameRoutes);
-app.use('/api/admin',    adminRoutes);
-app.use('/api/settings', settingsRoutes);
-app.use('/api/cricket',  cricketRoutes);
+setChatIO(io);
 
 const PORT = process.env.PORT || 5000;
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
-
-const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGODB_URI, {
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    });
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => {
     console.log('✅ MongoDB connected');
-    // ✅ Resume timers for any waiting games after DB connects
-    await resumeTimersOnStartup();
-  } catch (err) {
-    console.error('❌ MongoDB connection failed:', err.message);
-    setTimeout(connectDB, 5000);
-  }
-};
-
-mongoose.connection.on('disconnected', () => {
-  console.warn('⚠️ MongoDB disconnected — retrying in 3s...');
-  setTimeout(connectDB, 3000);
-});
-
-connectDB();
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`✅ Server running on port ${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ MongoDB Connection Error:', err.message);
+    process.exit(1);
+  });
 
 module.exports = { app, io };
