@@ -9,33 +9,33 @@ const walletRoutes = require('./routes/wallet');
 const gameRoutes = require('./routes/game');
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
+const cricketRoutes = require('./routes/cricket');
 const gameSocket = require('./socket/gameSocket');
 
 const app = express();
 const server = http.createServer(app);
 
-// ✅ CORS origin checker — allows localhost + any vercel.app deployment
-const isAllowedOrigin = (origin) => {
-  if (!origin) return true; // curl, mobile apps, server-to-server
-  if (origin === 'http://localhost:3000') return true;
-  if (origin.endsWith('.vercel.app')) return true;
-  return false;
-};
+// ✅ Fixed CORS
+const allowedOrigins = [
+  'https://ludo-fron.vercel.app',
+  'http://localhost:3000'
+];
 
 const io = new Server(server, {
   cors: {
-    origin: (origin, callback) => {
-      if (isAllowedOrigin(origin)) callback(null, true);
-      else callback(new Error('Not allowed by CORS'));
-    },
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
     credentials: true
   }
 });
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (isAllowedOrigin(origin)) return callback(null, true);
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -52,6 +52,7 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/game', gameRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/cricket', cricketRoutes);
 
 gameSocket(io);
 
