@@ -18,11 +18,21 @@ router.get('/lobby', auth, async (req, res) => {
       if (maxBet) query.betAmount.$lte = parseInt(maxBet);
     }
     query.createdBy = { $ne: req.user._id };
+    const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
     const games = await Game.find(query)
       .populate('createdBy', 'username gamesPlayed gamesWon')
       .sort({ createdAt: -1 })
       .limit(50);
-    res.json(games);
+
+    // Add secondsLeft so frontend can show countdown without socket
+    const now = Date.now();
+    const gamesWithTimer = games.map(g => {
+      const elapsed = now - new Date(g.createdAt).getTime();
+      const secondsLeft = Math.max(0, Math.floor((WAIT_DURATION - elapsed) / 1000));
+      return { ...g.toObject(), secondsLeft };
+    });
+
+    res.json(gamesWithTimer);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -42,6 +52,7 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
+// ✅ FIXED: returns all statuses so Lobby can detect waiting/active games
 router.get('/my-games/history', auth, async (req, res) => {
   try {
     const games = await Game.find({
@@ -156,9 +167,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// POST /api/game/cancel/:roomCode
-// FIX: Only reduce lockedBalance on cancel — do NOT touch balance.
-// balance only changes on deposit, withdrawal, win, or loss.
+// ✅ FIXED: cancel uses 'aborted' status + creates transaction record
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -172,23 +181,16 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
       return res.status(403).json({ message: 'Only game creator can cancel' });
 
     const user = await User.findById(req.user._id);
-
-    // Capture available balance before and after unlock (for accurate transaction log)
-    const availableBefore = user.balance - user.lockedBalance;
-
-    // ✅ Only unlock — do NOT add to balance (money was never deducted from balance)
+    const balanceBefore = user.balance;
     user.lockedBalance = Math.max(0, user.lockedBalance - game.betAmount);
     await user.save();
 
-    const availableAfter = user.balance - user.lockedBalance;
-
-    // Record transaction with correct available balances
     await Transaction.create({
       user: user._id,
       type: 'refund',
       amount: game.betAmount,
-      balanceBefore: availableBefore,
-      balanceAfter: availableAfter,
+      balanceBefore,
+      balanceAfter: user.balance,
       status: 'completed',
       gameId: game._id,
     });
@@ -197,7 +199,7 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
     game.finishedAt = new Date();
     await game.save();
 
-    res.json({ message: 'Game cancelled. Bet unlocked.' });
+    res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
