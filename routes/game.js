@@ -4,7 +4,6 @@ const Game = require('../models/Game');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
-const { startWaitingTimer, cancelWaitingTimer } = require('../socket/waitingTimer');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -35,6 +34,20 @@ router.get('/my-active-game', auth, async (req, res) => {
     const game = await Game.findOne({
       'players.user': req.user._id,
       status: 'active'
+    }).populate('players.user', 'username');
+    if (!game) return res.status(404).json(null);
+    res.json(game);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/game/my-waiting-game
+router.get('/my-waiting-game', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      'players.user': req.user._id,
+      status: 'waiting'
     }).populate('players.user', 'username');
     if (!game) return res.status(404).json(null);
     res.json(game);
@@ -100,11 +113,6 @@ router.post('/create', auth, async (req, res) => {
     });
 
     await game.populate('createdBy', 'username');
-
-    // ✅ Start 2-min timer immediately at HTTP create — no socket needed
-    // Timer is server-authoritative. Page refreshes have zero effect.
-    startWaitingTimer(game.roomCode, 120);
-
     res.status(201).json({ message: 'Game created! Share the room code.', game });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -156,9 +164,6 @@ router.post('/join/:roomCode', auth, async (req, res) => {
     game.startedAt = new Date();
     await game.save();
 
-    // ✅ Cancel the waiting timer — opponent joined
-    cancelWaitingTimer(req.params.roomCode.toUpperCase());
-
     await game.populate('players.user', 'username');
     res.json({ message: 'Joined game! Starting now.', game });
   } catch (err) {
@@ -197,9 +202,6 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
     game.status = 'aborted';
     game.finishedAt = new Date();
     await game.save();
-
-    // ✅ Cancel the waiting timer
-    cancelWaitingTimer(req.params.roomCode.toUpperCase());
 
     res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
