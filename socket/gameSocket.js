@@ -3,81 +3,9 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
+const { cancelWaitingTimer } = require('./waitingTimer');
 
 const activeRooms = new Map();
-const roomTimers = new Map(); // tracks 2-min auto-abort timers
-
-// ============================
-// Helper: Start 2-min waiting timer with live countdown
-// ============================
-function startWaitingTimer(io, roomCode) {
-  const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
-  let remainingSeconds = 120;
-
-  // Emit countdown every second
-  const tickInterval = setInterval(() => {
-    remainingSeconds -= 1;
-    io.to(roomCode).emit('waiting-countdown', {
-      secondsLeft: remainingSeconds,
-      message: `Waiting for opponent... ${remainingSeconds}s`,
-    });
-    if (remainingSeconds <= 0) clearInterval(tickInterval);
-  }, 1000);
-
-  // Auto-abort after 2 minutes
-  const abortTimer = setTimeout(async () => {
-    clearInterval(tickInterval);
-    try {
-      const game = await Game.findOne({ roomCode, status: 'waiting' });
-      if (!game) return; // already started or aborted
-
-      game.status = 'aborted';
-      game.finishedAt = new Date();
-      await game.save();
-
-      // ✅ Only unlock lockedBalance — do NOT touch balance (was never deducted)
-      const creator = await User.findById(game.players[0].user);
-      if (creator) {
-        const availableBefore = creator.balance - creator.lockedBalance;
-        creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
-        await creator.save();
-
-        await Transaction.create({
-          user: creator._id,
-          type: 'refund',
-          amount: game.betAmount,
-          balanceBefore: availableBefore,
-          balanceAfter: creator.balance - creator.lockedBalance,
-          status: 'completed',
-          gameId: game._id,
-        });
-      }
-
-      io.to(roomCode).emit('game-aborted', {
-        reason: 'no_opponent',
-        message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
-      });
-    } catch (err) {
-      console.error('Auto-abort error:', err);
-    } finally {
-      roomTimers.delete(roomCode);
-    }
-  }, WAIT_DURATION);
-
-  roomTimers.set(roomCode, { abortTimer, tickInterval });
-}
-
-// ============================
-// Helper: Cancel waiting timer (when opponent joins)
-// ============================
-function cancelWaitingTimer(roomCode) {
-  const timers = roomTimers.get(roomCode);
-  if (timers) {
-    clearTimeout(timers.abortTimer);
-    clearInterval(timers.tickInterval);
-    roomTimers.delete(roomCode);
-  }
-}
 
 // ============================
 // Helper: Settle game finances
@@ -184,13 +112,17 @@ module.exports = (io) => {
         socket.join(roomCode);
         socket.currentRoom = roomCode;
 
-        // Start 2-minute auto-abort countdown
-        startWaitingTimer(io, roomCode);
+        // ✅ Timer already started at HTTP create — just send current remaining time to UI
+        const game = await Game.findOne({ roomCode, status: 'waiting' });
+        if (!game) return;
 
-        console.log(`${socket.user.username} created room ${roomCode}, waiting timer started`);
+        const elapsed   = Math.floor((Date.now() - new Date(game.createdAt).getTime()) / 1000);
+        const remaining = Math.max(0, 120 - elapsed);
+        socket.emit('waiting-countdown', { secondsLeft: remaining });
+
+        console.log(`${socket.user.username} in room ${roomCode} as creator, ${remaining}s remaining`);
       } catch (err) {
         console.error('created-room error:', err);
-        socket.emit('error', { message: 'Failed to initialize room' });
       }
     });
 
@@ -456,19 +388,19 @@ module.exports = (io) => {
 
         // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
         if (game.status === 'waiting') {
-          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
+          // ✅ Cancel the server timer — waitingTimer module handles the abort
+          cancelWaitingTimer(socket.currentRoom);
 
           game.status = 'aborted';
           game.finishedAt = new Date();
           await game.save();
 
-          // ✅ Only unlock lockedBalance — do NOT touch balance (was never deducted)
+          // ✅ Only unlock lockedBalance — do NOT add to balance
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
             const availableBefore = creator.balance - creator.lockedBalance;
             creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
             await creator.save();
-
             await Transaction.create({
               user: creator._id,
               type: 'refund',
@@ -482,10 +414,10 @@ module.exports = (io) => {
 
           io.to(socket.currentRoom).emit('game-aborted', {
             reason: 'creator_left',
-            message: 'Room creator left. Game aborted. Bet refunded.',
+            message: 'Room creator left. Game aborted. Bet unlocked.',
           });
 
-          return; // stop here — no 60s timer needed
+          return;
         }
 
         // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
