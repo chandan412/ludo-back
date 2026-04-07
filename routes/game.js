@@ -89,7 +89,6 @@ router.post('/create', auth, async (req, res) => {
       players: [{
         user: req.user._id,
         color: 'red',
-        isConnected: false, // ✅ always start as false — socket sets it on join-room
         tokens: [
           { position: -1, isHome: true, isFinished: false },
           { position: -1, isHome: true, isFinished: false },
@@ -212,6 +211,86 @@ router.get('/:roomCode', auth, async (req, res) => {
 
     res.json(game);
   } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/game/forfeit/:roomCode — player exits active game, opponent wins immediately
+router.post('/forfeit/:roomCode', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'active'
+    });
+    if (!game) return res.status(404).json({ message: 'Active game not found' });
+
+    const playerIdx = game.players.findIndex(
+      p => p.user.toString() === req.user._id.toString()
+    );
+    if (playerIdx === -1) return res.status(403).json({ message: 'Not a player in this game' });
+
+    const opponentIdx = playerIdx === 0 ? 1 : 0;
+    const winnerId = game.players[opponentIdx].user;
+    const loserId  = req.user._id;
+
+    const pot         = game.betAmount * 2;
+    const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+    const winAmount   = pot - platformFee;
+
+    game.status      = 'finished';
+    game.winner      = winnerId;
+    game.loser       = loserId;
+    game.winAmount   = winAmount;
+    game.platformFee = platformFee;
+    game.finishedAt  = new Date();
+    await game.save();
+
+    // Settle balances
+    const winner = await User.findById(winnerId);
+    const loser  = await User.findById(loserId);
+
+    winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
+    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
+    loser.balance        = Math.max(0, loser.balance - game.betAmount);
+
+    const winnerBalBefore = winner.balance;
+    winner.balance     += winAmount;
+    winner.gamesWon    += 1;
+    winner.gamesPlayed += 1;
+    winner.totalEarned += winAmount;
+    loser.gamesPlayed  += 1;
+    loser.totalLost    += game.betAmount;
+
+    await winner.save();
+    await loser.save();
+
+    await Transaction.create({
+      user: winnerId, type: 'game_win', amount: winAmount,
+      balanceBefore: winnerBalBefore, balanceAfter: winner.balance,
+      status: 'completed', gameId: game._id,
+    });
+    await Transaction.create({
+      user: loserId, type: 'game_loss', amount: game.betAmount,
+      balanceBefore: loser.balance + game.betAmount, balanceAfter: loser.balance,
+      status: 'completed', gameId: game._id,
+    });
+
+    // Notify via socket if possible
+    const { io } = require('../server');
+    if (io) {
+      io.to(req.params.roomCode.toUpperCase()).emit('game-over', {
+        reason: 'forfeit',
+        winner: { id: winnerId.toString() },
+        loser:  { id: loserId.toString(), username: req.user.username },
+        winAmount,
+        platformFee,
+        message: `${req.user.username} forfeited. You win!`,
+      });
+    }
+
+    res.json({ message: 'Game forfeited', winnerId, winAmount });
+  } catch (err) {
+    console.error('Forfeit error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
