@@ -2,6 +2,7 @@ const express = require('express');
 const router  = express.Router();
 const jwt     = require('jsonwebtoken');
 const User    = require('../models/User');
+const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
 
 // POST /api/auth/register
@@ -14,7 +15,20 @@ router.post('/register', async (req, res) => {
     const exists = await User.findOne({ $or: [{ email }, { phone }, { username }] });
     if (exists) return res.status(400).json({ message: 'User already exists' });
 
-    const user = await User.create({ username, email, phone, password });
+    // ✅ Give ₹100 signup bonus
+    const user = await User.create({ username, email, phone, password, balance: 100 });
+
+    // ✅ Record bonus transaction
+    await Transaction.create({
+      user:          user._id,
+      type:          'bonus',
+      amount:        100,
+      balanceBefore: 0,
+      balanceAfter:  100,
+      status:        'completed',
+      description:   'Welcome bonus',
+    });
+
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.status(201).json({ token, user: user.toSafeObject() });
   } catch (err) {
@@ -22,7 +36,7 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login — accepts email or phone
+// POST /api/auth/login
 router.post('/login', async (req, res) => {
   try {
     const { email, phone, password } = req.body;
