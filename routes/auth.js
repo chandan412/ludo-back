@@ -22,14 +22,14 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login
+// POST /api/auth/login — accepts email or phone
 router.post('/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password)
-      return res.status(400).json({ message: 'Email and password required' });
+    const { email, phone, password } = req.body;
+    if ((!email && !phone) || !password)
+      return res.status(400).json({ message: 'Email/phone and password required' });
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne(email ? { email } : { phone });
     if (!user) return res.status(400).json({ message: 'Invalid credentials' });
     if (user.isBanned) return res.status(403).json({ message: 'Your account has been banned' });
     if (!user.isActive) return res.status(403).json({ message: 'Account inactive' });
