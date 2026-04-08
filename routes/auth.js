@@ -1,37 +1,59 @@
-const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const express = require('express');
+const router  = express.Router();
+const jwt     = require('jsonwebtoken');
+const User    = require('../models/User');
+const { auth } = require('../middleware/auth');
 
-const auth = async (req, res, next) => {
+// POST /api/auth/register
+router.post('/register', async (req, res) => {
   try {
-    const token = req.header('Authorization')?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ message: 'No token, access denied' });
+    const { username, email, phone, password } = req.body;
+    if (!username || !email || !phone || !password)
+      return res.status(400).json({ message: 'All fields required' });
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).select('-password');
+    const exists = await User.findOne({ $or: [{ email }, { phone }, { username }] });
+    if (exists) return res.status(400).json({ message: 'User already exists' });
 
-    if (!user) return res.status(401).json({ message: 'Token invalid' });
+    const user = await User.create({ username, email, phone, password });
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({ token, user: user.toSafeObject() });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/auth/login
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ message: 'Email and password required' });
+
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ message: 'Invalid credentials' });
     if (user.isBanned) return res.status(403).json({ message: 'Your account has been banned' });
     if (!user.isActive) return res.status(403).json({ message: 'Account inactive' });
 
-    req.user = user;
-    next();
+    const match = await user.comparePassword(password);
+    if (!match) return res.status(400).json({ message: 'Invalid credentials' });
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: user.toSafeObject() });
   } catch (err) {
-    res.status(401).json({ message: 'Token invalid or expired' });
+    res.status(500).json({ message: 'Server error' });
   }
-};
+});
 
-const adminAuth = async (req, res, next) => {
-  await auth(req, res, () => {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Admin access required' });
-    }
-    next();
-  });
-};
+// GET /api/auth/me
+router.get('/me', auth, async (req, res) => {
+  try {
+    res.json(req.user.toSafeObject());
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
 
-module.exports = { auth, adminAuth };
-
-// POST /api/auth/fcm-token — save player's FCM token
+// POST /api/auth/fcm-token
 router.post('/fcm-token', auth, async (req, res) => {
   try {
     const { token } = req.body;
@@ -42,3 +64,5 @@ router.post('/fcm-token', auth, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+module.exports = router;
