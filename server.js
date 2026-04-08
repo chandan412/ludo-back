@@ -11,6 +11,7 @@ const adminRoutes    = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
 const cricketRoutes  = require('./routes/cricket');
 const { router: chatRoutes, setIO: setChatIO } = require('./routes/chat');
+const notifRoutes = require('./routes/notifications');
 const gameSocket     = require('./socket/gameSocket');
 
 const app    = express();
@@ -50,6 +51,7 @@ app.use('/api/admin',    adminRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/cricket',  cricketRoutes);
 app.use('/api/chat',     chatRoutes);
+app.use('/api/notifications', notifRoutes);
 
 gameSocket(io);
 setChatIO(io);
