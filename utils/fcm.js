@@ -1,11 +1,9 @@
-// utils/fcm.js — FCM helper using HTTP v1 API
+// utils/fcm.js — FCM helper using HTTP v1 API (no node-fetch dependency)
 const { GoogleAuth } = require('google-auth-library');
-const fetch = require('node-fetch');
+const https = require('https');
 
 const PROJECT_ID = 'ludo-app-86957';
-const FCM_URL = `https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`;
 
-// Service account credentials
 const SERVICE_ACCOUNT = {
   type: "service_account",
   project_id: "ludo-app-86957",
@@ -27,17 +25,40 @@ async function getAccessToken() {
   return token.token;
 }
 
+// Native https POST helper (replaces node-fetch)
+function httpsPost(url, headers, body) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const data   = JSON.stringify(body);
+    const options = {
+      hostname: parsed.hostname,
+      path:     parsed.pathname,
+      method:   'POST',
+      headers:  { ...headers, 'Content-Length': Buffer.byteLength(data) },
+    };
+    const req = https.request(options, (res) => {
+      let raw = '';
+      res.on('data', chunk => raw += chunk);
+      res.on('end', () => {
+        try { resolve({ ok: res.statusCode < 300, status: res.statusCode, json: JSON.parse(raw) }); }
+        catch { resolve({ ok: false, status: res.statusCode, json: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 // Send to single device
 async function sendNotification(fcmToken, title, body, data = {}) {
   try {
     const accessToken = await getAccessToken();
-    const res = await fetch(FCM_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
+    const FCM_URL = `https://fcm.googleapis.com/v1/projects/${PROJECT_ID}/messages:send`;
+    const res = await httpsPost(
+      FCM_URL,
+      { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      {
         message: {
           token: fcmToken,
           notification: { title, body },
@@ -47,28 +68,22 @@ async function sendNotification(fcmToken, title, body, data = {}) {
             fcm_options: { link: data.url || '/dashboard' },
           },
         },
-      }),
-    });
-    const result = await res.json();
-    if (!res.ok) console.error('FCM error:', result);
-    return result;
+      }
+    );
+    if (!res.ok) console.error('FCM error:', res.json);
+    return res.json;
   } catch (err) {
     console.error('FCM send error:', err);
   }
 }
 
-// Send to multiple devices (batch)
+// Send to multiple devices in parallel batches of 10
 async function sendNotificationToAll(tokens, title, body, data = {}) {
-  // FCM v1 doesn't support multicast — send in parallel batches of 10
-  const results = [];
   const chunks = [];
-  for (let i = 0; i < tokens.length; i += 10) {
-    chunks.push(tokens.slice(i, i + 10));
-  }
+  for (let i = 0; i < tokens.length; i += 10) chunks.push(tokens.slice(i, i + 10));
   for (const chunk of chunks) {
     await Promise.all(chunk.map(token => sendNotification(token, title, body, data)));
   }
-  return results;
 }
 
 module.exports = { sendNotification, sendNotificationToAll };
