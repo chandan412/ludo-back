@@ -195,6 +195,42 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
   }
 });
 
+// GET /api/game/my-waiting-game
+router.get('/my-waiting-game', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      'players.user': req.user._id,
+      status: 'waiting'
+    }).populate('players.user', 'username');
+    if (!game) return res.status(404).json(null);
+    res.json(game);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/game/recent-winners
+router.get('/recent-winners', auth, async (req, res) => {
+  try {
+    const games = await Game.find({ status: 'finished' })
+      .populate('winner', 'username')
+      .populate('players.user', 'username')
+      .sort({ finishedAt: -1 })
+      .limit(10);
+    const winners = games
+      .filter(g => g.winner)
+      .map(g => ({
+        username: g.winner.username,
+        winAmount: g.winAmount,
+        betAmount: g.betAmount,
+        finishedAt: g.finishedAt,
+      }));
+    res.json(winners);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // GET /api/game/:roomCode — ALWAYS LAST
 router.get('/:roomCode', auth, async (req, res) => {
   try {
@@ -216,40 +252,3 @@ router.get('/:roomCode', auth, async (req, res) => {
 });
 
 module.exports = router;
-
-// GET /api/game/recent-winners — for ticker banner
-router.get('/recent-winners', async (req, res) => {
-  try {
-    const games = await Game.find({ status: 'finished' })
-      .sort({ finishedAt: -1 })
-      .limit(20)
-      .populate('winner', 'username')
-      .populate('players.user', 'username')
-      .lean();
-
-    const items = [];
-    games.forEach(g => {
-      // Add win item
-      if (g.winner?.username && g.winAmount >= 100) {
-        items.push({
-          name:   g.winner.username,
-          amount: Math.min(g.winAmount, 50000),
-          type:   'win',
-        });
-      }
-      // Add game item for active-ish games
-      const names = g.players.map(p => p.user?.username).filter(Boolean);
-      if (names.length === 2 && g.betAmount >= 100) {
-        items.push({
-          name:   `${names[0]} vs ${names[1]}`,
-          amount: Math.min(g.betAmount, 50000),
-          type:   'game',
-        });
-      }
-    });
-
-    res.json(items.slice(0, 20));
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
