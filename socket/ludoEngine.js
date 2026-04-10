@@ -1,13 +1,13 @@
-const BOARD_PATH_LENGTH = 52;
-const HOME_STRETCH_LENGTH = 6;
-const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 58
+const BOARD_PATH_LENGTH   = 52;  // main loop squares (0-51)
+const HOME_STRETCH_LENGTH = 6;   // colored home column squares (52-57)
+const HOME_CENTER         = 58;  // center triangle — the true finish (progress 58)
+const TOTAL_PATH          = HOME_CENTER + 1; // 59
 
 const START_POSITIONS = { red: 0, blue: 26 };
 
 // Safe squares by GLOBAL board position (0-51)
 const SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
 
-// ✅ FIX: Central helper — always normalize token position to a number
 function normalizeProgress(position) {
   if (position === undefined || position === null || isNaN(position)) return -1;
   return Number(position);
@@ -19,26 +19,21 @@ class LudoEngine {
     return Math.floor(Math.random() * 6) + 1;
   }
 
-  // Returns global board position (0-51) for tokens on main loop
-  // Returns null for tokens in home stretch (progress >= 52) — they can't be captured
   static getGlobalPosition(color, progress) {
-    if (progress < 0) return null;                  // still in home base
-    if (progress >= BOARD_PATH_LENGTH) return null; // in home stretch — safe, can't capture
+    if (progress < 0) return null;
+    if (progress >= BOARD_PATH_LENGTH) return null;
     const start = START_POSITIONS[color];
     return (start + progress) % BOARD_PATH_LENGTH;
   }
 
-  // ✅ FIX: Use normalizeProgress everywhere for opponent tokens
   static canCapture(globalPos, opponentState) {
     if (!opponentState || globalPos === null) return false;
     if (SAFE_SQUARES.has(globalPos)) return false;
-
     return opponentState.tokens.some(t => {
       if (t.isFinished) return false;
       const tProgress = normalizeProgress(t.position);
-      if (tProgress < 0) return false;                    // in home base
-      if (tProgress >= BOARD_PATH_LENGTH) return false;   // in home stretch — safe
-
+      if (tProgress < 0) return false;
+      if (tProgress >= BOARD_PATH_LENGTH) return false;
       const opGlobal = this.getGlobalPosition(opponentState.color, tProgress);
       return opGlobal === globalPos;
     });
@@ -50,63 +45,39 @@ class LudoEngine {
 
     tokens.forEach((token, index) => {
       if (token.isFinished) return;
-
       const progress = normalizeProgress(token.position);
 
-      // Token in home base — only a 6 can bring it out
       if (progress === -1) {
         if (diceRoll === 6) {
-          const globalPos = this.getGlobalPosition(color, 0);
+          const globalPos  = this.getGlobalPosition(color, 0);
           const canCapture = this.canCapture(globalPos, opponentState);
-          validMoves.push({
-            tokenIndex: index,
-            currentProgress: -1,
-            newProgress: 0,
-            canCapture,
-            willFinish: false
-          });
+          validMoves.push({ tokenIndex: index, currentProgress: -1, newProgress: 0, canCapture, willFinish: false });
         }
         return;
       }
 
       const newProgress = progress + diceRoll;
+      if (newProgress > HOME_CENTER) return; // cannot overshoot center — exact roll needed
 
-      // Can't overshoot the finish
-      if (newProgress > TOTAL_PATH - 1) return;
-
-      const willFinish = newProgress === TOTAL_PATH - 1;
-
+      const willFinish = newProgress === HOME_CENTER;
       const globalPos  = this.getGlobalPosition(color, newProgress);
-      const canCapture = !willFinish && globalPos !== null
-        ? this.canCapture(globalPos, opponentState)
-        : false;
+      const canCapture = (!willFinish && globalPos !== null) ? this.canCapture(globalPos, opponentState) : false;
 
-      validMoves.push({
-        tokenIndex: index,
-        currentProgress: progress,
-        newProgress,
-        canCapture,
-        willFinish
-      });
+      validMoves.push({ tokenIndex: index, currentProgress: progress, newProgress, canCapture, willFinish });
     });
 
     return validMoves;
   }
 
   static applyMove(playerState, opponentState, tokenIndex, diceRoll) {
-    // ✅ FIX: Normalize ALL positions up front using helper
     const newPlayerTokens = playerState.tokens.map(t => ({
-      position:   normalizeProgress(t.position),
-      isHome:     t.isHome ?? true,
-      isFinished: t.isFinished ?? false,
+      position: normalizeProgress(t.position), isHome: t.isHome ?? true, isFinished: t.isFinished ?? false,
     }));
     const newOpponentTokens = opponentState.tokens.map(t => ({
-      position:   normalizeProgress(t.position),
-      isHome:     t.isHome ?? true,
-      isFinished: t.isFinished ?? false,
+      position: normalizeProgress(t.position), isHome: t.isHome ?? true, isFinished: t.isFinished ?? false,
     }));
 
-    const token      = newPlayerTokens[tokenIndex];
+    const token       = newPlayerTokens[tokenIndex];
     const oldProgress = normalizeProgress(token.position);
     const newProgress = oldProgress === -1 ? 0 : oldProgress + diceRoll;
 
@@ -116,39 +87,33 @@ class LudoEngine {
     let captured = false;
     let gameOver  = false;
 
-    // Only attempt capture if landing on main loop (not home stretch)
     const newGlobalPos = this.getGlobalPosition(playerState.color, newProgress);
-
     if (newGlobalPos !== null && !SAFE_SQUARES.has(newGlobalPos)) {
       newOpponentTokens.forEach(opToken => {
         if (opToken.isFinished) return;
-        // ✅ FIX: position is already normalized above — no re-cast needed
         const opProgress = opToken.position;
-        if (opProgress < 0) return;                   // opponent in home base
-        if (opProgress >= BOARD_PATH_LENGTH) return;  // opponent in home stretch — safe
-
+        if (opProgress < 0 || opProgress >= BOARD_PATH_LENGTH) return;
         const opGlobal = this.getGlobalPosition(opponentState.color, opProgress);
         if (opGlobal === newGlobalPos) {
-          // CAPTURE — send opponent token back to base
           opToken.position = -1;
           opToken.isHome   = true;
           captured = true;
-          console.log(`[CAPTURE] ${playerState.color} captured ${opponentState.color} token at global ${newGlobalPos}`);
+          console.log(`[CAPTURE] ${playerState.color} captured ${opponentState.color} at global ${newGlobalPos}`);
         }
       });
     }
 
-    // Finish if reached last cell
-    if (newProgress >= TOTAL_PATH - 1) {
-      token.position   = TOTAL_PATH - 1;
+    if (newProgress >= HOME_CENTER) {
+      token.position   = HOME_CENTER;
       token.isFinished = true;
     }
 
     const finishedCount = newPlayerTokens.filter(t => t.isFinished).length;
     if (finishedCount === 4) gameOver = true;
 
-    // Extra turn on 6 OR on capture
-    const extraTurn = diceRoll === 6 || captured;
+    // Extra turn: rolling 6 OR capturing OR reaching home center (Indian online variant)
+    const reachedHome = newProgress >= HOME_CENTER;
+    const extraTurn = diceRoll === 6 || captured || reachedHome;
 
     return { newPlayerTokens, newOpponentTokens, captured, extraTurn, gameOver, finishedCount };
   }
