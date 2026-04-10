@@ -1,11 +1,17 @@
-const BOARD_PATH_LENGTH = 51;
+const BOARD_PATH_LENGTH = 52;
 const HOME_STRETCH_LENGTH = 6;
-const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 57
+const TOTAL_PATH = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 58
 
 const START_POSITIONS = { red: 0, blue: 26 };
 
 // Safe squares by GLOBAL board position (0-51)
 const SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
+
+// ✅ FIX: Central helper — always normalize token position to a number
+function normalizeProgress(position) {
+  if (position === undefined || position === null || isNaN(position)) return -1;
+  return Number(position);
+}
 
 class LudoEngine {
 
@@ -22,24 +28,20 @@ class LudoEngine {
     return (start + progress) % BOARD_PATH_LENGTH;
   }
 
-  // Can we capture an opponent token at this global position?
-  // Returns false if opponent has 2+ tokens there (blockade = uncapturable)
+  // ✅ FIX: Use normalizeProgress everywhere for opponent tokens
   static canCapture(globalPos, opponentState) {
     if (!opponentState || globalPos === null) return false;
     if (SAFE_SQUARES.has(globalPos)) return false;
 
-    const tokensHere = opponentState.tokens.filter(t => {
+    return opponentState.tokens.some(t => {
       if (t.isFinished) return false;
-      const tProgress = (t.position !== undefined && t.position !== null && !isNaN(t.position))
-        ? Number(t.position) : -1;
-      if (tProgress < 0) return false;
-      if (tProgress >= BOARD_PATH_LENGTH) return false;
+      const tProgress = normalizeProgress(t.position);
+      if (tProgress < 0) return false;                    // in home base
+      if (tProgress >= BOARD_PATH_LENGTH) return false;   // in home stretch — safe
+
       const opGlobal = this.getGlobalPosition(opponentState.color, tProgress);
       return opGlobal === globalPos;
     });
-
-    // Only capturable if exactly 1 opponent token is there (blockade = 2+)
-    return tokensHere.length === 1;
   }
 
   static getValidMoves(playerState, diceRoll, opponentState) {
@@ -49,8 +51,7 @@ class LudoEngine {
     tokens.forEach((token, index) => {
       if (token.isFinished) return;
 
-      const progress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
-        ? Number(token.position) : -1;
+      const progress = normalizeProgress(token.position);
 
       // Token in home base — only a 6 can bring it out
       if (progress === -1) {
@@ -75,8 +76,7 @@ class LudoEngine {
 
       const willFinish = newProgress === TOTAL_PATH - 1;
 
-      // Tokens in home stretch (progress >= 52) can never be captured or capture
-      const globalPos = this.getGlobalPosition(color, newProgress);
+      const globalPos  = this.getGlobalPosition(color, newProgress);
       const canCapture = !willFinish && globalPos !== null
         ? this.canCapture(globalPos, opponentState)
         : false;
@@ -94,21 +94,20 @@ class LudoEngine {
   }
 
   static applyMove(playerState, opponentState, tokenIndex, diceRoll) {
+    // ✅ FIX: Normalize ALL positions up front using helper
     const newPlayerTokens = playerState.tokens.map(t => ({
-      position:   (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1,
+      position:   normalizeProgress(t.position),
       isHome:     t.isHome ?? true,
-      isFinished: t.isFinished ?? false
+      isFinished: t.isFinished ?? false,
     }));
     const newOpponentTokens = opponentState.tokens.map(t => ({
-      position:   (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1,
+      position:   normalizeProgress(t.position),
       isHome:     t.isHome ?? true,
-      isFinished: t.isFinished ?? false
+      isFinished: t.isFinished ?? false,
     }));
 
-    const token = newPlayerTokens[tokenIndex];
-    const oldProgress = (token.position !== undefined && token.position !== null && !isNaN(token.position))
-      ? Number(token.position) : -1;
-
+    const token      = newPlayerTokens[tokenIndex];
+    const oldProgress = normalizeProgress(token.position);
     const newProgress = oldProgress === -1 ? 0 : oldProgress + diceRoll;
 
     token.position = newProgress;
@@ -121,38 +120,35 @@ class LudoEngine {
     const newGlobalPos = this.getGlobalPosition(playerState.color, newProgress);
 
     if (newGlobalPos !== null && !SAFE_SQUARES.has(newGlobalPos)) {
-      // Count how many opponent tokens are at this global position
-      const opponentTokensHere = newOpponentTokens.filter(opToken => {
-        if (opToken.isFinished) return false;
+      newOpponentTokens.forEach(opToken => {
+        if (opToken.isFinished) return;
+        // ✅ FIX: position is already normalized above — no re-cast needed
         const opProgress = opToken.position;
-        if (opProgress < 0) return false;
-        if (opProgress >= BOARD_PATH_LENGTH) return false;
-        const opGlobal = this.getGlobalPosition(opponentState.color, opProgress);
-        return opGlobal === newGlobalPos;
-      });
+        if (opProgress < 0) return;                   // opponent in home base
+        if (opProgress >= BOARD_PATH_LENGTH) return;  // opponent in home stretch — safe
 
-      // Blockade rule: 2+ opponent tokens on same cell = blockade, cannot be captured
-      // Only a solo opponent token (exactly 1) can be captured
-      if (opponentTokensHere.length === 1) {
-        opponentTokensHere[0].position = -1;
-        opponentTokensHere[0].isHome   = true;
-        captured = true;
-      }
-      // If opponentTokensHere.length >= 2 → blockade, no capture, move is still valid
+        const opGlobal = this.getGlobalPosition(opponentState.color, opProgress);
+        if (opGlobal === newGlobalPos) {
+          // CAPTURE — send opponent token back to base
+          opToken.position = -1;
+          opToken.isHome   = true;
+          captured = true;
+          console.log(`[CAPTURE] ${playerState.color} captured ${opponentState.color} token at global ${newGlobalPos}`);
+        }
+      });
     }
 
     // Finish if reached last cell
     if (newProgress >= TOTAL_PATH - 1) {
-      token.position  = TOTAL_PATH - 1;
+      token.position   = TOTAL_PATH - 1;
       token.isFinished = true;
     }
 
     const finishedCount = newPlayerTokens.filter(t => t.isFinished).length;
     if (finishedCount === 4) gameOver = true;
 
-    // Extra turn on: rolled 6, captured opponent, or token just reached home
-    const justFinished = token.isFinished && (oldProgress < TOTAL_PATH - 1);
-    const extraTurn = diceRoll === 6 || captured || justFinished;
+    // Extra turn on 6 OR on capture
+    const extraTurn = diceRoll === 6 || captured;
 
     return { newPlayerTokens, newOpponentTokens, captured, extraTurn, gameOver, finishedCount };
   }
