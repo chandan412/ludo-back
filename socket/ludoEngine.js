@@ -1,7 +1,7 @@
 const BOARD_PATH_LENGTH   = 51;  // main loop squares (0-50)
-const HOME_STRETCH_LENGTH = 6;   // colored home column squares (51-56)
-const HOME_CENTER         = 57;  // center triangle — the true finish (progress 57)
-const TOTAL_PATH          = HOME_CENTER + 1; // 58
+const HOME_STRETCH_LENGTH = 5;   // colored home column squares (51-55)
+const HOME_CENTER         = 56;  // center triangle — the true finish (progress 56)
+const TOTAL_PATH          = HOME_CENTER + 1; // 57
 
 const START_POSITIONS = { red: 0, blue: 26 };
 
