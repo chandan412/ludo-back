@@ -474,6 +474,49 @@ module.exports = (io) => {
     });
 
     // ============================
+    // player-exit: intentional exit — settle immediately, no rejoin
+    // ============================
+    socket.on('player-exit', async ({ roomCode }) => {
+      try {
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username');
+
+        if (!game || game.status !== 'active') return;
+
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        if (playerIdx === -1) return;
+        const opponentIdx = playerIdx === 0 ? 1 : 0;
+
+        const winnerId  = game.players[opponentIdx].user._id;
+        const loserId   = socket.user._id;
+        const pot       = game.betAmount * 2;
+        const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+        const winAmount = pot - platformFee;
+
+        game.status      = 'finished';
+        game.winner      = winnerId;
+        game.loser       = loserId;
+        game.winAmount   = winAmount;
+        game.platformFee = platformFee;
+        game.finishedAt  = new Date();
+        await game.save();
+
+        await settleGame(game, winnerId, loserId, winAmount, platformFee);
+
+        // Tell opponent they won — navigate them home
+        socket.to(roomCode).emit('player-exited', {
+          username:  socket.user.username,
+          winnerId:  winnerId.toString(),
+          winAmount,
+        });
+
+        console.log(`${socket.user.username} intentionally exited room ${roomCode}`);
+      } catch (err) {
+        console.error('player-exit error:', err);
+      }
+    });
+
+    // ============================
     // disconnect
     // ============================
     socket.on('disconnect', async () => {
