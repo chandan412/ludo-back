@@ -42,7 +42,7 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: returns all statuses so Lobby can detect waiting/active games
+// GET /api/game/my-games/history
 router.get('/my-games/history', auth, async (req, res) => {
   try {
     const games = await Game.find({
@@ -52,6 +52,20 @@ router.get('/my-games/history', auth, async (req, res) => {
       .populate('players.user', 'username')
       .populate('winner', 'username')
       .sort({ createdAt: -1 })
+      .limit(20);
+    res.json(games);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/game/live-games — must be before /:roomCode
+router.get('/live-games', auth, async (req, res) => {
+  try {
+    const games = await Game.find({ status: 'active' })
+      .populate('players.user', 'username')
+      .select('betAmount players roomCode')
+      .sort({ updatedAt: -1 })
       .limit(20);
     res.json(games);
   } catch (err) {
@@ -157,7 +171,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: cancel uses 'aborted' status + creates transaction record
+// POST /api/game/cancel/:roomCode
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -190,42 +204,6 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
     await game.save();
 
     res.json({ message: 'Game cancelled. Bet refunded.' });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// GET /api/game/my-waiting-game
-router.get('/my-waiting-game', auth, async (req, res) => {
-  try {
-    const game = await Game.findOne({
-      'players.user': req.user._id,
-      status: 'waiting'
-    }).populate('players.user', 'username');
-    if (!game) return res.status(404).json(null);
-    res.json(game);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// GET /api/game/recent-winners
-router.get('/recent-winners', auth, async (req, res) => {
-  try {
-    const games = await Game.find({ status: 'finished' })
-      .populate('winner', 'username')
-      .populate('players.user', 'username')
-      .sort({ finishedAt: -1 })
-      .limit(10);
-    const winners = games
-      .filter(g => g.winner)
-      .map(g => ({
-        username: g.winner.username,
-        winAmount: g.winAmount,
-        betAmount: g.betAmount,
-        finishedAt: g.finishedAt,
-      }));
-    res.json(winners);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
