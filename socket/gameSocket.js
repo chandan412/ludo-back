@@ -473,6 +473,33 @@ module.exports = (io) => {
       }
     });
 
+
+    // ============================
+    // Global chat — socket only, no DB
+    // ============================
+    socket.on('join-chat', () => {
+      socket.join('global-chat');
+      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+      io.to('global-chat').emit('chat-online-count', { count });
+    });
+
+    socket.on('leave-chat', () => {
+      socket.leave('global-chat');
+      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+      io.to('global-chat').emit('chat-online-count', { count });
+    });
+
+    socket.on('send-chat', ({ text }) => {
+      if (!text || !text.trim() || text.length > 150) return;
+      const msg = {
+        userId:    socket.user._id.toString(),
+        username:  socket.user.username,
+        text:      text.trim(),
+        createdAt: new Date().toISOString(),
+      };
+      io.to('global-chat').emit('chat-message', msg);
+    });
+
     // ============================
     // player-exit: intentional exit — settle immediately, no rejoin
     // ============================
