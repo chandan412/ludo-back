@@ -142,20 +142,8 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
 }
 
 // ============================
-// Helper: Sanitize game object for client
-// ============================
-function sanitizeGame(game, userId) {
-  const gameObj = game.toObject ? game.toObject() : game;
-  return {
-    ...gameObj,
-    currentTurn: gameObj.currentTurn?.toString(),
-    myColor: gameObj.players.find(p => p.user._id?.toString() === userId?.toString())?.color,
-  };
-}
-
-// ============================
 // Helper: Convert Mongoose player subdoc → plain object for LudoEngine
-// Mongoose subdocs have getters/virtuals that can confuse Number() coercion.
+// Mongoose subdocs have proxy getters that can confuse Number() coercion.
 // Always pass plain objects to the engine so _safeProgress works reliably.
 // ============================
 function toPlainState(playerDoc) {
@@ -168,6 +156,18 @@ function toPlainState(playerDoc) {
       isHome:     t.isHome     ?? true,
       isFinished: t.isFinished ?? false,
     })),
+  };
+}
+
+// ============================
+// Helper: Sanitize game object for client
+// ============================
+function sanitizeGame(game, userId) {
+  const gameObj = game.toObject ? game.toObject() : game;
+  return {
+    ...gameObj,
+    currentTurn: gameObj.currentTurn?.toString(),
+    myColor: gameObj.players.find(p => p.user._id?.toString() === userId?.toString())?.color,
   };
 }
 
@@ -272,7 +272,12 @@ module.exports = (io) => {
 
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
-        // ✅ Convert Mongoose subdocs to plain objects so LudoEngine works reliably
+
+        // ✅ Guard: ensure both players exist
+        if (playerIdx === -1 || !game.players[opponentIdx])
+          return socket.emit('error', { message: 'Game state invalid' });
+
+        // ✅ Convert Mongoose subdocs to plain objects for LudoEngine
         const playerState   = toPlainState(game.players[playerIdx]);
         const opponentState = toPlainState(game.players[opponentIdx]);
 
@@ -358,11 +363,16 @@ module.exports = (io) => {
 
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
-        // ✅ Convert Mongoose subdocs to plain objects so LudoEngine capture logic works reliably
+
+        // ✅ Guard: ensure both players exist
+        if (playerIdx === -1 || !game.players[opponentIdx])
+          return socket.emit('error', { message: 'Game state invalid' });
+
+        // ✅ Convert Mongoose subdocs to plain objects for LudoEngine (fixes capture bug)
         const playerState   = toPlainState(game.players[playerIdx]);
         const opponentState = toPlainState(game.players[opponentIdx]);
 
-        // ✅ FIX: Use local diceRoll variable (not game.lastDiceRoll) for all validation & logic
+        // ✅ Use local diceRoll variable for all validation & logic
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
         const move = validMoves.find(m => m.tokenIndex === tokenIndex);
         if (!move) return socket.emit('error', { message: 'Invalid move' });
@@ -425,13 +435,16 @@ module.exports = (io) => {
 
         if (result.extraTurn) {
           game.currentTurn = socket.user._id;
-          // ✅ FIX: Use local diceRoll variable (game.lastDiceRoll is already null here)
-          if (diceRoll !== 6 && result.captured) {
+          if (diceRoll === 6) {
+            // Extra turn from a 6 — consecutiveSixes already incremented in roll-dice handler
+            // No change needed here; it was set when dice was rolled
+          } else {
+            // Extra turn from capture (not a 6) — reset consecutive sixes
             game.consecutiveSixes = 0;
           }
         } else {
           game.currentTurn      = opponentState.user._id;
-          game.consecutiveSixes = 0; // ✅ reset when turn passes to opponent
+          game.consecutiveSixes = 0; // reset when turn passes to opponent
         }
 
         await game.save();
@@ -553,6 +566,9 @@ module.exports = (io) => {
             winAmount,
             message: `${socket.user.username} disconnected. You win!`,
           });
+
+          // ✅ Clean up room entry after timer fires
+          activeRooms.delete(socket.currentRoom);
         }, 60000);
 
         if (!activeRooms.has(socket.currentRoom)) activeRooms.set(socket.currentRoom, {});
@@ -573,6 +589,8 @@ module.exports = (io) => {
           clearTimeout(room.disconnectTimer);
           room.disconnectTimer = null;
         }
+        // ✅ Clean up room entry after successful reconnect
+        activeRooms.delete(roomCode);
 
         const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
         if (!game) return;
