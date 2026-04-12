@@ -40,18 +40,6 @@ router.post('/recharge-request', auth, async (req, res) => {
     const { amount, paymentNote } = req.body;
     if (!amount || amount < 10)
       return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
-
-    // Block if player already has a pending recharge request
-    const pending = await Transaction.findOne({
-      user: req.user._id,
-      type: 'recharge',
-      status: 'pending'
-    });
-    if (pending)
-      return res.status(400).json({
-        message: `You already have a pending recharge request of ₹${pending.amount}. Please wait for admin to approve it before submitting another.`
-      });
-
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'recharge',
@@ -84,17 +72,23 @@ router.post('/withdraw-request', auth, async (req, res) => {
       return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
     const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
     if (pending) return res.status(400).json({ message: 'You already have a pending withdrawal request' });
-    user.balance -= amount;
-    await user.save();
+
+    // ✅ Create transaction record FIRST, then deduct balance
+    // This way if the save fails, the transaction record exists and admin can reconcile
+    const balanceBefore = user.balance;
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'withdraw',
       amount,
-      balanceBefore: user.balance + amount,
-      balanceAfter: user.balance,
+      balanceBefore,
+      balanceAfter: balanceBefore - amount,
       status: 'pending',
       bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
     });
+
+    // Now deduct — if this fails, admin sees a pending transaction with no balance change
+    user.balance -= amount;
+    await user.save();
     res.status(201).json({
       message: 'Withdrawal request submitted. Admin will process within 24 hours.',
       transaction
