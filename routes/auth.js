@@ -13,31 +13,20 @@ router.post('/register', async (req, res) => {
     if (!username || !email || !phone || !password)
       return res.status(400).json({ message: 'All fields are required' });
 
-    // ✅ Always compare lowercased email so casing never causes a mismatch
-    const emailLower = email.toLowerCase().trim();
-    const phoneTrimmed = phone.trim();
+    const emailLower     = email.toLowerCase().trim();
+    const phoneTrimmed   = phone.trim();
     const usernameTrimmed = username.trim();
 
     const exists = await User.findOne({
-      $or: [
-        { email: emailLower },
-        { username: usernameTrimmed },
-        { phone: phoneTrimmed }
-      ]
+      $or: [{ email: emailLower }, { username: usernameTrimmed }, { phone: phoneTrimmed }]
     });
-
     if (exists) {
-      if (exists.email === emailLower)         return res.status(400).json({ message: 'Email already registered' });
+      if (exists.email    === emailLower)     return res.status(400).json({ message: 'Email already registered' });
       if (exists.username === usernameTrimmed) return res.status(400).json({ message: 'Username taken' });
-      if (exists.phone === phoneTrimmed)       return res.status(400).json({ message: 'Phone already registered' });
+      if (exists.phone    === phoneTrimmed)   return res.status(400).json({ message: 'Phone already registered' });
     }
 
-    const user = await User.create({
-      username: usernameTrimmed,
-      email:    emailLower,
-      phone:    phoneTrimmed,
-      password,
-    });
+    const user = await User.create({ username: usernameTrimmed, email: emailLower, phone: phoneTrimmed, password });
     const token = generateToken(user._id);
     res.status(201).json({ token, user: user.toSafeObject() });
   } catch (err) {
@@ -58,13 +47,7 @@ router.post('/register-admin', async (req, res) => {
     });
     if (exists) return res.status(400).json({ message: 'User already exists' });
 
-    const user = await User.create({
-      username: username.trim(),
-      email:    emailLower,
-      phone:    phone.trim(),
-      password,
-      role: 'admin',
-    });
+    const user = await User.create({ username: username.trim(), email: emailLower, phone: phone.trim(), password, role: 'admin' });
     const token = generateToken(user._id);
     res.status(201).json({ token, user: user.toSafeObject() });
   } catch (err) {
@@ -79,11 +62,8 @@ router.post('/login', async (req, res) => {
     if (!emailOrPhone || !password)
       return res.status(400).json({ message: 'Email/phone and password required' });
 
-    // ✅ Trim whitespace — leading/trailing spaces cause "Invalid credentials"
     const input = emailOrPhone.trim();
 
-    // ✅ Try email (lowercased) AND raw phone AND lowercased phone
-    // Covers: user types with spaces, wrong case, or phone with/without country code
     const user = await User.findOne({
       $or: [
         { email: input.toLowerCase() },
@@ -92,18 +72,12 @@ router.post('/login', async (req, res) => {
       ]
     });
 
-    if (!user)
-      return res.status(400).json({ message: 'No account found with this email or phone' });
-
-    if (user.isBanned)
-      return res.status(403).json({ message: 'Your account has been banned. Contact support.' });
-
-    if (!user.isActive)
-      return res.status(403).json({ message: 'Account is inactive. Contact support.' });
+    if (!user)   return res.status(400).json({ message: 'No account found with this email or phone' });
+    if (user.isBanned)  return res.status(403).json({ message: 'Your account has been banned. Contact support.' });
+    if (!user.isActive) return res.status(403).json({ message: 'Account is inactive. Contact support.' });
 
     const isMatch = await user.comparePassword(password);
-    if (!isMatch)
-      return res.status(400).json({ message: 'Incorrect password' });
+    if (!isMatch) return res.status(400).json({ message: 'Incorrect password' });
 
     const token = generateToken(user._id);
     res.json({ token, user: user.toSafeObject() });
@@ -117,6 +91,20 @@ router.get('/me', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id).select('-password');
     res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── FCM TOKEN ─────────────────────────────────────────────────────────────────
+// ✅ Firebase calls this to register push notification tokens per user
+router.post('/fcm-token', auth, async (req, res) => {
+  try {
+    const { token: fcmToken } = req.body;
+    if (!fcmToken) return res.status(400).json({ message: 'FCM token required' });
+    // Store on user document (add fcmToken field to User schema if needed)
+    await User.findByIdAndUpdate(req.user._id, { fcmToken });
+    res.json({ message: 'FCM token saved' });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
