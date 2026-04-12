@@ -9,7 +9,6 @@ const settingSchema = new mongoose.Schema({
 });
 const Setting = mongoose.model('Setting', settingSchema);
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
 async function getSetting(key) {
   const s = await Setting.findOne({ key });
   return s?.value || null;
@@ -18,81 +17,91 @@ async function setSetting(key, value) {
   return Setting.findOneAndUpdate({ key }, { key, value }, { upsert: true, new: true });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  QR CODE
-// ═══════════════════════════════════════════════════════════════════════════════
+// Extract value from body regardless of field name used
+function extractValue(body) {
+  return body.whatsapp      ??
+         body.number        ??
+         body.whatsappNumber??
+         body.apkUrl        ??
+         body.apk_url       ??
+         body.apkURL        ??
+         body.url           ??
+         body.qrCode        ??
+         body.value         ??
+         body.data          ??
+         null;
+}
 
-// GET /api/settings/qr-code — public
+// ═══ QR CODE ══════════════════════════════════════════════════════════════════
 router.get('/qr-code', async (req, res) => {
-  try {
-    res.json({ qrCode: await getSetting('payment_qr') });
-  } catch (err) { res.status(500).json({ message: 'Server error' }); }
+  try { res.json({ qrCode: await getSetting('payment_qr') }); }
+  catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// POST /api/settings/qr-code — admin only
 router.post('/qr-code', adminAuth, async (req, res) => {
   try {
-    const { qrCode } = req.body;
-    if (!qrCode) return res.status(400).json({ message: 'QR code image required' });
-    await setSetting('payment_qr', qrCode);
+    const val = req.body.qrCode || req.body.value || extractValue(req.body);
+    if (!val) return res.status(400).json({ message: 'QR code image required', received: Object.keys(req.body) });
+    await setSetting('payment_qr', val);
     res.json({ message: 'QR code updated successfully' });
   } catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  WHATSAPP SUPPORT NUMBER
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/settings/whatsapp — public
+// ═══ WHATSAPP ══════════════════════════════════════════════════════════════════
 router.get('/whatsapp', async (req, res) => {
-  try {
-    res.json({ whatsapp: await getSetting('whatsapp_number') });
-  } catch (err) { res.status(500).json({ message: 'Server error' }); }
+  try { res.json({ whatsapp: await getSetting('whatsapp_number') }); }
+  catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// POST /api/settings/whatsapp — admin only
 router.post('/whatsapp', adminAuth, async (req, res) => {
   try {
-    const { whatsapp } = req.body;
-    if (!whatsapp) return res.status(400).json({ message: 'WhatsApp number required' });
-    await setSetting('whatsapp_number', whatsapp);
+    const val = req.body.whatsapp || req.body.number || req.body.whatsappNumber || req.body.value || extractValue(req.body);
+    if (!val) return res.status(400).json({ message: 'WhatsApp number required', received: Object.keys(req.body) });
+    await setSetting('whatsapp_number', String(val).trim());
     res.json({ message: 'WhatsApp number updated successfully' });
   } catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  APK DOWNLOAD URL
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// GET /api/settings/apk-url — public
+// ═══ APK URL ══════════════════════════════════════════════════════════════════
 router.get('/apk-url', async (req, res) => {
-  try {
-    res.json({ apkUrl: await getSetting('apk_url') });
-  } catch (err) { res.status(500).json({ message: 'Server error' }); }
+  try { res.json({ apkUrl: await getSetting('apk_url') }); }
+  catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// GET /api/settings/apk — alias (some clients call this)
 router.get('/apk', async (req, res) => {
-  try {
-    res.json({ apkUrl: await getSetting('apk_url') });
-  } catch (err) { res.status(500).json({ message: 'Server error' }); }
+  try { res.json({ apkUrl: await getSetting('apk_url') }); }
+  catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// POST /api/settings/apk-url — admin only
 router.post('/apk-url', adminAuth, async (req, res) => {
   try {
-    const { apkUrl } = req.body;
-    if (!apkUrl) return res.status(400).json({ message: 'APK URL required' });
-    await setSetting('apk_url', apkUrl);
+    const val = req.body.apkUrl || req.body.url || req.body.apk_url || req.body.apkURL || req.body.value || extractValue(req.body);
+    if (!val) return res.status(400).json({ message: 'APK URL required', received: Object.keys(req.body) });
+    await setSetting('apk_url', String(val).trim());
     res.json({ message: 'APK URL updated successfully' });
   } catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  PLATFORM FEE PERCENT  (bonus — lets admin change fee without redeploy)
-// ═══════════════════════════════════════════════════════════════════════════════
+router.post('/apk', adminAuth, async (req, res) => {
+  try {
+    const val = req.body.apkUrl || req.body.url || req.body.apk_url || req.body.value || extractValue(req.body);
+    if (!val) return res.status(400).json({ message: 'APK URL required', received: Object.keys(req.body) });
+    await setSetting('apk_url', String(val).trim());
+    res.json({ message: 'APK URL updated successfully' });
+  } catch (err) { res.status(500).json({ message: 'Server error' }); }
+});
 
-// GET /api/settings/platform-fee — public
+// ═══ FCM TOKEN ════════════════════════════════════════════════════════════════
+router.post('/fcm-token', async (req, res) => {
+  try {
+    const { token, userId } = req.body;
+    if (!token) return res.status(400).json({ message: 'Token required' });
+    if (userId) await setSetting(`fcm_token_${userId}`, token);
+    res.json({ message: 'FCM token registered' });
+  } catch (err) { res.status(500).json({ message: 'Server error' }); }
+});
+
+// ═══ PLATFORM FEE ════════════════════════════════════════════════════════════
 router.get('/platform-fee', async (req, res) => {
   try {
     const fee = await getSetting('platform_fee_percent');
@@ -100,11 +109,10 @@ router.get('/platform-fee', async (req, res) => {
   } catch (err) { res.status(500).json({ message: 'Server error' }); }
 });
 
-// POST /api/settings/platform-fee — admin only
 router.post('/platform-fee', adminAuth, async (req, res) => {
   try {
-    const { percent } = req.body;
-    if (percent === undefined || percent < 0 || percent > 50)
+    const percent = req.body.percent ?? req.body.value ?? req.body.platformFeePercent;
+    if (percent === undefined || percent === null || percent < 0 || percent > 50)
       return res.status(400).json({ message: 'Percent must be 0–50' });
     await setSetting('platform_fee_percent', String(percent));
     res.json({ message: `Platform fee updated to ${percent}%` });
