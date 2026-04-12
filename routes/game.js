@@ -42,7 +42,21 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-games/history
+// GET /api/game/my-waiting-game  ✅ NEW — used by Dashboard
+router.get('/my-waiting-game', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      'players.user': req.user._id,
+      status: 'waiting'
+    }).populate('players.user', 'username');
+    if (!game) return res.status(404).json(null);
+    res.json(game);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ✅ FIXED: returns all statuses so Lobby can detect waiting/active games
 router.get('/my-games/history', auth, async (req, res) => {
   try {
     const games = await Game.find({
@@ -52,20 +66,6 @@ router.get('/my-games/history', auth, async (req, res) => {
       .populate('players.user', 'username')
       .populate('winner', 'username')
       .sort({ createdAt: -1 })
-      .limit(20);
-    res.json(games);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// GET /api/game/live-games — must be before /:roomCode
-router.get('/live-games', auth, async (req, res) => {
-  try {
-    const games = await Game.find({ status: 'active' })
-      .populate('players.user', 'username')
-      .select('betAmount players roomCode')
-      .sort({ updatedAt: -1 })
       .limit(20);
     res.json(games);
   } catch (err) {
@@ -171,7 +171,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// POST /api/game/cancel/:roomCode
+// ✅ FIXED: cancel uses 'aborted' status + creates transaction record
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
