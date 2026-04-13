@@ -130,8 +130,9 @@ class LudoEngine {
     const finishedCount = newPlayerTokens.filter(t => t.isFinished).length;
     if (finishedCount === newPlayerTokens.length) gameOver = true;
 
-    // Extra turn: roll 6 OR capture (Indian Ludo rules)
-    const extraTurn = diceRoll === 6 || captured;
+    // Extra turn: roll 6, capture, OR reaching home (Indian Ludo rules)
+    const willFinish = newProgress >= FINISH_PROGRESS;
+    const extraTurn = diceRoll === 6 || captured || willFinish;
 
     return { newPlayerTokens, newOpponentTokens, captured, extraTurn, gameOver, finishedCount };
   }
