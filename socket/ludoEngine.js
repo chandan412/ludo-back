@@ -5,10 +5,10 @@
 //  Finish       : progress 57 (exact roll required)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const BOARD_PATH_LENGTH   = 52;
+const BOARD_PATH_LENGTH   = 51;   // 51 main loop steps (progress 0-50; 50 = junction/entry)
 const HOME_STRETCH_LENGTH = 6;
-const TOTAL_PATH          = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 58
-const FINISH_PROGRESS     = TOTAL_PATH - 1; // 57
+const TOTAL_PATH          = BOARD_PATH_LENGTH + HOME_STRETCH_LENGTH; // 57
+const FINISH_PROGRESS     = TOTAL_PATH - 1; // 56
 
 // Starting offsets on the shared 52-square main loop
 // Must match LudoBoard.js RED_MAIN array order
@@ -37,7 +37,7 @@ class LudoEngine {
     if (progress >= BOARD_PATH_LENGTH) return null;
     const offset = START_OFFSETS[color];
     if (offset === undefined) return null;
-    return (offset + progress) % BOARD_PATH_LENGTH;
+    return (offset + progress) % 52; // 52 = full main loop size
   }
 
   static canCapture(globalPos, opponentState) {
