@@ -5,16 +5,15 @@ const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
 
 const activeRooms = new Map();
-const roomTimers = new Map(); // tracks 2-min auto-abort timers
+const roomTimers = new Map();
 
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
 // ============================
 function startWaitingTimer(io, roomCode) {
-  const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
+  const WAIT_DURATION = 2 * 60 * 1000;
   let remainingSeconds = 120;
 
-  // Emit countdown every second
   const tickInterval = setInterval(() => {
     remainingSeconds -= 1;
     io.to(roomCode).emit('waiting-countdown', {
@@ -24,18 +23,16 @@ function startWaitingTimer(io, roomCode) {
     if (remainingSeconds <= 0) clearInterval(tickInterval);
   }, 1000);
 
-  // Auto-abort after 2 minutes
   const abortTimer = setTimeout(async () => {
     clearInterval(tickInterval);
     try {
       const game = await Game.findOne({ roomCode, status: 'waiting' });
-      if (!game) return; // already started or aborted
+      if (!game) return;
 
       game.status = 'aborted';
       game.finishedAt = new Date();
       await game.save();
 
-      // Refund creator
       const creator = await User.findById(game.players[0].user);
       if (creator) {
         const before = creator.balance;
@@ -68,9 +65,6 @@ function startWaitingTimer(io, roomCode) {
   roomTimers.set(roomCode, { abortTimer, tickInterval });
 }
 
-// ============================
-// Helper: Cancel waiting timer (when opponent joins)
-// ============================
 function cancelWaitingTimer(roomCode) {
   const timers = roomTimers.get(roomCode);
   if (timers) {
@@ -80,9 +74,6 @@ function cancelWaitingTimer(roomCode) {
   }
 }
 
-// ============================
-// Helper: Settle game finances
-// ============================
 async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
   try {
     const winner = await User.findById(winnerId);
@@ -135,15 +126,12 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
       gameId: game._id,
     });
 
-    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
+    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}`);
   } catch (err) {
     console.error('Game settlement error:', err);
   }
 }
 
-// ============================
-// Helper: Sanitize game object for client
-// ============================
 function sanitizeGame(game, userId) {
   const gameObj = game.toObject ? game.toObject() : game;
   return {
@@ -153,12 +141,8 @@ function sanitizeGame(game, userId) {
   };
 }
 
-// ============================
-// Main socket module
-// ============================
 module.exports = (io) => {
 
-  // Auth middleware
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth.token;
@@ -176,34 +160,29 @@ module.exports = (io) => {
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.user.username} (${socket.id})`);
 
-    // ============================
-    // created-room: fired by creator right after creating a game
-    // Starts the 2-minute waiting countdown
-    // ============================
     socket.on('created-room', async ({ roomCode }) => {
       try {
         socket.join(roomCode);
         socket.currentRoom = roomCode;
-
-        // Start 2-minute auto-abort countdown
         startWaitingTimer(io, roomCode);
-
-        console.log(`${socket.user.username} created room ${roomCode}, waiting timer started`);
+        console.log(`${socket.user.username} created room ${roomCode}`);
       } catch (err) {
         console.error('created-room error:', err);
         socket.emit('error', { message: 'Failed to initialize room' });
       }
     });
 
-    // ============================
-    // join-room: fired when a player enters an existing room
-    // ============================
     socket.on('join-room', async ({ roomCode }) => {
       try {
         const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
           .populate('players.user', 'username gamesPlayed gamesWon');
 
         if (!game) return socket.emit('error', { message: 'Game not found' });
+
+        // ✅ Block forfeited player from rejoining
+        if (game.forfeitedBy && game.forfeitedBy.toString() === socket.user._id.toString()) {
+          return socket.emit('error', { message: 'You forfeited this game and cannot rejoin.' });
+        }
 
         const isPlayer = game.players.some(
           p => p.user._id.toString() === socket.user._id.toString()
@@ -222,31 +201,6 @@ module.exports = (io) => {
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
-        // ✅ ANTI-CHEAT: If player already rolled this turn, restore their dice state on reconnect.
-        // This prevents refresh-to-reroll cheating — the same dice value is sent back.
-        if (game.status === 'active' &&
-            game.lastDiceRoll !== null &&
-            game.lastDiceRoll !== undefined &&
-            game.currentTurn.toString() === socket.user._id.toString()) {
-          const pIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-          const oIdx = pIdx === 0 ? 1 : 0;
-          if (pIdx !== -1 && game.players[oIdx]) {
-            const pState = toPlainState(game.players[pIdx]);
-            const oState = toPlainState(game.players[oIdx]);
-            const existingMoves = LudoEngine.getValidMoves(pState, game.lastDiceRoll, oState);
-            socket.emit('dice-rolled', {
-              diceRoll:       game.lastDiceRoll,
-              playerId:       socket.user._id,
-              playerUsername: socket.user.username,
-              validMoves:     existingMoves.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
-              hasValidMoves:  existingMoves.length > 0,
-              currentTurn:    game.currentTurn.toString(),
-              resync:         true,
-            });
-          }
-        }
-
-        // ✅ Count connected players — if both are in, cancel the waiting timer
         const connectedCount = game.players.filter(p => p.isConnected).length;
         if (connectedCount >= 2) {
           cancelWaitingTimer(roomCode);
@@ -263,8 +217,25 @@ module.exports = (io) => {
     });
 
     // ============================
-    // roll-dice
+    // ✅ player-forfeit: intentional exit — money already settled by REST API
+    // Just notify opponent and close the room
     // ============================
+    socket.on('player-forfeit', async ({ roomCode, winnerId, winAmount }) => {
+      try {
+        // Notify opponent immediately — they win, navigate them to dashboard
+        socket.to(roomCode).emit('game-over', {
+          reason: 'opponent_forfeited',
+          winner: { id: winnerId },
+          loser:  { id: socket.user._id.toString(), username: socket.user.username },
+          winAmount,
+          message: `${socket.user.username} forfeited! You win ₹${winAmount}!`,
+        });
+        console.log(`${socket.user.username} forfeited room ${roomCode}`);
+      } catch (err) {
+        console.error('player-forfeit error:', err);
+      }
+    });
+
     socket.on('roll-dice', async ({ roomCode }) => {
       try {
         const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
@@ -276,37 +247,14 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
-        // ✅ ANTI-CHEAT: If lastDiceRoll already set, player already rolled this turn.
-        // Re-emit the existing result to resync their UI — do NOT roll again.
-        if (game.lastDiceRoll !== null && game.lastDiceRoll !== undefined) {
-          const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-          const opponentIdx = playerIdx === 0 ? 1 : 0;
-          const pState = toPlainState(game.players[playerIdx]);
-          const oState = toPlainState(game.players[opponentIdx]);
-          const existingMoves = LudoEngine.getValidMoves(pState, game.lastDiceRoll, oState);
-          socket.emit('dice-rolled', {
-            diceRoll:       game.lastDiceRoll,
-            playerId:       socket.user._id,
-            playerUsername: socket.user.username,
-            validMoves:     existingMoves.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
-            hasValidMoves:  existingMoves.length > 0,
-            currentTurn:    game.currentTurn.toString(),
-            resync:         true, // flag so client knows this is a resync not a new roll
-          });
-          return;
-        }
-
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
         const playerState   = game.players[playerIdx];
         const opponentState = game.players[opponentIdx];
 
-        // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
         let diceRoll = LudoEngine.rollDice();
         if ((game.consecutiveSixes || 0) >= 2) {
-          while (diceRoll === 6) {
-            diceRoll = LudoEngine.rollDice();
-          }
+          while (diceRoll === 6) diceRoll = LudoEngine.rollDice();
         }
         game.lastDiceRoll = diceRoll;
 
@@ -318,7 +266,6 @@ module.exports = (io) => {
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
 
-        // No valid moves — pass turn instantly
         if (validMoves.length === 0) {
           game.currentTurn  = opponentState.user._id;
           game.lastDiceRoll = null;
@@ -326,17 +273,27 @@ module.exports = (io) => {
 
           io.to(roomCode).emit('dice-rolled', {
             diceRoll,
-            playerId: socket.user._id,
+            playerId: socket.user._id.toString(),
             playerUsername: socket.user.username,
-            validMoves: [],
             hasValidMoves: false,
-            currentTurn: game.currentTurn.toString(),
-          });
-
-          io.to(roomCode).emit('turn-passed', {
-            reason: 'No valid moves',
             nextTurn: opponentState.user._id.toString(),
-            nextTurnUsername: opponentState.user.username,
+          });
+          return;
+        }
+
+        if ((game.consecutiveSixes || 0) >= 3) {
+          game.currentTurn      = opponentState.user._id;
+          game.consecutiveSixes = 0;
+          game.lastDiceRoll     = null;
+          await game.save();
+
+          io.to(roomCode).emit('dice-rolled', {
+            diceRoll,
+            playerId: socket.user._id.toString(),
+            playerUsername: socket.user.username,
+            consecutiveSixes: true,
+            message: '3 sixes in a row! Turn forfeited.',
+            nextTurn: opponentState.user._id.toString(),
           });
           return;
         }
@@ -345,15 +302,10 @@ module.exports = (io) => {
 
         io.to(roomCode).emit('dice-rolled', {
           diceRoll,
-          playerId: socket.user._id,
+          playerId: socket.user._id.toString(),
           playerUsername: socket.user.username,
-          validMoves: validMoves.map(m => ({
-            tokenIndex: m.tokenIndex,
-            newProgress: m.newProgress,
-            canCapture: m.canCapture,
-          })),
           hasValidMoves: true,
-          currentTurn: game.currentTurn.toString(),
+          validMoves: validMoves.map(m => m.tokenIndex),
         });
 
       } catch (err) {
@@ -362,9 +314,6 @@ module.exports = (io) => {
       }
     });
 
-    // ============================
-    // move-token
-    // ============================
     socket.on('move-token', async ({ roomCode, tokenIndex }) => {
       try {
         const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
@@ -376,22 +325,18 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
-        // ✅ FIX: Capture diceRoll into a local variable FIRST before nulling game.lastDiceRoll
-        const diceRoll = game.lastDiceRoll;
-        if (diceRoll === null || diceRoll === undefined)
-          return socket.emit('error', { message: 'Roll dice first' });
-
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
         const playerState   = game.players[playerIdx];
         const opponentState = game.players[opponentIdx];
 
-        // ✅ FIX: Use local diceRoll variable (not game.lastDiceRoll) for all validation & logic
+        const diceRoll = game.lastDiceRoll;
+        if (!diceRoll) return socket.emit('error', { message: 'Roll dice first' });
+
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
         const move = validMoves.find(m => m.tokenIndex === tokenIndex);
         if (!move) return socket.emit('error', { message: 'Invalid move' });
 
-        // ✅ FIX: Use local diceRoll variable here too
         const result = LudoEngine.applyMove(playerState, opponentState, tokenIndex, diceRoll);
 
         game.players[playerIdx].tokens         = result.newPlayerTokens;
@@ -400,13 +345,12 @@ module.exports = (io) => {
 
         game.moveHistory.push({
           player: socket.user._id,
-          dice: diceRoll, // ✅ FIX: use local variable
+          dice: diceRoll,
           tokenIndex,
           fromPosition: move.currentProgress,
           toPosition:   move.newProgress,
         });
 
-        // ✅ FIX: Null lastDiceRoll AFTER all logic that depends on it is done
         game.lastDiceRoll = null;
 
         const moveData = {
@@ -420,7 +364,6 @@ module.exports = (io) => {
           finishedCount: result.finishedCount,
         };
 
-        // Game over
         if (result.gameOver) {
           game.status     = 'finished';
           game.winner     = socket.user._id;
@@ -449,13 +392,10 @@ module.exports = (io) => {
 
         if (result.extraTurn) {
           game.currentTurn = socket.user._id;
-          // ✅ FIX: Use local diceRoll variable (game.lastDiceRoll is already null here)
-          if (diceRoll !== 6 && result.captured) {
-            game.consecutiveSixes = 0;
-          }
+          if (diceRoll !== 6 && result.captured) game.consecutiveSixes = 0;
         } else {
           game.currentTurn      = opponentState.user._id;
-          game.consecutiveSixes = 0; // ✅ reset when turn passes to opponent
+          game.consecutiveSixes = 0;
         }
 
         await game.save();
@@ -482,7 +422,7 @@ module.exports = (io) => {
     });
 
     // ============================
-    // disconnect
+    // disconnect — internet/connection drop only (NOT intentional exit)
     // ============================
     socket.on('disconnect', async () => {
       console.log(`User disconnected: ${socket.user.username}`);
@@ -494,20 +434,21 @@ module.exports = (io) => {
 
         if (!game) return;
 
+        // ✅ If game already finished (forfeited), no need to handle disconnect
+        if (game.status === 'finished') return;
+
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
         );
         if (playerIdx === -1) return;
 
-        // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
+        // SCENARIO 1: waiting room → abort
         if (game.status === 'waiting') {
-          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
-
+          cancelWaitingTimer(socket.currentRoom);
           game.status = 'aborted';
           game.finishedAt = new Date();
           await game.save();
 
-          // Refund creator (only creator has paid at this point)
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
             const before = creator.balance;
@@ -530,11 +471,10 @@ module.exports = (io) => {
             reason: 'creator_left',
             message: 'Room creator left. Game aborted. Bet refunded.',
           });
-
-          return; // stop here — no 60s timer needed
+          return;
         }
 
-        // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
+        // SCENARIO 2: active game → 60s reconnect window (internet drop)
         game.players[playerIdx].isConnected = false;
         await game.save();
 
@@ -587,19 +527,21 @@ module.exports = (io) => {
       }
     });
 
-    // ============================
-    // reconnect-room: player comes back within 60s
-    // ============================
     socket.on('reconnect-room', async ({ roomCode }) => {
       try {
+        // ✅ Block forfeited player from reconnecting
+        const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
+        if (!game) return;
+
+        if (game.forfeitedBy && game.forfeitedBy.toString() === socket.user._id.toString()) {
+          return socket.emit('error', { message: 'You forfeited this game.' });
+        }
+
         const room = activeRooms.get(roomCode);
         if (room?.disconnectTimer) {
           clearTimeout(room.disconnectTimer);
           room.disconnectTimer = null;
         }
-
-        const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
-        if (!game) return;
 
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
@@ -617,6 +559,5 @@ module.exports = (io) => {
       }
     });
 
-  }); // end io.on('connection')
-
-}; // end module.exports
+  });
+};
