@@ -42,7 +42,7 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-waiting-game
+// ✅ GET /api/game/my-waiting-game
 router.get('/my-waiting-game', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -171,7 +171,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// POST /api/game/cancel/:roomCode — cancel a waiting game (creator only)
+// POST /api/game/cancel/:roomCode — cancel waiting game (creator only)
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -210,7 +210,7 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
 });
 
 // ✅ POST /api/game/forfeit/:roomCode — intentional exit during active game
-// Player forfeits: loses bet, opponent wins. Player is BLOCKED from rejoining.
+// Settles money immediately. Marks forfeitedBy to block player from rejoining.
 router.post('/forfeit/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -221,13 +221,13 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
     if (!game)
       return res.status(404).json({ message: 'Active game not found' });
 
-    const forfeitPlayerIdx = game.players.findIndex(
+    const forfeitIdx = game.players.findIndex(
       p => p.user._id.toString() === req.user._id.toString()
     );
-    if (forfeitPlayerIdx === -1)
+    if (forfeitIdx === -1)
       return res.status(403).json({ message: 'Not a player in this game' });
 
-    const opponentIdx = forfeitPlayerIdx === 0 ? 1 : 0;
+    const opponentIdx = forfeitIdx === 0 ? 1 : 0;
     const winnerId    = game.players[opponentIdx].user._id;
     const loserId     = req.user._id;
 
@@ -241,7 +241,7 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
     game.winAmount   = winAmount;
     game.platformFee = platformFee;
     game.finishedAt  = new Date();
-    game.forfeitedBy = loserId; // ✅ mark as intentional forfeit
+    game.forfeitedBy = loserId; // ✅ blocks this player from rejoining
     await game.save();
 
     // Settle finances
@@ -257,9 +257,9 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
     winner.balance     += netWin;
     winner.gamesWon    += 1;
     winner.gamesPlayed += 1;
-    winner.totalEarned += netWin;
+    winner.totalEarned = (winner.totalEarned || 0) + netWin;
     loser.gamesPlayed  += 1;
-    loser.totalLost    += game.betAmount;
+    loser.totalLost    = (loser.totalLost || 0) + game.betAmount;
 
     await winner.save();
     await loser.save();
@@ -282,6 +282,8 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
       status: 'completed',
       gameId: game._id,
     });
+
+    console.log(`Forfeit: ${req.user.username} forfeited. Winner: ${winner.username} +₹${netWin}`);
 
     res.json({
       message: 'Forfeited. You lost the bet.',
