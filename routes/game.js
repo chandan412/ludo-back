@@ -42,7 +42,7 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// GET /api/game/my-waiting-game  ✅ NEW — used by Dashboard
+// GET /api/game/my-waiting-game
 router.get('/my-waiting-game', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -56,7 +56,7 @@ router.get('/my-waiting-game', auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: returns all statuses so Lobby can detect waiting/active games
+// GET /api/game/my-games/history
 router.get('/my-games/history', auth, async (req, res) => {
   try {
     const games = await Game.find({
@@ -171,7 +171,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: cancel uses 'aborted' status + creates transaction record
+// POST /api/game/cancel/:roomCode — cancel a waiting game (creator only)
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -205,6 +205,91 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
 
     res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ✅ POST /api/game/forfeit/:roomCode — intentional exit during active game
+// Player forfeits: loses bet, opponent wins. Player is BLOCKED from rejoining.
+router.post('/forfeit/:roomCode', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'active'
+    }).populate('players.user', 'username');
+
+    if (!game)
+      return res.status(404).json({ message: 'Active game not found' });
+
+    const forfeitPlayerIdx = game.players.findIndex(
+      p => p.user._id.toString() === req.user._id.toString()
+    );
+    if (forfeitPlayerIdx === -1)
+      return res.status(403).json({ message: 'Not a player in this game' });
+
+    const opponentIdx = forfeitPlayerIdx === 0 ? 1 : 0;
+    const winnerId    = game.players[opponentIdx].user._id;
+    const loserId     = req.user._id;
+
+    const pot         = game.betAmount * 2;
+    const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+    const winAmount   = pot - platformFee;
+
+    game.status      = 'finished';
+    game.winner      = winnerId;
+    game.loser       = loserId;
+    game.winAmount   = winAmount;
+    game.platformFee = platformFee;
+    game.finishedAt  = new Date();
+    game.forfeitedBy = loserId; // ✅ mark as intentional forfeit
+    await game.save();
+
+    // Settle finances
+    const winner = await User.findById(winnerId);
+    const loser  = await User.findById(loserId);
+
+    winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
+    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
+    loser.balance        = Math.max(0, loser.balance - game.betAmount);
+
+    const winnerBalanceBefore = winner.balance;
+    const netWin = game.betAmount - platformFee;
+    winner.balance     += netWin;
+    winner.gamesWon    += 1;
+    winner.gamesPlayed += 1;
+    winner.totalEarned += netWin;
+    loser.gamesPlayed  += 1;
+    loser.totalLost    += game.betAmount;
+
+    await winner.save();
+    await loser.save();
+
+    await Transaction.create({
+      user: winnerId,
+      type: 'game_win',
+      amount: netWin,
+      balanceBefore: winnerBalanceBefore,
+      balanceAfter:  winner.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+    await Transaction.create({
+      user: loserId,
+      type: 'game_loss',
+      amount: game.betAmount,
+      balanceBefore: loser.balance + game.betAmount,
+      balanceAfter:  loser.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    res.json({
+      message: 'Forfeited. You lost the bet.',
+      winnerId: winnerId.toString(),
+      winAmount,
+    });
+  } catch (err) {
+    console.error('forfeit error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
