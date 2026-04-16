@@ -241,11 +241,8 @@ module.exports = (io) => {
     // ============================
     // roll-dice
     // ============================
-    // ============================
-    // player-rolling: broadcast to opponent so they see dice shaking
-    // ============================
+    // ✅ player-rolling: notify opponent dice is shaking before result arrives
     socket.on('player-rolling', ({ roomCode }) => {
-      // Notify everyone else in the room immediately
       socket.to(roomCode).emit('opponent-rolling', {
         playerId: socket.user._id.toString(),
         username: socket.user.username,
