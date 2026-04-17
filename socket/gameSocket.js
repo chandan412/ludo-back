@@ -240,10 +240,8 @@ module.exports = (io) => {
 
     // ============================
     // roll-dice
-    // ✅ Frontend sends the dice value it already showed the player.
-    // Server validates it (consecutive-six override), computes valid moves, saves.
     // ============================
-    socket.on('roll-dice', async ({ roomCode, diceValue }) => {
+    socket.on('roll-dice', async ({ roomCode }) => {
       try {
         const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
           .populate('players.user', 'username');
@@ -254,48 +252,29 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
-        const playerIdx     = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
-        const opponentIdx   = playerIdx === 0 ? 1 : 0;
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const opponentIdx = playerIdx === 0 ? 1 : 0;
         const playerState   = game.players[playerIdx];
         const opponentState = game.players[opponentIdx];
 
-        // ✅ Use the value the player already saw — but override if they hit 3 sixes
-        let diceRoll = (diceValue >= 1 && diceValue <= 6) ? diceValue : LudoEngine.rollDice();
-
-        // 3rd consecutive six → force non-six (override what player saw)
-        if ((game.consecutiveSixes || 0) >= 2 && diceRoll === 6) {
-          diceRoll = LudoEngine.rollDice();
-          while (diceRoll === 6) diceRoll = LudoEngine.rollDice();
+        // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
+        let diceRoll = LudoEngine.rollDice();
+        if ((game.consecutiveSixes || 0) >= 2) {
+          while (diceRoll === 6) {
+            diceRoll = LudoEngine.rollDice();
+          }
         }
-
         game.lastDiceRoll = diceRoll;
-        game.consecutiveSixes = diceRoll === 6
-          ? (game.consecutiveSixes || 0) + 1
-          : 0;
+
+        if (diceRoll === 6) {
+          game.consecutiveSixes = (game.consecutiveSixes || 0) + 1;
+        } else {
+          game.consecutiveSixes = 0;
+        }
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
 
-        // ✅ Consecutive six penalty
-        if ((game.consecutiveSixes || 0) >= 3) {
-          game.currentTurn      = opponentState.user._id;
-          game.consecutiveSixes = 0;
-          game.lastDiceRoll     = null;
-          await game.save();
-
-          io.to(roomCode).emit('dice-rolled', {
-            diceRoll,
-            playerId:       socket.user._id.toString(),
-            playerUsername: socket.user.username,
-            hasValidMoves:  false,
-            validMoves:     [],
-            consecutiveSixes: true,
-            message:        '3 sixes in a row! Turn forfeited.',
-            nextTurn:       opponentState.user._id.toString(),
-          });
-          return;
-        }
-
-        // No valid moves — pass turn
+        // No valid moves — pass turn instantly
         if (validMoves.length === 0) {
           game.currentTurn  = opponentState.user._id;
           game.lastDiceRoll = null;
@@ -303,16 +282,16 @@ module.exports = (io) => {
 
           io.to(roomCode).emit('dice-rolled', {
             diceRoll,
-            playerId:       socket.user._id.toString(),
+            playerId: socket.user._id,
             playerUsername: socket.user.username,
-            hasValidMoves:  false,
-            validMoves:     [],
-            nextTurn:       opponentState.user._id.toString(),
+            validMoves: [],
+            hasValidMoves: false,
+            currentTurn: game.currentTurn.toString(),
           });
 
           io.to(roomCode).emit('turn-passed', {
-            reason:           'No valid moves',
-            nextTurn:         opponentState.user._id.toString(),
+            reason: 'No valid moves',
+            nextTurn: opponentState.user._id.toString(),
             nextTurnUsername: opponentState.user.username,
           });
           return;
@@ -320,13 +299,17 @@ module.exports = (io) => {
 
         await game.save();
 
-        // ✅ Send validMoves as plain tokenIndex numbers — easier for frontend
         io.to(roomCode).emit('dice-rolled', {
           diceRoll,
-          playerId:       socket.user._id.toString(),
+          playerId: socket.user._id,
           playerUsername: socket.user.username,
-          hasValidMoves:  true,
-          validMoves:     validMoves.map(m => m.tokenIndex),
+          validMoves: validMoves.map(m => ({
+            tokenIndex: m.tokenIndex,
+            newProgress: m.newProgress,
+            canCapture: m.canCapture,
+          })),
+          hasValidMoves: true,
+          currentTurn: game.currentTurn.toString(),
         });
 
       } catch (err) {
@@ -588,6 +571,50 @@ module.exports = (io) => {
       } catch (err) {
         console.error('reconnect-room error:', err);
       }
+    });
+
+
+    // ============================
+    // Global chat — socket only, no DB, messages live in memory only
+    // ============================
+    socket.on('join-chat', () => {
+      socket.join('global-chat');
+      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+      io.to('global-chat').emit('chat-online-count', { count });
+    });
+
+    socket.on('leave-chat', () => {
+      socket.leave('global-chat');
+      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+      io.to('global-chat').emit('chat-online-count', { count });
+    });
+
+    socket.on('send-chat', ({ text }) => {
+      if (!text || !text.trim() || text.length > 200) return;
+      const msg = {
+        _id:       Date.now().toString() + Math.random().toString(36).slice(2),
+        userId:    socket.user._id.toString(),
+        username:  socket.user.username,
+        text:      text.trim(),
+        type:      'chat',
+        createdAt: new Date().toISOString(),
+      };
+      io.to('global-chat').emit('chat-message', msg);
+    });
+
+    // ✅ Game invite — player sends a challenge card into chat
+    socket.on('send-invite', ({ betAmount }) => {
+      if (!betAmount || betAmount < 10) return;
+      const invite = {
+        _id:       Date.now().toString() + Math.random().toString(36).slice(2),
+        userId:    socket.user._id.toString(),
+        username:  socket.user.username,
+        text:      `wants to play for ₹${betAmount}`,
+        type:      'invite',
+        betAmount,
+        createdAt: new Date().toISOString(),
+      };
+      io.to('global-chat').emit('chat-message', invite);
     });
 
   }); // end io.on('connection')
