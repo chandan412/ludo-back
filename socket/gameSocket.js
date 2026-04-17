@@ -602,16 +602,18 @@ module.exports = (io) => {
       io.to('global-chat').emit('chat-message', msg);
     });
 
-    // ✅ Game invite — player sends a challenge card into chat
-    socket.on('send-invite', ({ betAmount }) => {
-      if (!betAmount || betAmount < 10) return;
+    // ✅ Game invite — player already created a game, now broadcasts challenge card
+    // roomCode is included so acceptor can join directly without searching lobby
+    socket.on('send-invite', ({ betAmount, roomCode }) => {
+      if (!betAmount || betAmount < 10 || !roomCode) return;
       const invite = {
         _id:       Date.now().toString() + Math.random().toString(36).slice(2),
         userId:    socket.user._id.toString(),
         username:  socket.user.username,
-        text:      `wants to play for ₹${betAmount}`,
+        text:      `challenged everyone for ₹${betAmount}`,
         type:      'invite',
         betAmount,
+        roomCode,
         createdAt: new Date().toISOString(),
       };
       io.to('global-chat').emit('chat-message', invite);
