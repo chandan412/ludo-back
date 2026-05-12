@@ -72,23 +72,17 @@ router.post('/withdraw-request', auth, async (req, res) => {
       return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
     const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
     if (pending) return res.status(400).json({ message: 'You already have a pending withdrawal request' });
-
-    // ✅ Create transaction record FIRST, then deduct balance
-    // This way if the save fails, the transaction record exists and admin can reconcile
-    const balanceBefore = user.balance;
+    user.lockedBalance += amount;
+    await user.save();
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'withdraw',
       amount,
-      balanceBefore,
-      balanceAfter: balanceBefore - amount,
+      balanceBefore: user.balance,
+      balanceAfter: user.balance,
       status: 'pending',
       bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
     });
-
-    // Now deduct — if this fails, admin sees a pending transaction with no balance change
-    user.balance -= amount;
-    await user.save();
     res.status(201).json({
       message: 'Withdrawal request submitted. Admin will process within 24 hours.',
       transaction
