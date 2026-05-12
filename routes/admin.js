@@ -55,11 +55,9 @@ router.post('/add-balance', adminAuth, async (req, res) => {
     await user.save();
 
     if (transactionId) {
-      // ✅ balanceAfter = balanceBefore (stored in tx at request time) + amount added now
-      const tx = await Transaction.findById(transactionId);
       await Transaction.findByIdAndUpdate(transactionId, {
         status: 'approved',
-        balanceAfter: (tx?.balanceBefore || user.balance - parseFloat(amount)) + parseFloat(amount),
+        balanceAfter: user.balance,
         processedBy: req.user._id,
         processedAt: new Date()
       });
@@ -98,15 +96,23 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
     const user = await User.findById(transaction.user._id);
 
     if (action === 'approve') {
+      // ✅ FIX: Deduct from both balance and lockedBalance on approval
+      const balanceBefore = user.balance;
+      user.balance = Math.max(0, user.balance - transaction.amount);
+      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
+      await user.save();
+
       transaction.status = 'completed';
+      transaction.balanceBefore = balanceBefore;
+      transaction.balanceAfter = user.balance;
       transaction.withdrawNote = adminNote || 'Payment sent by admin';
       transaction.processedBy = req.user._id;
       transaction.processedAt = new Date();
       await transaction.save();
       res.json({ message: `Withdrawal of ₹${transaction.amount} approved for ${user.username}` });
     } else if (action === 'reject') {
-      const balanceBefore = user.balance;
-      user.balance += transaction.amount;
+      // ✅ FIX: Only unlock — balance was never deducted
+      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
       await user.save();
 
       transaction.status = 'rejected';
@@ -117,17 +123,17 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
 
       await Transaction.create({
         user: user._id,
-        type: 'recharge',
+        type: 'refund',
         amount: transaction.amount,
-        balanceBefore,
+        balanceBefore: user.balance,
         balanceAfter: user.balance,
         status: 'completed',
-        rechargeNote: `Withdrawal rejected - refund. Reason: ${adminNote || 'N/A'}`,
+        withdrawNote: `Withdrawal rejected - amount unlocked. Reason: ${adminNote || 'N/A'}`,
         processedBy: req.user._id,
         processedAt: new Date()
       });
 
-      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} refunded to ${user.username}` });
+      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} unlocked for ${user.username}` });
     } else {
       res.status(400).json({ message: 'Invalid action. Use approve or reject' });
     }
