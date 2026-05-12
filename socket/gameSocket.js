@@ -28,12 +28,13 @@ function startWaitingTimer(io, roomCode) {
   const abortTimer = setTimeout(async () => {
     clearInterval(tickInterval);
     try {
-      const game = await Game.findOne({ roomCode, status: 'waiting' });
+      // ✅ Atomic: only succeeds if game is still waiting (prevents double refund if user cancelled)
+      const game = await Game.findOneAndUpdate(
+        { roomCode, status: 'waiting' },
+        { $set: { status: 'aborted', finishedAt: new Date() } },
+        { new: true }
+      );
       if (!game) return; // already started or aborted
-
-      game.status = 'aborted';
-      game.finishedAt = new Date();
-      await game.save();
 
       // Refund creator
       const creator = await User.findById(game.players[0].user);
@@ -220,6 +221,34 @@ module.exports = (io) => {
         await game.save();
 
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
+
+        // ✅ ANTI-CHEAT: If a dice roll is pending and it's this player's turn,
+        // resend the dice value + valid moves so they can complete their move after reconnect
+        if (
+          game.status === 'active' &&
+          game.lastDiceRoll !== null &&
+          game.lastDiceRoll !== undefined &&
+          game.currentTurn?.toString() === socket.user._id.toString()
+        ) {
+          const opponentIdx = playerIdx === 0 ? 1 : 0;
+          const playerState   = game.players[playerIdx];
+          const opponentState = game.players[opponentIdx];
+          const validMoves = LudoEngine.getValidMoves(playerState, game.lastDiceRoll, opponentState);
+          socket.emit('dice-rolled', {
+            diceRoll: game.lastDiceRoll,
+            playerId: socket.user._id,
+            playerUsername: socket.user.username,
+            validMoves: validMoves.map(m => ({
+              tokenIndex: m.tokenIndex,
+              newProgress: m.newProgress,
+              canCapture: m.canCapture,
+            })),
+            hasValidMoves: validMoves.length > 0,
+            resumed: true, // ✅ marks this as a state-restore, not a fresh roll
+            currentTurn: game.currentTurn.toString(),
+          });
+        }
+
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
         // ✅ Count connected players — if both are in, cancel the waiting timer
@@ -251,6 +280,23 @@ module.exports = (io) => {
 
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
+
+        // ✅ ANTI-CHEAT: Block re-roll if a dice value is already pending
+        if (game.lastDiceRoll !== null && game.lastDiceRoll !== undefined) {
+          // Re-emit existing value so client recovers state — don't roll again
+          return socket.emit('dice-rolled', {
+            diceRoll: game.lastDiceRoll,
+            playerId: socket.user._id,
+            playerUsername: socket.user.username,
+            validMoves: LudoEngine.getValidMoves(
+              game.players.find(p => p.user._id.toString() === socket.user._id.toString()),
+              game.lastDiceRoll,
+              game.players.find(p => p.user._id.toString() !== socket.user._id.toString())
+            ).map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
+            hasValidMoves: true,
+            currentTurn: game.currentTurn.toString(),
+          });
+        }
 
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
@@ -326,16 +372,23 @@ module.exports = (io) => {
     // ============================
     socket.on('move-token', async ({ roomCode, tokenIndex }) => {
       try {
-        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
-          .populate('players.user', 'username');
+        // ✅ Atomic: read game + null lastDiceRoll in one op so double-click can't double-move
+        const game = await Game.findOneAndUpdate(
+          {
+            roomCode: roomCode.toUpperCase(),
+            status: 'active',
+            currentTurn: socket.user._id,
+            lastDiceRoll: { $ne: null },
+          },
+          { $set: { lastDiceRoll: null } },
+          { new: false } // return pre-update doc so we still have diceRoll
+        ).populate('players.user', 'username');
 
-        if (!game || game.status !== 'active')
-          return socket.emit('error', { message: 'Game not active' });
+        if (!game) {
+          // Either not active, not your turn, or dice was already nulled (double-click race)
+          return socket.emit('error', { message: 'Move rejected: not your turn or dice already consumed' });
+        }
 
-        if (game.currentTurn.toString() !== socket.user._id.toString())
-          return socket.emit('error', { message: 'Not your turn' });
-
-        // ✅ FIX: Capture diceRoll into a local variable FIRST before nulling game.lastDiceRoll
         const diceRoll = game.lastDiceRoll;
         if (diceRoll === null || diceRoll === undefined)
           return socket.emit('error', { message: 'Roll dice first' });
@@ -365,7 +418,7 @@ module.exports = (io) => {
           toPosition:   move.newProgress,
         });
 
-        // ✅ FIX: Null lastDiceRoll AFTER all logic that depends on it is done
+        // Already nulled in DB by findOneAndUpdate above — reassert in-memory for the upcoming save
         game.lastDiceRoll = null;
 
         const moveData = {
@@ -494,26 +547,30 @@ module.exports = (io) => {
         if (game.status === 'waiting') {
           cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
 
-          game.status = 'aborted';
-          game.finishedAt = new Date();
-          await game.save();
+          // ✅ Atomic: only refund if game is still waiting (prevents double refund w/ auto-abort or cancel route)
+          const aborted = await Game.findOneAndUpdate(
+            { roomCode: socket.currentRoom, status: 'waiting' },
+            { $set: { status: 'aborted', finishedAt: new Date() } },
+            { new: true }
+          );
+          if (!aborted) return; // someone else already aborted/cancelled
 
           // Refund creator (only creator has paid at this point)
-          const creator = await User.findById(game.players[0].user._id);
+          const creator = await User.findById(aborted.players[0].user);
           if (creator) {
             const before = creator.balance;
             // ✅ FIX: Only reduce lockedBalance — balance was never deducted
-            creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
+            creator.lockedBalance = Math.max(0, creator.lockedBalance - aborted.betAmount);
             await creator.save();
 
             await Transaction.create({
               user: creator._id,
               type: 'refund',
-              amount: game.betAmount,
+              amount: aborted.betAmount,
               balanceBefore: before,
               balanceAfter: creator.balance,
               status: 'completed',
-              gameId: game._id,
+              gameId: aborted._id,
             });
           }
 
@@ -535,7 +592,12 @@ module.exports = (io) => {
         });
 
         const timer = setTimeout(async () => {
-          const freshGame = await Game.findOne({ roomCode: socket.currentRoom, status: 'active' });
+          // ✅ Atomic: only succeeds if game is still active (prevents double settle if forfeit/move happened)
+          const freshGame = await Game.findOneAndUpdate(
+            { roomCode: socket.currentRoom, status: 'active' },
+            { $set: { status: 'finished', finishedAt: new Date() } },
+            { new: true }
+          );
           if (!freshGame) return;
 
           const disconnectedIdx = freshGame.players.findIndex(
@@ -551,12 +613,10 @@ module.exports = (io) => {
           const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
           const winAmount   = pot - platformFee;
 
-          freshGame.status      = 'finished';
           freshGame.winner      = winnerId;
           freshGame.loser       = loserId;
           freshGame.winAmount   = winAmount;
           freshGame.platformFee = platformFee;
-          freshGame.finishedAt  = new Date();
           await freshGame.save();
 
           await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
