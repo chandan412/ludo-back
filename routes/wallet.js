@@ -2,15 +2,40 @@ const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
+const Game = require('../models/Game');
 const { auth } = require('../middleware/auth');
 
 router.get('/balance', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id).select('balance lockedBalance username');
+
+    // ✅ Auto-reconcile lockedBalance against active games + pending withdrawals.
+    // Prevents stale "money in game" when no game exists.
+    const activeGames = await Game.find({
+      'players.user': req.user._id,
+      status: { $in: ['waiting', 'active'] },
+    }).select('betAmount');
+    const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
+
+    const pendingWithdraws = await Transaction.find({
+      user: req.user._id,
+      type: 'withdraw',
+      status: 'pending',
+    }).select('amount');
+    const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
+
+    const expectedLocked = gameLocked + withdrawLocked;
+
+    // If user's stored lockedBalance is different from the real expected, reconcile
+    if (user.lockedBalance !== expectedLocked) {
+      user.lockedBalance = expectedLocked;
+      await user.save();
+    }
+
     res.json({
       balance: user.balance,
       lockedBalance: user.lockedBalance,
-      availableBalance: user.balance - user.lockedBalance
+      availableBalance: user.balance - user.lockedBalance,
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
