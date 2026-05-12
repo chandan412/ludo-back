@@ -150,8 +150,8 @@ class LudoEngine {
     const finishedCount = newPlayerTokens.filter(t => t.isFinished).length;
     if (finishedCount === 4) gameOver = true;
 
-    // Extra turn on 6 OR on capture
-    const extraTurn = diceRoll === 6 || captured;
+    // ✅ Extra turn on 6 OR capture OR reaching main home (finishing a token)
+    const extraTurn = diceRoll === 6 || captured || token.isFinished;
 
     return { newPlayerTokens, newOpponentTokens, captured, extraTurn, gameOver, finishedCount };
   }
