@@ -242,4 +242,52 @@ router.get('/dashboard-stats', adminAuth, async (req, res) => {
   }
 });
 
+// ✅ POST /api/admin/reconcile-locked-balances
+// Recalculates lockedBalance for ALL users based on actual active games + pending withdrawals.
+// One-shot migration to fix any historical inflation.
+router.post('/reconcile-locked-balances', adminAuth, async (req, res) => {
+  try {
+    const users = await User.find().select('_id username lockedBalance');
+    const fixes = [];
+
+    for (const user of users) {
+      // Sum bet amounts in active/waiting games
+      const activeGames = await Game.find({
+        'players.user': user._id,
+        status: { $in: ['waiting', 'active'] },
+      }).select('betAmount');
+      const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
+
+      // Sum pending withdrawals
+      const pendingWithdraws = await Transaction.find({
+        user: user._id,
+        type: 'withdraw',
+        status: 'pending',
+      }).select('amount');
+      const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
+
+      const expectedLocked = gameLocked + withdrawLocked;
+      if (user.lockedBalance !== expectedLocked) {
+        fixes.push({
+          username: user.username,
+          before: user.lockedBalance,
+          after: expectedLocked,
+          delta: expectedLocked - user.lockedBalance,
+        });
+        user.lockedBalance = expectedLocked;
+        await user.save();
+      }
+    }
+
+    res.json({
+      message: `Reconciled ${fixes.length} users`,
+      fixes,
+      totalUnlocked: fixes.reduce((sum, f) => sum + Math.max(0, -f.delta), 0),
+    });
+  } catch (err) {
+    console.error('Reconcile error:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 module.exports = router;
