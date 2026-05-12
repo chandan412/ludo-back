@@ -3,290 +3,130 @@ const router = express.Router();
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Game = require('../models/Game');
-const { adminAuth } = require('../middleware/auth');
+const { auth } = require('../middleware/auth');
 
-// GET /api/admin/players
-router.get('/players', adminAuth, async (req, res) => {
+router.get('/balance', auth, async (req, res) => {
   try {
-    const { search, page = 1, limit = 20 } = req.query;
-    const skip = (page - 1) * limit;
-    const query = { role: 'player' };
-    if (search) {
-      query.$or = [
-        { username: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-        { phone: { $regex: search, $options: 'i' } }
-      ];
-    }
-    const players = await User.find(query).select('-password').sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit));
-    const total = await User.countDocuments(query);
-    res.json({ players, total, page: parseInt(page), pages: Math.ceil(total / limit) });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+    const user = await User.findById(req.user._id).select('balance lockedBalance username');
 
-// GET /api/admin/player/:id
-router.get('/player/:id', adminAuth, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id).select('-password');
-    if (!user) return res.status(404).json({ message: 'Player not found' });
-    const transactions = await Transaction.find({ user: user._id }).sort({ createdAt: -1 }).limit(20);
-    const games = await Game.find({ 'players.user': user._id }).sort({ createdAt: -1 }).limit(10);
-    res.json({ user, transactions, games });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
+    // ✅ Auto-reconcile lockedBalance against active games + pending withdrawals.
+    // Prevents stale "money in game" when no game exists.
+    const activeGames = await Game.find({
+      'players.user': req.user._id,
+      status: { $in: ['waiting', 'active'] },
+    }).select('betAmount');
+    const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
 
-// POST /api/admin/add-balance
-router.post('/add-balance', adminAuth, async (req, res) => {
-  try {
-    const { userId, amount, note, transactionId } = req.body;
-    if (!userId || !amount || amount <= 0)
-      return res.status(400).json({ message: 'userId and valid amount required' });
+    const pendingWithdraws = await Transaction.find({
+      user: req.user._id,
+      type: 'withdraw',
+      status: 'pending',
+    }).select('amount');
+    const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
 
-    const user = await User.findById(userId);
-    if (!user) return res.status(404).json({ message: 'Player not found' });
-    if (user.role !== 'player') return res.status(400).json({ message: 'Can only add balance to players' });
+    const expectedLocked = gameLocked + withdrawLocked;
 
-    const balanceBefore = user.balance;
-    user.balance += parseFloat(amount);
-    await user.save();
-
-    if (transactionId) {
-      await Transaction.findByIdAndUpdate(transactionId, {
-        status: 'approved',
-        balanceAfter: user.balance,
-        processedBy: req.user._id,
-        processedAt: new Date()
-      });
-    } else {
-      await Transaction.create({
-        user: userId,
-        type: 'recharge',
-        amount: parseFloat(amount),
-        balanceBefore,
-        balanceAfter: user.balance,
-        status: 'approved',
-        rechargeNote: note || 'Manual recharge by admin',
-        processedBy: req.user._id,
-        processedAt: new Date()
-      });
-    }
-
-    res.json({ message: `₹${amount} added to ${user.username}'s account`, newBalance: user.balance });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// POST /api/admin/process-withdrawal
-router.post('/process-withdrawal', adminAuth, async (req, res) => {
-  try {
-    const { transactionId, action, adminNote } = req.body;
-    if (!transactionId || !action)
-      return res.status(400).json({ message: 'transactionId and action required' });
-
-    const transaction = await Transaction.findById(transactionId).populate('user');
-    if (!transaction) return res.status(404).json({ message: 'Transaction not found' });
-    if (transaction.type !== 'withdraw') return res.status(400).json({ message: 'Not a withdrawal transaction' });
-    if (transaction.status !== 'pending') return res.status(400).json({ message: 'Transaction already processed' });
-
-    const user = await User.findById(transaction.user._id);
-
-    if (action === 'approve') {
-      // ✅ FIX: Deduct from both balance and lockedBalance on approval
-      const balanceBefore = user.balance;
-      user.balance = Math.max(0, user.balance - transaction.amount);
-      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
+    // If user's stored lockedBalance is different from the real expected, reconcile
+    if (user.lockedBalance !== expectedLocked) {
+      user.lockedBalance = expectedLocked;
       await user.save();
-
-      transaction.status = 'completed';
-      transaction.balanceBefore = balanceBefore;
-      transaction.balanceAfter = user.balance;
-      transaction.withdrawNote = adminNote || 'Payment sent by admin';
-      transaction.processedBy = req.user._id;
-      transaction.processedAt = new Date();
-      await transaction.save();
-      res.json({ message: `Withdrawal of ₹${transaction.amount} approved for ${user.username}` });
-    } else if (action === 'reject') {
-      // ✅ FIX: Only unlock — balance was never deducted
-      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
-      await user.save();
-
-      transaction.status = 'rejected';
-      transaction.withdrawNote = adminNote || 'Rejected by admin';
-      transaction.processedBy = req.user._id;
-      transaction.processedAt = new Date();
-      await transaction.save();
-
-      await Transaction.create({
-        user: user._id,
-        type: 'refund',
-        amount: transaction.amount,
-        balanceBefore: user.balance,
-        balanceAfter: user.balance,
-        status: 'completed',
-        withdrawNote: `Withdrawal rejected - amount unlocked. Reason: ${adminNote || 'N/A'}`,
-        processedBy: req.user._id,
-        processedAt: new Date()
-      });
-
-      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} unlocked for ${user.username}` });
-    } else {
-      res.status(400).json({ message: 'Invalid action. Use approve or reject' });
     }
+
+    res.json({
+      balance: user.balance,
+      lockedBalance: user.lockedBalance,
+      availableBalance: user.balance - user.lockedBalance,
+    });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// GET /api/admin/pending-transactions
-router.get('/pending-transactions', adminAuth, async (req, res) => {
+router.get('/transactions', auth, async (req, res) => {
   try {
-    const { type } = req.query;
-    const query = { status: 'pending' };
-    if (type) query.type = type;
-    const transactions = await Transaction.find(query)
-      .populate('user', 'username email phone balance')
-      .sort({ createdAt: -1 });
-    res.json(transactions);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// GET /api/admin/all-transactions
-router.get('/all-transactions', adminAuth, async (req, res) => {
-  try {
-    const { page = 1, limit = 30, type } = req.query;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
-    const query = {};
-    if (type) query.type = type;
-    const transactions = await Transaction.find(query)
-      .populate('user', 'username phone')
-      .populate('processedBy', 'username')
+    const transactions = await Transaction.find({ user: req.user._id })
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
-    const total = await Transaction.countDocuments(query);
-    res.json({ transactions, total });
+      .limit(limit)
+      .populate('processedBy', 'username')
+      .populate('gameId', 'roomCode betAmount');
+    const total = await Transaction.countDocuments({ user: req.user._id });
+    res.json({ transactions, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// POST /api/admin/ban-player
-router.post('/ban-player', adminAuth, async (req, res) => {
+router.post('/recharge-request', auth, async (req, res) => {
   try {
-    const { userId } = req.body;
-    const user = await User.findByIdAndUpdate(userId, { isBanned: true }, { new: true }).select('-password');
-    if (!user) return res.status(404).json({ message: 'Player not found' });
-    res.json({ message: `${user.username} has been banned`, user });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// POST /api/admin/unban-player
-router.post('/unban-player', adminAuth, async (req, res) => {
-  try {
-    const { userId } = req.body;
-    const user = await User.findByIdAndUpdate(userId, { isBanned: false }, { new: true }).select('-password');
-    if (!user) return res.status(404).json({ message: 'Player not found' });
-    res.json({ message: `${user.username} has been unbanned`, user });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// GET /api/admin/dashboard-stats
-router.get('/dashboard-stats', adminAuth, async (req, res) => {
-  try {
-    const totalPlayers = await User.countDocuments({ role: 'player' });
-    const activePlayers = await User.countDocuments({ role: 'player', isBanned: false });
-    const totalGames = await Game.countDocuments({ status: 'finished' });
-    const activeGames = await Game.countDocuments({ status: 'active' });
-    const pendingRecharges = await Transaction.countDocuments({ type: 'recharge', status: 'pending' });
-    const pendingWithdrawals = await Transaction.countDocuments({ type: 'withdraw', status: 'pending' });
-
-    const feeEarned = await Transaction.aggregate([
-      { $match: { type: 'platform_fee' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-
-    const totalRechargedResult = await Transaction.aggregate([
-      { $match: { type: 'recharge', status: { $in: ['approved', 'completed'] } } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-
-    const totalWithdrawnResult = await Transaction.aggregate([
-      { $match: { type: 'withdraw', status: 'completed' } },
-      { $group: { _id: null, total: { $sum: '$amount' } } }
-    ]);
-
-    res.json({
-      totalPlayers,
-      activePlayers,
-      totalGames,
-      activeGames,
-      pendingRecharges,
-      pendingWithdrawals,
-      platformFeeEarned: feeEarned[0]?.total || 0,
-      totalRecharged: totalRechargedResult[0]?.total || 0,
-      totalWithdrawn: totalWithdrawnResult[0]?.total || 0
+    const { amount, paymentNote } = req.body;
+    if (!amount || amount < 10)
+      return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
+    const transaction = await Transaction.create({
+      user: req.user._id,
+      type: 'recharge',
+      amount,
+      balanceBefore: req.user.balance,
+      balanceAfter: req.user.balance,
+      status: 'pending',
+      rechargeNote: paymentNote || 'Payment via QR'
+    });
+    res.status(201).json({
+      message: 'Recharge request submitted. Admin will add balance after verifying payment.',
+      transaction
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// ✅ POST /api/admin/reconcile-locked-balances
-// Recalculates lockedBalance for ALL users based on actual active games + pending withdrawals.
-// One-shot migration to fix any historical inflation.
-router.post('/reconcile-locked-balances', adminAuth, async (req, res) => {
+router.post('/withdraw-request', auth, async (req, res) => {
   try {
-    const users = await User.find().select('_id username lockedBalance');
-    const fixes = [];
-
-    for (const user of users) {
-      // Sum bet amounts in active/waiting games
-      const activeGames = await Game.find({
-        'players.user': user._id,
-        status: { $in: ['waiting', 'active'] },
-      }).select('betAmount');
-      const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
-
-      // Sum pending withdrawals
-      const pendingWithdraws = await Transaction.find({
-        user: user._id,
-        type: 'withdraw',
-        status: 'pending',
-      }).select('amount');
-      const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
-
-      const expectedLocked = gameLocked + withdrawLocked;
-      if (user.lockedBalance !== expectedLocked) {
-        fixes.push({
-          username: user.username,
-          before: user.lockedBalance,
-          after: expectedLocked,
-          delta: expectedLocked - user.lockedBalance,
-        });
-        user.lockedBalance = expectedLocked;
-        await user.save();
-      }
-    }
-
-    res.json({
-      message: `Reconciled ${fixes.length} users`,
-      fixes,
-      totalUnlocked: fixes.reduce((sum, f) => sum + Math.max(0, -f.delta), 0),
+    const { amount, bankDetails } = req.body;
+    const { accountHolderName, accountNumber, ifscCode, bankName, upiId } = bankDetails || {};
+    if (!amount || amount < 50)
+      return res.status(400).json({ message: 'Minimum withdrawal amount is ₹50' });
+    const user = await User.findById(req.user._id);
+    const available = user.balance - user.lockedBalance;
+    if (amount > available)
+      return res.status(400).json({ message: `Insufficient balance. Available: ₹${available}` });
+    if (!upiId && (!accountNumber || !ifscCode || !accountHolderName))
+      return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
+    const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
+    if (pending) return res.status(400).json({ message: 'You already have a pending withdrawal request' });
+    // ✅ Create transaction first, then lock balance (safer if either fails)
+    const transaction = await Transaction.create({
+      user: req.user._id,
+      type: 'withdraw',
+      amount,
+      balanceBefore: user.balance,
+      balanceAfter: user.balance,
+      status: 'pending',
+      bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
+    });
+    user.lockedBalance += amount;
+    await user.save();
+    res.status(201).json({
+      message: 'Withdrawal request submitted. Admin will process within 24 hours.',
+      transaction
     });
   } catch (err) {
-    console.error('Reconcile error:', err);
-    res.status(500).json({ message: 'Server error', error: err.message });
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+router.get('/pending-requests', auth, async (req, res) => {
+  try {
+    const requests = await Transaction.find({
+      user: req.user._id,
+      status: 'pending'
+    }).sort({ createdAt: -1 });
+    res.json(requests);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
