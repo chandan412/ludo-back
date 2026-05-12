@@ -54,7 +54,6 @@ const userSchema = new mongoose.Schema({
   gamesWon: { type: Number, default: 0 },
   totalEarned: { type: Number, default: 0 },
   totalLost: { type: Number, default: 0 },
-  fcmToken: { type: String, default: null },
   createdAt: {
     type: Date,
     default: Date.now
@@ -77,4 +76,4 @@ userSchema.methods.toSafeObject = function () {
   return obj;
 };
 
-module.exports = mongoose.model('User', userSchema);
+module.exports = mongoose.models.User || mongoose.model('User', userSchema);
