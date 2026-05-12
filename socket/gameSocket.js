@@ -39,7 +39,7 @@ function startWaitingTimer(io, roomCode) {
       const creator = await User.findById(game.players[0].user);
       if (creator) {
         const before = creator.balance;
-        creator.balance += game.betAmount;
+        // ✅ FIX: Only reduce lockedBalance — balance was never deducted
         creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
         await creator.save();
 
@@ -259,9 +259,11 @@ module.exports = (io) => {
 
         // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
         let diceRoll = LudoEngine.rollDice();
+        let thirdSixBlocked = false;
         if ((game.consecutiveSixes || 0) >= 2) {
           while (diceRoll === 6) {
             diceRoll = LudoEngine.rollDice();
+            thirdSixBlocked = true;
           }
         }
         game.lastDiceRoll = diceRoll;
@@ -309,6 +311,7 @@ module.exports = (io) => {
             canCapture: m.canCapture,
           })),
           hasValidMoves: true,
+          thirdSixBlocked, // ✅ tells frontend the 3rd-six rule kicked in
           currentTurn: game.currentTurn.toString(),
         });
 
@@ -438,6 +441,38 @@ module.exports = (io) => {
     });
 
     // ============================
+    // forfeit-notify: client calls REST /forfeit endpoint first,
+    // then emits this so opponent learns in real-time
+    // ============================
+    socket.on('forfeit-notify', async ({ roomCode }) => {
+      try {
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username')
+          .populate('winner', 'username');
+
+        if (!game || game.status !== 'finished') return;
+
+        const winnerUser = game.players.find(p =>
+          p.user._id.toString() === game.winner?._id?.toString()
+        )?.user;
+        const loserUser = game.players.find(p =>
+          p.user._id.toString() === game.loser?.toString()
+        )?.user;
+
+        io.to(roomCode).emit('game-over', {
+          reason:  'forfeit',
+          winner:  { id: game.winner?._id?.toString(), username: winnerUser?.username },
+          loser:   { id: game.loser?.toString(), username: loserUser?.username },
+          winAmount: game.winAmount,
+          platformFee: game.platformFee,
+          message: `${loserUser?.username || 'Opponent'} forfeited. ${winnerUser?.username || 'You'} win!`,
+        });
+      } catch (err) {
+        console.error('forfeit-notify error:', err);
+      }
+    });
+
+    // ============================
     // disconnect
     // ============================
     socket.on('disconnect', async () => {
@@ -467,7 +502,7 @@ module.exports = (io) => {
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
             const before = creator.balance;
-            creator.balance += game.betAmount;
+            // ✅ FIX: Only reduce lockedBalance — balance was never deducted
             creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
             await creator.save();
 
@@ -571,52 +606,6 @@ module.exports = (io) => {
       } catch (err) {
         console.error('reconnect-room error:', err);
       }
-    });
-
-
-    // ============================
-    // Global chat — socket only, no DB, messages live in memory only
-    // ============================
-    socket.on('join-chat', () => {
-      socket.join('global-chat');
-      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
-      io.to('global-chat').emit('chat-online-count', { count });
-    });
-
-    socket.on('leave-chat', () => {
-      socket.leave('global-chat');
-      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
-      io.to('global-chat').emit('chat-online-count', { count });
-    });
-
-    socket.on('send-chat', ({ text }) => {
-      if (!text || !text.trim() || text.length > 200) return;
-      const msg = {
-        _id:       Date.now().toString() + Math.random().toString(36).slice(2),
-        userId:    socket.user._id.toString(),
-        username:  socket.user.username,
-        text:      text.trim(),
-        type:      'chat',
-        createdAt: new Date().toISOString(),
-      };
-      io.to('global-chat').emit('chat-message', msg);
-    });
-
-    // ✅ Game invite — player already created a game, now broadcasts challenge card
-    // roomCode is included so acceptor can join directly without searching lobby
-    socket.on('send-invite', ({ betAmount, roomCode }) => {
-      if (!betAmount || betAmount < 10 || !roomCode) return;
-      const invite = {
-        _id:       Date.now().toString() + Math.random().toString(36).slice(2),
-        userId:    socket.user._id.toString(),
-        username:  socket.user.username,
-        text:      `challenged everyone for ₹${betAmount}`,
-        type:      'invite',
-        betAmount,
-        roomCode,
-        createdAt: new Date().toISOString(),
-      };
-      io.to('global-chat').emit('chat-message', invite);
     });
 
   }); // end io.on('connection')
