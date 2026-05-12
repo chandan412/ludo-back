@@ -72,8 +72,7 @@ router.post('/withdraw-request', auth, async (req, res) => {
       return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
     const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
     if (pending) return res.status(400).json({ message: 'You already have a pending withdrawal request' });
-    user.lockedBalance += amount;
-    await user.save();
+    // ✅ Create transaction first, then lock balance (safer if either fails)
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'withdraw',
@@ -83,6 +82,8 @@ router.post('/withdraw-request', auth, async (req, res) => {
       status: 'pending',
       bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
     });
+    user.lockedBalance += amount;
+    await user.save();
     res.status(201).json({
       message: 'Withdrawal request submitted. Admin will process within 24 hours.',
       transaction
