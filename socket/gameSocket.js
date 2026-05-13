@@ -222,31 +222,39 @@ module.exports = (io) => {
 
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
 
-        // ✅ ANTI-CHEAT: If a dice roll is pending and it's this player's turn,
-        // resend the dice value + valid moves so they can complete their move after reconnect
+        // ✅ ANTI-CHEAT: If a dice roll is pending, resend the dice value to whoever is reconnecting
+        // (both rolling player AND opponent need to see the current dice value after refresh).
         if (
           game.status === 'active' &&
           game.lastDiceRoll !== null &&
-          game.lastDiceRoll !== undefined &&
-          game.currentTurn?.toString() === socket.user._id.toString()
+          game.lastDiceRoll !== undefined
         ) {
-          const opponentIdx = playerIdx === 0 ? 1 : 0;
-          const playerState   = game.players[playerIdx];
-          const opponentState = game.players[opponentIdx];
-          const validMoves = LudoEngine.getValidMoves(playerState, game.lastDiceRoll, opponentState);
-          socket.emit('dice-rolled', {
-            diceRoll: game.lastDiceRoll,
-            playerId: socket.user._id,
-            playerUsername: socket.user.username,
-            validMoves: validMoves.map(m => ({
-              tokenIndex: m.tokenIndex,
-              newProgress: m.newProgress,
-              canCapture: m.canCapture,
-            })),
-            hasValidMoves: validMoves.length > 0,
-            resumed: true, // ✅ marks this as a state-restore, not a fresh roll
-            currentTurn: game.currentTurn.toString(),
-          });
+          const rollerIdx = game.players.findIndex(p => p.user._id.toString() === game.currentTurn?.toString());
+          if (rollerIdx !== -1) {
+            const rollerOppIdx  = rollerIdx === 0 ? 1 : 0;
+            const rollerState   = game.players[rollerIdx];
+            const opponentState = game.players[rollerOppIdx];
+            const isRoller = game.currentTurn?.toString() === socket.user._id.toString();
+
+            // Compute valid moves only for the rolling player (opponent gets empty list)
+            const validMoves = isRoller
+              ? LudoEngine.getValidMoves(rollerState, game.lastDiceRoll, opponentState)
+              : [];
+
+            socket.emit('dice-rolled', {
+              diceRoll: game.lastDiceRoll,
+              playerId: rollerState.user._id,
+              playerUsername: rollerState.user.username,
+              validMoves: validMoves.map(m => ({
+                tokenIndex: m.tokenIndex,
+                newProgress: m.newProgress,
+                canCapture: m.canCapture,
+              })),
+              hasValidMoves: validMoves.length > 0,
+              resumed: true, // marks this as a state-restore, not a fresh roll
+              currentTurn: game.currentTurn.toString(),
+            });
+          }
         }
 
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
@@ -321,6 +329,40 @@ module.exports = (io) => {
         }
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
+
+        // ✅ DIAGNOSTIC: catch the bug where dice=6 returns 0 moves but home tokens exist
+        if (validMoves.length === 0 && diceRoll === 6) {
+          const tokensSummary = playerState.tokens.map(t => ({
+            pos: t.position, isHome: t.isHome, isFinished: t.isFinished
+          }));
+          console.log('⚠️ ENGINE ANOMALY: dice=6 returned 0 moves. Player tokens:',
+            JSON.stringify(tokensSummary));
+
+          // ✅ DEFENSIVE FIX: For each home token (position=-1 OR isHome=true OR position=null),
+          // manually add an exit-home move. This catches Mongoose field-type drift.
+          playerState.tokens.forEach((t, idx) => {
+            if (t.isFinished) return;
+            const isInHome = t.position === -1
+                          || t.position === null
+                          || t.position === undefined
+                          || t.isHome === true
+                          || isNaN(Number(t.position));
+            if (isInHome) {
+              const globalPos = LudoEngine.getGlobalPosition(playerState.color, 0);
+              const canCapture = LudoEngine.canCapture(globalPos, opponentState);
+              validMoves.push({
+                tokenIndex: idx,
+                currentProgress: -1,
+                newProgress: 0,
+                canCapture,
+                willFinish: false,
+              });
+            }
+          });
+          if (validMoves.length > 0) {
+            console.log('✅ Recovered ' + validMoves.length + ' moves via defensive fix');
+          }
+        }
 
         // No valid moves — pass turn instantly
         if (validMoves.length === 0) {
