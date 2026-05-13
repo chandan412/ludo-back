@@ -42,7 +42,7 @@ router.get('/my-active-game', auth, async (req, res) => {
   }
 });
 
-// ✅ GET /api/game/my-waiting-game — for Dashboard waiting banner
+// GET /api/game/my-waiting-game
 router.get('/my-waiting-game', auth, async (req, res) => {
   try {
     const game = await Game.findOne({
@@ -122,7 +122,16 @@ router.post('/create', auth, async (req, res) => {
 // POST /api/game/join/:roomCode
 router.post('/join/:roomCode', auth, async (req, res) => {
   try {
-    // First: pre-check existing game for this user (not atomic but enough)
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'waiting'
+    });
+    if (!game)
+      return res.status(404).json({ message: 'Game not found or already started' });
+
+    if (game.createdBy.toString() === req.user._id.toString())
+      return res.status(400).json({ message: 'Cannot join your own game' });
+
     const existingGame = await Game.findOne({
       'players.user': req.user._id,
       status: { $in: ['waiting', 'active'] }
@@ -130,61 +139,32 @@ router.post('/join/:roomCode', auth, async (req, res) => {
     if (existingGame)
       return res.status(400).json({ message: 'You already have an active game' });
 
-    // Pre-check the target game exists and is joinable
-    const target = await Game.findOne({
-      roomCode: req.params.roomCode.toUpperCase(),
-      status: 'waiting'
-    });
-    if (!target)
-      return res.status(404).json({ message: 'Game not found or already started' });
-
-    if (target.createdBy.toString() === req.user._id.toString())
-      return res.status(400).json({ message: 'Cannot join your own game' });
-
     const user = await User.findById(req.user._id);
     const available = user.balance - user.lockedBalance;
-    if (available < target.betAmount)
+    if (available < game.betAmount)
       return res.status(400).json({
-        message: `Insufficient balance. Need ₹${target.betAmount}, available: ₹${available}`
+        message: `Insufficient balance. Need ₹${game.betAmount}, available: ₹${available}`
       });
 
-    // ✅ Atomic: only succeed if status is still waiting AND only 1 player currently
-    // Prevents two simultaneous joins from both succeeding
-    const game = await Game.findOneAndUpdate(
-      {
-        roomCode: req.params.roomCode.toUpperCase(),
-        status: 'waiting',
-        'players.1': { $exists: false }, // only 1 player currently
-      },
-      {
-        $push: {
-          players: {
-            user: req.user._id,
-            color: 'blue',
-            tokens: [
-              { position: -1, isHome: true, isFinished: false },
-              { position: -1, isHome: true, isFinished: false },
-              { position: -1, isHome: true, isFinished: false },
-              { position: -1, isHome: true, isFinished: false }
-            ]
-          }
-        },
-        $set: {
-          status: 'active',
-          currentTurn: target.players[0].user,
-          startedAt: new Date(),
-        }
-      },
-      { new: true }
-    ).populate('players.user', 'username');
-
-    if (!game)
-      return res.status(409).json({ message: 'Someone else already joined this game' });
-
-    // Lock the joiner's balance AFTER they're successfully in
     user.lockedBalance += game.betAmount;
     await user.save();
 
+    game.players.push({
+      user: req.user._id,
+      color: 'blue',
+      tokens: [
+        { position: -1, isHome: true, isFinished: false },
+        { position: -1, isHome: true, isFinished: false },
+        { position: -1, isHome: true, isFinished: false },
+        { position: -1, isHome: true, isFinished: false }
+      ]
+    });
+    game.status = 'active';
+    game.currentTurn = game.players[0].user;
+    game.startedAt = new Date();
+    await game.save();
+
+    await game.populate('players.user', 'username');
     res.json({ message: 'Joined game! Starting now.', game });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -194,18 +174,15 @@ router.post('/join/:roomCode', auth, async (req, res) => {
 // ✅ FIXED: cancel uses 'aborted' status + creates transaction record
 router.post('/cancel/:roomCode', auth, async (req, res) => {
   try {
-    // ✅ Atomic: only succeed if game is still waiting AND user is creator
-    const game = await Game.findOneAndUpdate(
-      {
-        roomCode: req.params.roomCode.toUpperCase(),
-        status: 'waiting',
-        createdBy: req.user._id,
-      },
-      { $set: { status: 'aborted', finishedAt: new Date() } },
-      { new: true }
-    );
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'waiting'
+    });
     if (!game)
-      return res.status(404).json({ message: 'Game not found, already started, or you are not the creator' });
+      return res.status(404).json({ message: 'Game not found or already started' });
+
+    if (game.createdBy.toString() !== req.user._id.toString())
+      return res.status(403).json({ message: 'Only game creator can cancel' });
 
     const user = await User.findById(req.user._id);
     const balanceBefore = user.balance;
@@ -222,100 +199,12 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
       gameId: game._id,
     });
 
-    res.json({ message: 'Game cancelled. Bet refunded.' });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ✅ POST /api/game/forfeit/:roomCode — player forfeits, opponent wins immediately
-router.post('/forfeit/:roomCode', auth, async (req, res) => {
-  try {
-    // ✅ Atomic: only first request that flips status=active→finished wins
-    const game = await Game.findOneAndUpdate(
-      {
-        roomCode: req.params.roomCode.toUpperCase(),
-        status: 'active'
-      },
-      { $set: { status: 'finished', finishedAt: new Date() } },
-      { new: true }
-    ).populate('players.user', 'username');
-    if (!game) return res.status(404).json({ message: 'Active game not found or already finished' });
-
-    const playerIdx = game.players.findIndex(p => p.user._id.toString() === req.user._id.toString());
-    if (playerIdx === -1) {
-      // Should be impossible since status was active, but guard anyway
-      return res.status(403).json({ message: 'Not a player in this game' });
-    }
-
-    const opponentIdx = playerIdx === 0 ? 1 : 0;
-    const winnerId = game.players[opponentIdx].user._id;
-    const loserId  = req.user._id;
-
-    const pot         = game.betAmount * 2;
-    const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
-    const winAmount   = pot - platformFee;
-
-    game.winner      = winnerId;
-    game.loser       = loserId;
-    game.winAmount   = winAmount;
-    game.platformFee = platformFee;
-    game.forfeitedBy = loserId;
+    game.status = 'aborted';
+    game.finishedAt = new Date();
     await game.save();
 
-    // Settle finances
-    const winner = await User.findById(winnerId);
-    const loser  = await User.findById(loserId);
-
-    winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
-    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
-    loser.balance        = Math.max(0, loser.balance - game.betAmount);
-
-    const winnerBalanceBefore = winner.balance;
-    const netWin = game.betAmount - platformFee;
-    winner.balance     += netWin;
-    winner.gamesWon    += 1;
-    winner.gamesPlayed += 1;
-    winner.totalEarned += netWin;
-    loser.gamesPlayed  += 1;
-    loser.totalLost    += game.betAmount;
-
-    await winner.save();
-    await loser.save();
-
-    await Transaction.create({
-      user: winnerId,
-      type: 'game_win',
-      amount: netWin,
-      balanceBefore: winnerBalanceBefore,
-      balanceAfter: winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    await Transaction.create({
-      user: loserId,
-      type: 'game_loss',
-      amount: game.betAmount,
-      balanceBefore: loser.balance + game.betAmount,
-      balanceAfter: loser.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    await Transaction.create({
-      user: winnerId,
-      type: 'platform_fee',
-      amount: platformFee,
-      balanceBefore: winner.balance,
-      balanceAfter: winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
-
-    res.json({ message: 'Game forfeited', winAmount, platformFee });
+    res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
-    console.error('forfeit error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
