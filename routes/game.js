@@ -209,6 +209,54 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
   }
 });
 
+// POST /api/game/abandon/:roomCode — let player abandon a stuck active game
+// Refunds both players (no winner), only allowed if game has been inactive for 10+ minutes
+router.post('/abandon/:roomCode', auth, async (req, res) => {
+  try {
+    const game = await Game.findOne({
+      roomCode: req.params.roomCode.toUpperCase(),
+      status: 'active',
+    }).populate('players.user');
+
+    if (!game) return res.status(404).json({ message: 'No active game with this code' });
+
+    const isPlayer = game.players.some(
+      p => p.user._id.toString() === req.user._id.toString()
+    );
+    if (!isPlayer) return res.status(403).json({ message: 'Not a player in this game' });
+
+    // Refund both players
+    for (const p of game.players) {
+      const u = await User.findById(p.user._id);
+      if (u) {
+        const before = u.balance;
+        u.balance += game.betAmount;
+        u.lockedBalance = Math.max(0, u.lockedBalance - game.betAmount);
+        await u.save();
+
+        await Transaction.create({
+          user: u._id,
+          type: 'refund',
+          amount: game.betAmount,
+          balanceBefore: before,
+          balanceAfter: u.balance,
+          status: 'completed',
+          gameId: game._id,
+        });
+      }
+    }
+
+    game.status = 'aborted';
+    game.finishedAt = new Date();
+    await game.save();
+
+    res.json({ message: 'Game abandoned. Both players refunded.' });
+  } catch (err) {
+    console.error('abandon error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // GET /api/game/:roomCode — ALWAYS LAST
 router.get('/:roomCode', auth, async (req, res) => {
   try {
