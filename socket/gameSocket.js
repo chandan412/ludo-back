@@ -10,9 +10,19 @@ const roomTimers = new Map(); // tracks 2-min auto-abort timers
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
 // ============================
-function startWaitingTimer(io, roomCode) {
-  const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
-  let remainingSeconds = 120;
+function startWaitingTimer(io, roomCode, remainingSecondsOverride) {
+  // ✅ Guard against double-start: if `created-room` fires twice (socket reconnect,
+  // accidental double-emit), don't spawn a second timer for the same room.
+  if (roomTimers.has(roomCode)) {
+    console.log(`[timer] already running for ${roomCode}, skipping double-start`);
+    return;
+  }
+  // ✅ Accept an override for resume-on-startup: lets us start a timer with
+  // whatever time is still left (instead of always 120s).
+  let remainingSeconds = (typeof remainingSecondsOverride === 'number' && remainingSecondsOverride > 0)
+    ? Math.floor(remainingSecondsOverride)
+    : 120;
+  const WAIT_DURATION = remainingSeconds * 1000;
 
   // Emit countdown every second
   const tickInterval = setInterval(() => {
@@ -159,6 +169,60 @@ function sanitizeGame(game, userId) {
 // ============================
 module.exports = (io) => {
 
+  // ✅ On server startup: scan DB for any games still in `waiting` status and
+  // restart their 2-minute auto-abort timers. Without this, a Railway restart
+  // mid-wait would leave games orphaned forever (locked balance never refunded).
+  // Runs async so it doesn't block io setup.
+  (async function resumeTimersOnStartup() {
+    try {
+      const waitingGames = await Game.find({ status: 'waiting' });
+      let resumed = 0, expired = 0;
+      for (const game of waitingGames) {
+        const elapsedMs = Date.now() - new Date(game.createdAt).getTime();
+        const remainingSec = Math.max(0, 120 - Math.floor(elapsedMs / 1000));
+        if (remainingSec <= 0) {
+          // Past deadline — abort immediately + refund creator
+          try {
+            const aborted = await Game.findOneAndUpdate(
+              { roomCode: game.roomCode, status: 'waiting' },
+              { $set: { status: 'aborted', finishedAt: new Date() } },
+              { new: true }
+            );
+            if (aborted && aborted.players[0]) {
+              const creator = await User.findById(aborted.players[0].user);
+              if (creator) {
+                const before = creator.balance;
+                creator.lockedBalance = Math.max(0, creator.lockedBalance - aborted.betAmount);
+                await creator.save();
+                await Transaction.create({
+                  user: creator._id,
+                  type: 'refund',
+                  amount: aborted.betAmount,
+                  balanceBefore: before,
+                  balanceAfter: creator.balance,
+                  status: 'completed',
+                  gameId: aborted._id,
+                });
+              }
+              expired++;
+            }
+          } catch (e) {
+            console.error('startup-abort error:', e);
+          }
+        } else {
+          // Still time left — restart timer with the remaining seconds
+          startWaitingTimer(io, game.roomCode, remainingSec);
+          resumed++;
+        }
+      }
+      if (resumed || expired) {
+        console.log(`🔄 Startup: resumed ${resumed} waiting timers, aborted ${expired} expired`);
+      }
+    } catch (err) {
+      console.error('resumeTimersOnStartup error:', err);
+    }
+  })();
+
   // Auth middleware
   io.use(async (socket, next) => {
     try {
@@ -217,8 +281,26 @@ module.exports = (io) => {
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
         );
+        // ✅ Detect reconnect BEFORE flipping isConnected — we need the old value
+        const wasDisconnected = game.players[playerIdx].isConnected === false;
         game.players[playerIdx].isConnected = true;
         await game.save();
+
+        // ✅ If the player was in the disconnect grace window, cancel pending timers
+        // so we don't auto-forfeit them seconds after they returned. Covers both:
+        //  - 60s active-game reconnect timer (activeRooms[room].disconnectTimer)
+        //  - 15s waiting-room grace timer (activeRooms[room].waitingGraceTimer)
+        const roomState = activeRooms.get(roomCode);
+        if (roomState) {
+          if (roomState.disconnectTimer) {
+            clearTimeout(roomState.disconnectTimer);
+            roomState.disconnectTimer = null;
+          }
+          if (roomState.waitingGraceTimer) {
+            clearTimeout(roomState.waitingGraceTimer);
+            roomState.waitingGraceTimer = null;
+          }
+        }
 
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
 
@@ -257,7 +339,14 @@ module.exports = (io) => {
           }
         }
 
-        socket.to(roomCode).emit('player-connected', { username: socket.user.username });
+        // ✅ Notify the opponent. If this is a reconnect (we were marked disconnected),
+        // emit `player-reconnected` so the opponent's "waiting 60s..." banner clears.
+        // Otherwise it's a first-time join and we emit `player-connected` as before.
+        if (wasDisconnected) {
+          socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
+        } else {
+          socket.to(roomCode).emit('player-connected', { username: socket.user.username });
+        }
 
         // ✅ Count connected players — if both are in, cancel the waiting timer
         const connectedCount = game.players.filter(p => p.isConnected).length;
@@ -585,43 +674,78 @@ module.exports = (io) => {
         );
         if (playerIdx === -1) return;
 
-        // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
+        // ✅ SCENARIO 1: Player drops while room is still waiting.
+        // OLD behaviour: instant abort + refund — but a browser refresh / brief
+        // network blip would kill the room and force the creator to start over.
+        // NEW behaviour: 15-second grace window. If they reconnect within 15s
+        // (via join-room → cancels this timer above), the room survives. Otherwise
+        // we abort + refund EXACTLY as before.
         if (game.status === 'waiting') {
-          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
+          // Don't cancel the 2-min waiting timer yet — if they reconnect, it should
+          // keep ticking from wherever it was. cancelWaitingTimer happens only on
+          // confirmed abort below.
 
-          // ✅ Atomic: only refund if game is still waiting (prevents double refund w/ auto-abort or cancel route)
-          const aborted = await Game.findOneAndUpdate(
-            { roomCode: socket.currentRoom, status: 'waiting' },
-            { $set: { status: 'aborted', finishedAt: new Date() } },
-            { new: true }
-          );
-          if (!aborted) return; // someone else already aborted/cancelled
+          const graceTimer = setTimeout(async () => {
+            try {
+              // Re-check status — they may have rejoined, or another path may have aborted/started the game
+              const stillWaiting = await Game.findOne({ roomCode: socket.currentRoom, status: 'waiting' });
+              if (!stillWaiting) return;
+              const creatorPlayer = stillWaiting.players[0];
+              if (!creatorPlayer) return;
+              // If the disconnected user is no longer marked offline, they returned — abort the abort.
+              if (creatorPlayer.user.toString() === socket.user._id.toString() &&
+                  creatorPlayer.isConnected) {
+                return;
+              }
 
-          // Refund creator (only creator has paid at this point)
-          const creator = await User.findById(aborted.players[0].user);
-          if (creator) {
-            const before = creator.balance;
-            // ✅ FIX: Only reduce lockedBalance — balance was never deducted
-            creator.lockedBalance = Math.max(0, creator.lockedBalance - aborted.betAmount);
-            await creator.save();
+              cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown now
 
-            await Transaction.create({
-              user: creator._id,
-              type: 'refund',
-              amount: aborted.betAmount,
-              balanceBefore: before,
-              balanceAfter: creator.balance,
-              status: 'completed',
-              gameId: aborted._id,
-            });
-          }
+              const aborted = await Game.findOneAndUpdate(
+                { roomCode: socket.currentRoom, status: 'waiting' },
+                { $set: { status: 'aborted', finishedAt: new Date() } },
+                { new: true }
+              );
+              if (!aborted) return; // someone else already aborted/cancelled
 
-          io.to(socket.currentRoom).emit('game-aborted', {
-            reason: 'creator_left',
-            message: 'Room creator left. Game aborted. Bet refunded.',
-          });
+              // Refund creator (only creator has paid at this point)
+              const creator = await User.findById(aborted.players[0].user);
+              if (creator) {
+                const before = creator.balance;
+                // ✅ Only reduce lockedBalance — balance was never deducted
+                creator.lockedBalance = Math.max(0, creator.lockedBalance - aborted.betAmount);
+                await creator.save();
 
-          return; // stop here — no 60s timer needed
+                await Transaction.create({
+                  user: creator._id,
+                  type: 'refund',
+                  amount: aborted.betAmount,
+                  balanceBefore: before,
+                  balanceAfter: creator.balance,
+                  status: 'completed',
+                  gameId: aborted._id,
+                });
+              }
+
+              io.to(socket.currentRoom).emit('game-aborted', {
+                reason: 'creator_left',
+                message: 'Room creator left. Game aborted. Bet refunded.',
+              });
+            } catch (e) {
+              console.error('waiting-grace abort error:', e);
+            } finally {
+              const rs = activeRooms.get(socket.currentRoom);
+              if (rs) rs.waitingGraceTimer = null;
+            }
+          }, 15000); // 15 seconds — enough for a browser refresh / network blip recovery
+
+          if (!activeRooms.has(socket.currentRoom)) activeRooms.set(socket.currentRoom, {});
+          activeRooms.get(socket.currentRoom).waitingGraceTimer = graceTimer;
+
+          // Mark the player offline so join-room can detect the reconnect and clear the timer
+          game.players[playerIdx].isConnected = false;
+          await game.save();
+
+          return; // stop here — abort happens via the grace timer (or doesn't, if they return)
         }
 
         // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
