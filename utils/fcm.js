@@ -2,9 +2,26 @@
 const { GoogleAuth } = require('google-auth-library');
 const https = require('https');
 
-const PROJECT_ID = 'ludo-app-86957';
+// ============================================================
+// ⚠️  SECURITY MIGRATION IN PROGRESS
+// The Firebase service account private key MUST live in env vars, not source.
+//
+// Migration steps (do these on Railway, then remove the hardcoded fallback below):
+//   1. In Firebase Console → Project Settings → Service Accounts → generate
+//      a NEW private key (this also lets you revoke the old one which has
+//      been exposed in source).
+//   2. On Railway, add env vars:
+//        FCM_PROJECT_ID         = "ludo-app-86957"
+//        FCM_CLIENT_EMAIL       = "firebase-adminsdk-...@...iam.gserviceaccount.com"
+//        FCM_PRIVATE_KEY        = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+//        FCM_PRIVATE_KEY_ID     = "..." (optional)
+//        FCM_CLIENT_ID          = "..." (optional)
+//   3. Once env-var path is verified working, delete the SERVICE_ACCOUNT_FALLBACK
+//      block below and the `|| SERVICE_ACCOUNT_FALLBACK` lines.
+// ============================================================
 
-const SERVICE_ACCOUNT = {
+// ⚠️ DEPRECATED FALLBACK — REMOVE AFTER ENV VARS ARE SET ON RAILWAY
+const SERVICE_ACCOUNT_FALLBACK = {
   type: "service_account",
   project_id: "ludo-app-86957",
   private_key_id: "5359124eb4338fd555b7389c0c7f776cfce5187a",
@@ -13,6 +30,22 @@ const SERVICE_ACCOUNT = {
   client_id: "105532415453856816961",
   token_uri: "https://oauth2.googleapis.com/token",
 };
+
+// Read from env first, fall back to hardcoded values during migration
+const PROJECT_ID = process.env.FCM_PROJECT_ID || SERVICE_ACCOUNT_FALLBACK.project_id;
+
+const SERVICE_ACCOUNT = (process.env.FCM_PRIVATE_KEY && process.env.FCM_CLIENT_EMAIL)
+  ? {
+      type: 'service_account',
+      project_id:     process.env.FCM_PROJECT_ID     || SERVICE_ACCOUNT_FALLBACK.project_id,
+      // Env-var newlines arrive as literal "\n" strings — convert them back to real newlines.
+      private_key:    process.env.FCM_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      client_email:   process.env.FCM_CLIENT_EMAIL,
+      private_key_id: process.env.FCM_PRIVATE_KEY_ID || undefined,
+      client_id:      process.env.FCM_CLIENT_ID      || undefined,
+      token_uri:      'https://oauth2.googleapis.com/token',
+    }
+  : (console.warn('⚠️ FCM: Using hardcoded service account — set FCM_PRIVATE_KEY env var ASAP and remove fallback'), SERVICE_ACCOUNT_FALLBACK);
 
 // Get OAuth2 access token
 async function getAccessToken() {
