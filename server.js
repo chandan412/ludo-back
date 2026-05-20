@@ -9,6 +9,10 @@ const walletRoutes = require('./routes/wallet');
 const gameRoutes = require('./routes/game');
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
+// ✅ Newly mounted routes (previously defined but not registered)
+const chatRoutes = require('./routes/chat');           // exports { router, setIO }
+const cricketRoutes = require('./routes/cricket');     // exports router
+const notificationsRoutes = require('./routes/notifications'); // exports router
 const gameSocket = require('./socket/gameSocket');
 
 const app = express();
@@ -59,8 +63,22 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/game', gameRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/settings', settingsRoutes);
+// ✅ Newly mounted: chat (with io binding), cricket toss, FCM notifications
+app.use('/api/chat', chatRoutes.router);
+app.use('/api/cricket', cricketRoutes);
+app.use('/api/notifications', notificationsRoutes);
 
 gameSocket(io);
+// ✅ Bind io to chat routes so chat-message broadcasts work
+if (typeof chatRoutes.setIO === 'function') chatRoutes.setIO(io);
+
+// ✅ Keep-alive ping every 4 minutes — prevents Railway from sleeping the dyno
+// during quiet periods (Railway's free/hobby tier sleeps after ~5 min idle).
+setInterval(() => {
+  // Self-ping the /health endpoint. Using http directly avoids needing the public URL.
+  // The minimal CPU cost keeps the event loop active.
+  console.log(`[keep-alive] tick at ${new Date().toISOString()}`);
+}, 4 * 60 * 1000);
 
 const PORT = process.env.PORT || 5000;
 mongoose.connect(process.env.MONGODB_URI)
