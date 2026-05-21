@@ -242,6 +242,63 @@ module.exports = (io) => {
     console.log(`User connected: ${socket.user.username} (${socket.id})`);
 
     // ============================
+    // GLOBAL CHAT handlers
+    // ============================
+    socket.on('join-chat', () => {
+      socket.join('global-chat');
+      // Broadcast updated online count to everyone in the chat room
+      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+      io.to('global-chat').emit('chat-online-count', { count });
+    });
+
+    socket.on('leave-chat', () => {
+      socket.leave('global-chat');
+      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+      io.to('global-chat').emit('chat-online-count', { count });
+    });
+
+    socket.on('send-chat', async ({ text }) => {
+      try {
+        if (!text || typeof text !== 'string') return;
+        const clean = text.trim().slice(0, 200);
+        if (!clean) return;
+        // ✅ Lazy-require to avoid circular import; chat.js owns the model schema.
+        const mongoose = require('mongoose');
+        const ChatMessage = mongoose.models.ChatMessage;
+        if (!ChatMessage) return;
+
+        const msg = await ChatMessage.create({
+          userId:   socket.user._id,
+          username: socket.user.username,
+          text:     clean,
+        });
+        io.to('global-chat').emit('chat-message', {
+          _id:       msg._id,
+          userId:    socket.user._id.toString(),
+          username:  socket.user.username,
+          text:      msg.text,
+          createdAt: msg.createdAt,
+        });
+      } catch (err) {
+        console.error('send-chat error:', err);
+      }
+    });
+
+    socket.on('send-invite', ({ betAmount, roomCode }) => {
+      if (!betAmount || !roomCode) return;
+      // Broadcast a special invite-typed message — doesn't need to be persisted.
+      io.to('global-chat').emit('chat-message', {
+        _id:       `invite_${Date.now()}_${socket.user._id}`,
+        userId:    socket.user._id.toString(),
+        username:  socket.user.username,
+        type:      'invite',
+        betAmount: Number(betAmount),
+        roomCode:  roomCode.toUpperCase(),
+        createdAt: new Date(),
+      });
+    });
+
+    // ============================
     // created-room: fired by creator right after creating a game
     // Starts the 2-minute waiting countdown
     // ============================
@@ -661,6 +718,11 @@ module.exports = (io) => {
     // ============================
     socket.on('disconnect', async () => {
       console.log(`User disconnected: ${socket.user.username}`);
+      // ✅ Update global-chat online count if this socket was in chat
+      try {
+        const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
+        io.to('global-chat').emit('chat-online-count', { count });
+      } catch {}
       if (!socket.currentRoom) return;
 
       try {
