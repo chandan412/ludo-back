@@ -298,6 +298,17 @@ module.exports = (io) => {
       });
     });
 
+    // ✅ Joiner clicks Accept on an invite → after the REST /join succeeds, they
+    // emit this so the challenger gets a toast notification ("X accepted — tap to join").
+    socket.on('invite-accepted', ({ roomCode, challengerId, acceptedBy }) => {
+      if (!roomCode || !challengerId) return;
+      io.to('global-chat').emit('invite-accepted', {
+        roomCode:     String(roomCode).toUpperCase(),
+        challengerId: String(challengerId),
+        acceptedBy:   String(acceptedBy || socket.user.username),
+      });
+    });
+
     // ============================
     // created-room: fired by creator right after creating a game
     // Starts the 2-minute waiting countdown
