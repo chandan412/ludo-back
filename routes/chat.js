@@ -19,11 +19,18 @@ catch { ChatMessage = mongoose.model('ChatMessage', chatSchema); }
 let _io = null;
 function setIO(io) { _io = io; }
 
-// GET /api/chat/messages — last 50 messages
+// GET /api/chat/messages — last 100 messages (oldest → newest)
 router.get('/messages', auth, async (req, res) => {
   try {
-    const msgs = await ChatMessage.find().sort({ createdAt: -1 }).limit(20).lean();
-    res.json(msgs.reverse());
+    // Fetch newest 100, then reverse so the client renders oldest→newest top→bottom.
+    const msgs = await ChatMessage.find().sort({ createdAt: -1 }).limit(100).lean();
+    res.json(msgs.reverse().map(m => ({
+      _id:       m._id,
+      userId:    m.userId?.toString(),
+      username:  m.username,
+      text:      m.text,
+      createdAt: m.createdAt,
+    })));
   } catch { res.status(500).json({ message: 'Server error' }); }
 });
 
