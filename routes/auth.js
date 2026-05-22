@@ -110,4 +110,87 @@ router.post('/fcm-token', auth, async (req, res) => {
   }
 });
 
+// ── FORGOT PASSWORD: STEP 1 — VERIFY IDENTITY ──────────────────────────────────
+// User provides registered phone + email. If BOTH match the same account, we issue
+// a short-lived (15-min) reset token. No email/SMS is sent — verification is by
+// matching the two stored fields, then the user sets a new password directly.
+router.post('/forgot-verify', async (req, res) => {
+  try {
+    const { phone, email } = req.body;
+    if (!phone || !email) {
+      return res.status(400).json({ message: 'Phone and email are both required' });
+    }
+
+    const normEmail = String(email).trim().toLowerCase();
+    const normPhone = String(phone).trim();
+
+    // Both must belong to the SAME user
+    const user = await User.findOne({ phone: normPhone, email: normEmail });
+    if (!user) {
+      return res.status(404).json({
+        message: "Phone and email don't match any account",
+        contactAdmin: true,
+      });
+    }
+    if (user.isBanned) {
+      return res.status(403).json({ message: 'Account is banned. Contact admin.' });
+    }
+
+    // Short-lived token scoped specifically to password reset for this user.
+    // The `pwReset` flag + `pwHash` binding ensures it can't be used as a login token
+    // and is invalidated the moment the password actually changes.
+    const resetToken = jwt.sign(
+      { id: user._id, pwReset: true, pwHash: user.password.slice(-10) },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    res.json({ resetToken, message: 'Identity verified' });
+  } catch (err) {
+    console.error('forgot-verify error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── FORGOT PASSWORD: STEP 2 — RESET ─────────────────────────────────────────────
+router.post('/forgot-reset', async (req, res) => {
+  try {
+    const { resetToken, newPassword } = req.body;
+    if (!resetToken || !newPassword) {
+      return res.status(400).json({ message: 'Reset token and new password required' });
+    }
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(resetToken, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: 'Reset session expired. Please start over.' });
+    }
+    if (!decoded.pwReset) {
+      return res.status(401).json({ message: 'Invalid reset token' });
+    }
+
+    const user = await User.findById(decoded.id);
+    if (!user) return res.status(404).json({ message: 'Account not found' });
+
+    // ✅ Bind the token to the password it was issued for — if the password already
+    // changed since the token was minted, reject (prevents token replay).
+    if (decoded.pwHash !== user.password.slice(-10)) {
+      return res.status(401).json({ message: 'Reset link already used. Please start over.' });
+    }
+
+    // The User model's pre-save hook hashes this automatically.
+    user.password = newPassword;
+    await user.save();
+
+    res.json({ message: 'Password reset successfully' });
+  } catch (err) {
+    console.error('forgot-reset error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
