@@ -30,20 +30,31 @@ class LudoEngine {
   }
 
   // ✅ Can we capture an opponent token at this global position?
-  static canCapture(globalPos, opponentState) {
+  // Count-based: capture is only possible if MY token count on that cell (after the
+  // move, i.e. +1 for the incoming token) would be >= the OPPONENT's count there.
+  static canCapture(globalPos, opponentState, playerState = null, incomingCount = 1) {
     if (!opponentState || globalPos === null) return false;
     if (SAFE_SQUARES.has(globalPos)) return false; // safe square — no capture
 
-    return opponentState.tokens.some(t => {
-      if (t.isFinished) return false;
-      const tProgress = (t.position !== undefined && t.position !== null && !isNaN(t.position))
-        ? Number(t.position) : -1;
-      if (tProgress < 0) return false;                    // in home base
-      if (tProgress >= BOARD_PATH_LENGTH) return false;   // in home stretch — safe
+    const opCount = this.countTokensAtGlobal(opponentState, globalPos);
+    if (opCount === 0) return false;
 
-      const opGlobal = this.getGlobalPosition(opponentState.color, tProgress);
-      return opGlobal === globalPos;
+    // Count my tokens already on that cell (the incoming token is counted separately).
+    const myExisting = playerState ? this.countTokensAtGlobal(playerState, globalPos) : 0;
+    return (myExisting + incomingCount) >= opCount;
+  }
+
+  // ✅ Count how many of a player's tokens sit on a given GLOBAL board position.
+  static countTokensAtGlobal(state, globalPos) {
+    if (!state || globalPos === null) return 0;
+    let count = 0;
+    state.tokens.forEach(t => {
+      if (t.isFinished) return;
+      const p = (t.position !== undefined && t.position !== null && !isNaN(t.position)) ? Number(t.position) : -1;
+      if (p < 0 || p >= BOARD_PATH_LENGTH) return;
+      if (this.getGlobalPosition(state.color, p) === globalPos) count++;
     });
+    return count;
   }
 
   static getValidMoves(playerState, diceRoll, opponentState) {
@@ -60,7 +71,7 @@ class LudoEngine {
       if (progress === -1) {
         if (diceRoll === 6) {
           const globalPos = this.getGlobalPosition(color, 0);
-          const canCapture = this.canCapture(globalPos, opponentState);
+          const canCapture = this.canCapture(globalPos, opponentState, playerState, 1);
           validMoves.push({
             tokenIndex: index,
             currentProgress: -1,
@@ -82,7 +93,7 @@ class LudoEngine {
       // Tokens in home stretch (progress >= 51) can never be captured or capture
       const globalPos = this.getGlobalPosition(color, newProgress);
       const canCapture = !willFinish && globalPos !== null
-        ? this.canCapture(globalPos, opponentState)
+        ? this.canCapture(globalPos, opponentState, playerState, 1)
         : false;
 
       validMoves.push({
@@ -121,24 +132,56 @@ class LudoEngine {
     let captured = false;
     let gameOver  = false;
 
-    // ✅ Only attempt capture if landing on main loop (not home stretch)
-    const newGlobalPos = this.getGlobalPosition(playerState.color, newProgress);
+    // Build temporary state objects reflecting the post-move token positions, so
+    // count helpers see the new reality (the moved token is already at newProgress).
+    const movedColor = playerState.color;
+    const oppColor   = opponentState.color;
+    const tmpPlayerState = { color: movedColor, tokens: newPlayerTokens };
+    const tmpOppState    = { color: oppColor,   tokens: newOpponentTokens };
 
+    // ── (1) CAPTURE AT DESTINATION (count-based) ──
+    // My move lands on newGlobalPos. I capture the opponent's stack there ONLY if
+    // my token count on that cell >= their count. Otherwise we coexist (no capture).
+    const newGlobalPos = this.getGlobalPosition(movedColor, newProgress);
     if (newGlobalPos !== null && !SAFE_SQUARES.has(newGlobalPos)) {
-      newOpponentTokens.forEach(opToken => {
-        if (opToken.isFinished) return;
-        const opProgress = opToken.position;
-        if (opProgress < 0) return;                   // opponent in home base
-        if (opProgress >= BOARD_PATH_LENGTH) return;  // opponent in home stretch — safe
+      const myCount = this.countTokensAtGlobal(tmpPlayerState, newGlobalPos);
+      const opCount = this.countTokensAtGlobal(tmpOppState, newGlobalPos);
+      if (opCount > 0 && myCount >= opCount) {
+        // Capture ALL opponent tokens on this cell
+        newOpponentTokens.forEach(opToken => {
+          if (opToken.isFinished) return;
+          const opProgress = opToken.position;
+          if (opProgress < 0 || opProgress >= BOARD_PATH_LENGTH) return;
+          if (this.getGlobalPosition(oppColor, opProgress) === newGlobalPos) {
+            opToken.position = -1;
+            opToken.isHome   = true;
+            captured = true;
+          }
+        });
+      }
+    }
 
-        const opGlobal = this.getGlobalPosition(opponentState.color, opProgress);
-        if (opGlobal === newGlobalPos) {
-          // ✅ CAPTURE — send opponent token back to base
-          opToken.position = -1;
-          opToken.isHome   = true;
-          captured = true;
-        }
-      });
+    // ── (2) PASSIVE AUTO-CAPTURE AT VACATED CELL ──
+    // The moved token left oldGlobalPos. If opponent tokens are sitting there and
+    // now (after I reduced my count) the OPPONENT count >= my remaining count,
+    // the opponent's sitting tokens auto-capture MY remaining tokens there.
+    const oldGlobalPos = oldProgress >= 0 ? this.getGlobalPosition(movedColor, oldProgress) : null;
+    if (oldGlobalPos !== null && oldGlobalPos !== newGlobalPos && !SAFE_SQUARES.has(oldGlobalPos)) {
+      const myRemaining = this.countTokensAtGlobal(tmpPlayerState, oldGlobalPos);
+      const opThere     = this.countTokensAtGlobal(tmpOppState, oldGlobalPos);
+      if (myRemaining > 0 && opThere >= myRemaining) {
+        // Opponent outnumbers/equals my leftover tokens → my tokens get captured
+        newPlayerTokens.forEach(myToken => {
+          if (myToken.isFinished) return;
+          const p = myToken.position;
+          if (p < 0 || p >= BOARD_PATH_LENGTH) return;
+          if (this.getGlobalPosition(movedColor, p) === oldGlobalPos) {
+            myToken.position = -1;
+            myToken.isHome   = true;
+            // Note: this is the opponent capturing me — does NOT grant me a capture/extra turn
+          }
+        });
+      }
     }
 
     // Finish if reached last cell
