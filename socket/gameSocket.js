@@ -10,19 +10,9 @@ const roomTimers = new Map(); // tracks 2-min auto-abort timers
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
 // ============================
-function startWaitingTimer(io, roomCode, remainingSecondsOverride) {
-  // ✅ Guard against double-start: if `created-room` fires twice (socket reconnect,
-  // accidental double-emit), don't spawn a second timer for the same room.
-  if (roomTimers.has(roomCode)) {
-    console.log(`[timer] already running for ${roomCode}, skipping double-start`);
-    return;
-  }
-  // ✅ Accept an override for resume-on-startup: lets us start a timer with
-  // whatever time is still left (instead of always 120s).
-  let remainingSeconds = (typeof remainingSecondsOverride === 'number' && remainingSecondsOverride > 0)
-    ? Math.floor(remainingSecondsOverride)
-    : 120;
-  const WAIT_DURATION = remainingSeconds * 1000;
+function startWaitingTimer(io, roomCode) {
+  const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
+  let remainingSeconds = 120;
 
   // Emit countdown every second
   const tickInterval = setInterval(() => {
@@ -38,19 +28,18 @@ function startWaitingTimer(io, roomCode, remainingSecondsOverride) {
   const abortTimer = setTimeout(async () => {
     clearInterval(tickInterval);
     try {
-      // ✅ Atomic: only succeeds if game is still waiting (prevents double refund if user cancelled)
-      const game = await Game.findOneAndUpdate(
-        { roomCode, status: 'waiting' },
-        { $set: { status: 'aborted', finishedAt: new Date() } },
-        { new: true }
-      );
+      const game = await Game.findOne({ roomCode, status: 'waiting' });
       if (!game) return; // already started or aborted
+
+      game.status = 'aborted';
+      game.finishedAt = new Date();
+      await game.save();
 
       // Refund creator
       const creator = await User.findById(game.players[0].user);
       if (creator) {
         const before = creator.balance;
-        // ✅ FIX: Only reduce lockedBalance — balance was never deducted
+        creator.balance += game.betAmount;
         creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
         await creator.save();
 
@@ -169,60 +158,6 @@ function sanitizeGame(game, userId) {
 // ============================
 module.exports = (io) => {
 
-  // ✅ On server startup: scan DB for any games still in `waiting` status and
-  // restart their 2-minute auto-abort timers. Without this, a Railway restart
-  // mid-wait would leave games orphaned forever (locked balance never refunded).
-  // Runs async so it doesn't block io setup.
-  (async function resumeTimersOnStartup() {
-    try {
-      const waitingGames = await Game.find({ status: 'waiting' });
-      let resumed = 0, expired = 0;
-      for (const game of waitingGames) {
-        const elapsedMs = Date.now() - new Date(game.createdAt).getTime();
-        const remainingSec = Math.max(0, 120 - Math.floor(elapsedMs / 1000));
-        if (remainingSec <= 0) {
-          // Past deadline — abort immediately + refund creator
-          try {
-            const aborted = await Game.findOneAndUpdate(
-              { roomCode: game.roomCode, status: 'waiting' },
-              { $set: { status: 'aborted', finishedAt: new Date() } },
-              { new: true }
-            );
-            if (aborted && aborted.players[0]) {
-              const creator = await User.findById(aborted.players[0].user);
-              if (creator) {
-                const before = creator.balance;
-                creator.lockedBalance = Math.max(0, creator.lockedBalance - aborted.betAmount);
-                await creator.save();
-                await Transaction.create({
-                  user: creator._id,
-                  type: 'refund',
-                  amount: aborted.betAmount,
-                  balanceBefore: before,
-                  balanceAfter: creator.balance,
-                  status: 'completed',
-                  gameId: aborted._id,
-                });
-              }
-              expired++;
-            }
-          } catch (e) {
-            console.error('startup-abort error:', e);
-          }
-        } else {
-          // Still time left — restart timer with the remaining seconds
-          startWaitingTimer(io, game.roomCode, remainingSec);
-          resumed++;
-        }
-      }
-      if (resumed || expired) {
-        console.log(`🔄 Startup: resumed ${resumed} waiting timers, aborted ${expired} expired`);
-      }
-    } catch (err) {
-      console.error('resumeTimersOnStartup error:', err);
-    }
-  })();
-
   // Auth middleware
   io.use(async (socket, next) => {
     try {
@@ -240,74 +175,6 @@ module.exports = (io) => {
 
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.user.username} (${socket.id})`);
-
-    // ============================
-    // GLOBAL CHAT handlers
-    // ============================
-    socket.on('join-chat', () => {
-      socket.join('global-chat');
-      // Broadcast updated online count to everyone in the chat room
-      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
-      io.to('global-chat').emit('chat-online-count', { count });
-    });
-
-    socket.on('leave-chat', () => {
-      socket.leave('global-chat');
-      const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
-      io.to('global-chat').emit('chat-online-count', { count });
-    });
-
-    socket.on('send-chat', async ({ text }) => {
-      try {
-        if (!text || typeof text !== 'string') return;
-        const clean = text.trim().slice(0, 200);
-        if (!clean) return;
-        // ✅ Lazy-require to avoid circular import; chat.js owns the model schema.
-        const mongoose = require('mongoose');
-        const ChatMessage = mongoose.models.ChatMessage;
-        if (!ChatMessage) return;
-
-        const msg = await ChatMessage.create({
-          userId:   socket.user._id,
-          username: socket.user.username,
-          text:     clean,
-        });
-        io.to('global-chat').emit('chat-message', {
-          _id:       msg._id,
-          userId:    socket.user._id.toString(),
-          username:  socket.user.username,
-          text:      msg.text,
-          createdAt: msg.createdAt,
-        });
-      } catch (err) {
-        console.error('send-chat error:', err);
-      }
-    });
-
-    socket.on('send-invite', ({ betAmount, roomCode }) => {
-      if (!betAmount || !roomCode) return;
-      // Broadcast a special invite-typed message — doesn't need to be persisted.
-      io.to('global-chat').emit('chat-message', {
-        _id:       `invite_${Date.now()}_${socket.user._id}`,
-        userId:    socket.user._id.toString(),
-        username:  socket.user.username,
-        type:      'invite',
-        betAmount: Number(betAmount),
-        roomCode:  roomCode.toUpperCase(),
-        createdAt: new Date(),
-      });
-    });
-
-    // ✅ Joiner clicks Accept on an invite → after the REST /join succeeds, they
-    // emit this so the challenger gets a toast notification ("X accepted — tap to join").
-    socket.on('invite-accepted', ({ roomCode, challengerId, acceptedBy }) => {
-      if (!roomCode || !challengerId) return;
-      io.to('global-chat').emit('invite-accepted', {
-        roomCode:     String(roomCode).toUpperCase(),
-        challengerId: String(challengerId),
-        acceptedBy:   String(acceptedBy || socket.user.username),
-      });
-    });
 
     // ============================
     // created-room: fired by creator right after creating a game
@@ -349,72 +216,18 @@ module.exports = (io) => {
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
         );
-        // ✅ Detect reconnect BEFORE flipping isConnected — we need the old value
-        const wasDisconnected = game.players[playerIdx].isConnected === false;
         game.players[playerIdx].isConnected = true;
         await game.save();
 
-        // ✅ If the player was in the disconnect grace window, cancel pending timers
-        // so we don't auto-forfeit them seconds after they returned. Covers both:
-        //  - 60s active-game reconnect timer (activeRooms[room].disconnectTimer)
-        //  - 15s waiting-room grace timer (activeRooms[room].waitingGraceTimer)
-        const roomState = activeRooms.get(roomCode);
-        if (roomState) {
-          if (roomState.disconnectTimer) {
-            clearTimeout(roomState.disconnectTimer);
-            roomState.disconnectTimer = null;
-          }
-          if (roomState.waitingGraceTimer) {
-            clearTimeout(roomState.waitingGraceTimer);
-            roomState.waitingGraceTimer = null;
-          }
-        }
+        // ✅ Track this player's live socket id so a stale/old socket's later
+        // disconnect can't wrongly mark them offline after they've reconnected.
+        if (!activeRooms.has(roomCode)) activeRooms.set(roomCode, {});
+        const roomMeta = activeRooms.get(roomCode);
+        if (!roomMeta.sockets) roomMeta.sockets = {};
+        roomMeta.sockets[socket.user._id.toString()] = socket.id;
 
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
-
-        // ✅ ANTI-CHEAT: If a dice roll is pending, resend the dice value to whoever is reconnecting
-        // (both rolling player AND opponent need to see the current dice value after refresh).
-        if (
-          game.status === 'active' &&
-          game.lastDiceRoll !== null &&
-          game.lastDiceRoll !== undefined
-        ) {
-          const rollerIdx = game.players.findIndex(p => p.user._id.toString() === game.currentTurn?.toString());
-          if (rollerIdx !== -1) {
-            const rollerOppIdx  = rollerIdx === 0 ? 1 : 0;
-            const rollerState   = game.players[rollerIdx];
-            const opponentState = game.players[rollerOppIdx];
-            const isRoller = game.currentTurn?.toString() === socket.user._id.toString();
-
-            // Compute valid moves only for the rolling player (opponent gets empty list)
-            const validMoves = isRoller
-              ? LudoEngine.getValidMoves(rollerState, game.lastDiceRoll, opponentState)
-              : [];
-
-            socket.emit('dice-rolled', {
-              diceRoll: game.lastDiceRoll,
-              playerId: rollerState.user._id,
-              playerUsername: rollerState.user.username,
-              validMoves: validMoves.map(m => ({
-                tokenIndex: m.tokenIndex,
-                newProgress: m.newProgress,
-                canCapture: m.canCapture,
-              })),
-              hasValidMoves: validMoves.length > 0,
-              resumed: true, // marks this as a state-restore, not a fresh roll
-              currentTurn: game.currentTurn.toString(),
-            });
-          }
-        }
-
-        // ✅ Notify the opponent. If this is a reconnect (we were marked disconnected),
-        // emit `player-reconnected` so the opponent's "waiting 60s..." banner clears.
-        // Otherwise it's a first-time join and we emit `player-connected` as before.
-        if (wasDisconnected) {
-          socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
-        } else {
-          socket.to(roomCode).emit('player-connected', { username: socket.user.username });
-        }
+        socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
         // ✅ Count connected players — if both are in, cancel the waiting timer
         const connectedCount = game.players.filter(p => p.isConnected).length;
@@ -446,23 +259,6 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
-        // ✅ ANTI-CHEAT: Block re-roll if a dice value is already pending
-        if (game.lastDiceRoll !== null && game.lastDiceRoll !== undefined) {
-          // Re-emit existing value so client recovers state — don't roll again
-          return socket.emit('dice-rolled', {
-            diceRoll: game.lastDiceRoll,
-            playerId: socket.user._id,
-            playerUsername: socket.user.username,
-            validMoves: LudoEngine.getValidMoves(
-              game.players.find(p => p.user._id.toString() === socket.user._id.toString()),
-              game.lastDiceRoll,
-              game.players.find(p => p.user._id.toString() !== socket.user._id.toString())
-            ).map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
-            hasValidMoves: true,
-            currentTurn: game.currentTurn.toString(),
-          });
-        }
-
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
         const playerState   = game.players[playerIdx];
@@ -470,11 +266,9 @@ module.exports = (io) => {
 
         // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
         let diceRoll = LudoEngine.rollDice();
-        let thirdSixBlocked = false;
         if ((game.consecutiveSixes || 0) >= 2) {
           while (diceRoll === 6) {
             diceRoll = LudoEngine.rollDice();
-            thirdSixBlocked = true;
           }
         }
         game.lastDiceRoll = diceRoll;
@@ -486,40 +280,6 @@ module.exports = (io) => {
         }
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
-
-        // ✅ DIAGNOSTIC: catch the bug where dice=6 returns 0 moves but home tokens exist
-        if (validMoves.length === 0 && diceRoll === 6) {
-          const tokensSummary = playerState.tokens.map(t => ({
-            pos: t.position, isHome: t.isHome, isFinished: t.isFinished
-          }));
-          console.log('⚠️ ENGINE ANOMALY: dice=6 returned 0 moves. Player tokens:',
-            JSON.stringify(tokensSummary));
-
-          // ✅ DEFENSIVE FIX: For each home token (position=-1 OR isHome=true OR position=null),
-          // manually add an exit-home move. This catches Mongoose field-type drift.
-          playerState.tokens.forEach((t, idx) => {
-            if (t.isFinished) return;
-            const isInHome = t.position === -1
-                          || t.position === null
-                          || t.position === undefined
-                          || t.isHome === true
-                          || isNaN(Number(t.position));
-            if (isInHome) {
-              const globalPos = LudoEngine.getGlobalPosition(playerState.color, 0);
-              const canCapture = LudoEngine.canCapture(globalPos, opponentState);
-              validMoves.push({
-                tokenIndex: idx,
-                currentProgress: -1,
-                newProgress: 0,
-                canCapture,
-                willFinish: false,
-              });
-            }
-          });
-          if (validMoves.length > 0) {
-            console.log('✅ Recovered ' + validMoves.length + ' moves via defensive fix');
-          }
-        }
 
         // No valid moves — pass turn instantly
         if (validMoves.length === 0) {
@@ -556,7 +316,6 @@ module.exports = (io) => {
             canCapture: m.canCapture,
           })),
           hasValidMoves: true,
-          thirdSixBlocked, // ✅ tells frontend the 3rd-six rule kicked in
           currentTurn: game.currentTurn.toString(),
         });
 
@@ -571,23 +330,16 @@ module.exports = (io) => {
     // ============================
     socket.on('move-token', async ({ roomCode, tokenIndex }) => {
       try {
-        // ✅ Atomic: read game + null lastDiceRoll in one op so double-click can't double-move
-        const game = await Game.findOneAndUpdate(
-          {
-            roomCode: roomCode.toUpperCase(),
-            status: 'active',
-            currentTurn: socket.user._id,
-            lastDiceRoll: { $ne: null },
-          },
-          { $set: { lastDiceRoll: null } },
-          { new: false } // return pre-update doc so we still have diceRoll
-        ).populate('players.user', 'username');
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username');
 
-        if (!game) {
-          // Either not active, not your turn, or dice was already nulled (double-click race)
-          return socket.emit('error', { message: 'Move rejected: not your turn or dice already consumed' });
-        }
+        if (!game || game.status !== 'active')
+          return socket.emit('error', { message: 'Game not active' });
 
+        if (game.currentTurn.toString() !== socket.user._id.toString())
+          return socket.emit('error', { message: 'Not your turn' });
+
+        // ✅ FIX: Capture diceRoll into a local variable FIRST before nulling game.lastDiceRoll
         const diceRoll = game.lastDiceRoll;
         if (diceRoll === null || diceRoll === undefined)
           return socket.emit('error', { message: 'Roll dice first' });
@@ -617,7 +369,7 @@ module.exports = (io) => {
           toPosition:   move.newProgress,
         });
 
-        // Already nulled in DB by findOneAndUpdate above — reassert in-memory for the upcoming save
+        // ✅ FIX: Null lastDiceRoll AFTER all logic that depends on it is done
         game.lastDiceRoll = null;
 
         const moveData = {
@@ -693,47 +445,10 @@ module.exports = (io) => {
     });
 
     // ============================
-    // forfeit-notify: client calls REST /forfeit endpoint first,
-    // then emits this so opponent learns in real-time
-    // ============================
-    socket.on('forfeit-notify', async ({ roomCode }) => {
-      try {
-        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
-          .populate('players.user', 'username')
-          .populate('winner', 'username');
-
-        if (!game || game.status !== 'finished') return;
-
-        const winnerUser = game.players.find(p =>
-          p.user._id.toString() === game.winner?._id?.toString()
-        )?.user;
-        const loserUser = game.players.find(p =>
-          p.user._id.toString() === game.loser?.toString()
-        )?.user;
-
-        io.to(roomCode).emit('game-over', {
-          reason:  'forfeit',
-          winner:  { id: game.winner?._id?.toString(), username: winnerUser?.username },
-          loser:   { id: game.loser?.toString(), username: loserUser?.username },
-          winAmount: game.winAmount,
-          platformFee: game.platformFee,
-          message: `${loserUser?.username || 'Opponent'} forfeited. ${winnerUser?.username || 'You'} win!`,
-        });
-      } catch (err) {
-        console.error('forfeit-notify error:', err);
-      }
-    });
-
-    // ============================
     // disconnect
     // ============================
     socket.on('disconnect', async () => {
       console.log(`User disconnected: ${socket.user.username}`);
-      // ✅ Update global-chat online count if this socket was in chat
-      try {
-        const count = io.sockets.adapter.rooms.get('global-chat')?.size || 0;
-        io.to('global-chat').emit('chat-online-count', { count });
-      } catch {}
       if (!socket.currentRoom) return;
 
       try {
@@ -747,78 +462,48 @@ module.exports = (io) => {
         );
         if (playerIdx === -1) return;
 
-        // ✅ SCENARIO 1: Player drops while room is still waiting.
-        // OLD behaviour: instant abort + refund — but a browser refresh / brief
-        // network blip would kill the room and force the creator to start over.
-        // NEW behaviour: 15-second grace window. If they reconnect within 15s
-        // (via join-room → cancels this timer above), the room survives. Otherwise
-        // we abort + refund EXACTLY as before.
+        // ✅ Stale-socket guard: if this player already reconnected on a newer
+        // socket, this disconnect belongs to the dead old socket. Ignore it so
+        // we don't mark an actively-playing player offline or start a kill timer.
+        const roomMeta = activeRooms.get(socket.currentRoom);
+        const currentSocketId = roomMeta?.sockets?.[socket.user._id.toString()];
+        if (game.status !== 'waiting' && currentSocketId && currentSocketId !== socket.id) {
+          return;
+        }
+
+        // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
         if (game.status === 'waiting') {
-          // Don't cancel the 2-min waiting timer yet — if they reconnect, it should
-          // keep ticking from wherever it was. cancelWaitingTimer happens only on
-          // confirmed abort below.
+          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
 
-          const graceTimer = setTimeout(async () => {
-            try {
-              // Re-check status — they may have rejoined, or another path may have aborted/started the game
-              const stillWaiting = await Game.findOne({ roomCode: socket.currentRoom, status: 'waiting' });
-              if (!stillWaiting) return;
-              const creatorPlayer = stillWaiting.players[0];
-              if (!creatorPlayer) return;
-              // If the disconnected user is no longer marked offline, they returned — abort the abort.
-              if (creatorPlayer.user.toString() === socket.user._id.toString() &&
-                  creatorPlayer.isConnected) {
-                return;
-              }
-
-              cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown now
-
-              const aborted = await Game.findOneAndUpdate(
-                { roomCode: socket.currentRoom, status: 'waiting' },
-                { $set: { status: 'aborted', finishedAt: new Date() } },
-                { new: true }
-              );
-              if (!aborted) return; // someone else already aborted/cancelled
-
-              // Refund creator (only creator has paid at this point)
-              const creator = await User.findById(aborted.players[0].user);
-              if (creator) {
-                const before = creator.balance;
-                // ✅ Only reduce lockedBalance — balance was never deducted
-                creator.lockedBalance = Math.max(0, creator.lockedBalance - aborted.betAmount);
-                await creator.save();
-
-                await Transaction.create({
-                  user: creator._id,
-                  type: 'refund',
-                  amount: aborted.betAmount,
-                  balanceBefore: before,
-                  balanceAfter: creator.balance,
-                  status: 'completed',
-                  gameId: aborted._id,
-                });
-              }
-
-              io.to(socket.currentRoom).emit('game-aborted', {
-                reason: 'creator_left',
-                message: 'Room creator left. Game aborted. Bet refunded.',
-              });
-            } catch (e) {
-              console.error('waiting-grace abort error:', e);
-            } finally {
-              const rs = activeRooms.get(socket.currentRoom);
-              if (rs) rs.waitingGraceTimer = null;
-            }
-          }, 15000); // 15 seconds — enough for a browser refresh / network blip recovery
-
-          if (!activeRooms.has(socket.currentRoom)) activeRooms.set(socket.currentRoom, {});
-          activeRooms.get(socket.currentRoom).waitingGraceTimer = graceTimer;
-
-          // Mark the player offline so join-room can detect the reconnect and clear the timer
-          game.players[playerIdx].isConnected = false;
+          game.status = 'aborted';
+          game.finishedAt = new Date();
           await game.save();
 
-          return; // stop here — abort happens via the grace timer (or doesn't, if they return)
+          // Refund creator (only creator has paid at this point)
+          const creator = await User.findById(game.players[0].user._id);
+          if (creator) {
+            const before = creator.balance;
+            creator.balance += game.betAmount;
+            creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
+            await creator.save();
+
+            await Transaction.create({
+              user: creator._id,
+              type: 'refund',
+              amount: game.betAmount,
+              balanceBefore: before,
+              balanceAfter: creator.balance,
+              status: 'completed',
+              gameId: game._id,
+            });
+          }
+
+          io.to(socket.currentRoom).emit('game-aborted', {
+            reason: 'creator_left',
+            message: 'Room creator left. Game aborted. Bet refunded.',
+          });
+
+          return; // stop here — no 60s timer needed
         }
 
         // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
@@ -831,12 +516,7 @@ module.exports = (io) => {
         });
 
         const timer = setTimeout(async () => {
-          // ✅ Atomic: only succeeds if game is still active (prevents double settle if forfeit/move happened)
-          const freshGame = await Game.findOneAndUpdate(
-            { roomCode: socket.currentRoom, status: 'active' },
-            { $set: { status: 'finished', finishedAt: new Date() } },
-            { new: true }
-          );
+          const freshGame = await Game.findOne({ roomCode: socket.currentRoom, status: 'active' });
           if (!freshGame) return;
 
           const disconnectedIdx = freshGame.players.findIndex(
@@ -852,10 +532,12 @@ module.exports = (io) => {
           const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
           const winAmount   = pot - platformFee;
 
+          freshGame.status      = 'finished';
           freshGame.winner      = winnerId;
           freshGame.loser       = loserId;
           freshGame.winAmount   = winAmount;
           freshGame.platformFee = platformFee;
+          freshGame.finishedAt  = new Date();
           await freshGame.save();
 
           await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
@@ -899,6 +581,13 @@ module.exports = (io) => {
           await game.save();
           socket.join(roomCode);
           socket.currentRoom = roomCode;
+
+          // ✅ This new socket is now the player's live socket.
+          if (!activeRooms.has(roomCode)) activeRooms.set(roomCode, {});
+          const meta = activeRooms.get(roomCode);
+          if (!meta.sockets) meta.sockets = {};
+          meta.sockets[socket.user._id.toString()] = socket.id;
+
           socket.emit('game-state', sanitizeGame(game, socket.user._id));
           socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
         }
