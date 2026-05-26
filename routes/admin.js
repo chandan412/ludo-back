@@ -81,24 +81,41 @@ router.post('/add-balance', adminAuth, async (req, res) => {
   }
 });
 
-// POST /api/admin/reject-recharge
-router.post('/reject-recharge', adminAuth, async (req, res) => {
+// POST /api/admin/deduct-balance
+router.post('/deduct-balance', adminAuth, async (req, res) => {
   try {
-    const { transactionId, adminNote } = req.body;
-    if (!transactionId) return res.status(400).json({ message: 'transactionId required' });
+    const { userId, amount, note } = req.body;
+    if (!userId || !amount || amount <= 0)
+      return res.status(400).json({ message: 'userId and valid amount required' });
 
-    const transaction = await Transaction.findById(transactionId).populate('user');
-    if (!transaction) return res.status(404).json({ message: 'Transaction not found' });
-    if (transaction.type !== 'recharge') return res.status(400).json({ message: 'Not a recharge transaction' });
-    if (transaction.status !== 'pending') return res.status(400).json({ message: 'Transaction already processed' });
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: 'Player not found' });
+    if (user.role !== 'player') return res.status(400).json({ message: 'Can only deduct balance from players' });
 
-    transaction.status = 'rejected';
-    transaction.rechargeNote = adminNote || 'Rejected by admin';
-    transaction.processedBy = req.user._id;
-    transaction.processedAt = new Date();
-    await transaction.save();
+    const amt = parseFloat(amount);
+    const available = user.balance - user.lockedBalance;
+    if (amt > available)
+      return res.status(400).json({
+        message: `Cannot deduct ₹${amt}. Available (non-locked) balance is ₹${available}.`
+      });
 
-    res.json({ message: `Recharge of ₹${transaction.amount} rejected for ${transaction.user?.username}` });
+    const balanceBefore = user.balance;
+    user.balance -= amt;
+    await user.save();
+
+    await Transaction.create({
+      user: userId,
+      type: 'admin_deduct',
+      amount: amt,
+      balanceBefore,
+      balanceAfter: user.balance,
+      status: 'approved',
+      rechargeNote: note || 'Manual deduction by admin',
+      processedBy: req.user._id,
+      processedAt: new Date()
+    });
+
+    res.json({ message: `₹${amt} deducted from ${user.username}'s account`, newBalance: user.balance });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
