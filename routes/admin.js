@@ -81,6 +81,29 @@ router.post('/add-balance', adminAuth, async (req, res) => {
   }
 });
 
+// POST /api/admin/reject-recharge
+router.post('/reject-recharge', adminAuth, async (req, res) => {
+  try {
+    const { transactionId, adminNote } = req.body;
+    if (!transactionId) return res.status(400).json({ message: 'transactionId required' });
+
+    const transaction = await Transaction.findById(transactionId).populate('user');
+    if (!transaction) return res.status(404).json({ message: 'Transaction not found' });
+    if (transaction.type !== 'recharge') return res.status(400).json({ message: 'Not a recharge transaction' });
+    if (transaction.status !== 'pending') return res.status(400).json({ message: 'Transaction already processed' });
+
+    transaction.status = 'rejected';
+    transaction.rechargeNote = adminNote || 'Rejected by admin';
+    transaction.processedBy = req.user._id;
+    transaction.processedAt = new Date();
+    await transaction.save();
+
+    res.json({ message: `Recharge of ₹${transaction.amount} rejected for ${transaction.user?.username}` });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // POST /api/admin/process-withdrawal
 router.post('/process-withdrawal', adminAuth, async (req, res) => {
   try {
@@ -96,23 +119,15 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
     const user = await User.findById(transaction.user._id);
 
     if (action === 'approve') {
-      // ✅ FIX: Deduct from both balance and lockedBalance on approval
-      const balanceBefore = user.balance;
-      user.balance = Math.max(0, user.balance - transaction.amount);
-      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
-      await user.save();
-
       transaction.status = 'completed';
-      transaction.balanceBefore = balanceBefore;
-      transaction.balanceAfter = user.balance;
       transaction.withdrawNote = adminNote || 'Payment sent by admin';
       transaction.processedBy = req.user._id;
       transaction.processedAt = new Date();
       await transaction.save();
       res.json({ message: `Withdrawal of ₹${transaction.amount} approved for ${user.username}` });
     } else if (action === 'reject') {
-      // ✅ FIX: Only unlock — balance was never deducted
-      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
+      const balanceBefore = user.balance;
+      user.balance += transaction.amount;
       await user.save();
 
       transaction.status = 'rejected';
@@ -123,17 +138,17 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
 
       await Transaction.create({
         user: user._id,
-        type: 'refund',
+        type: 'recharge',
         amount: transaction.amount,
-        balanceBefore: user.balance,
+        balanceBefore,
         balanceAfter: user.balance,
         status: 'completed',
-        withdrawNote: `Withdrawal rejected - amount unlocked. Reason: ${adminNote || 'N/A'}`,
+        rechargeNote: `Withdrawal rejected - refund. Reason: ${adminNote || 'N/A'}`,
         processedBy: req.user._id,
         processedAt: new Date()
       });
 
-      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} unlocked for ${user.username}` });
+      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} refunded to ${user.username}` });
     } else {
       res.status(400).json({ message: 'Invalid action. Use approve or reject' });
     }
@@ -239,54 +254,6 @@ router.get('/dashboard-stats', adminAuth, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ✅ POST /api/admin/reconcile-locked-balances
-// Recalculates lockedBalance for ALL users based on actual active games + pending withdrawals.
-// One-shot migration to fix any historical inflation.
-router.post('/reconcile-locked-balances', adminAuth, async (req, res) => {
-  try {
-    const users = await User.find().select('_id username lockedBalance');
-    const fixes = [];
-
-    for (const user of users) {
-      // Sum bet amounts in active/waiting games
-      const activeGames = await Game.find({
-        'players.user': user._id,
-        status: { $in: ['waiting', 'active'] },
-      }).select('betAmount');
-      const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
-
-      // Sum pending withdrawals
-      const pendingWithdraws = await Transaction.find({
-        user: user._id,
-        type: 'withdraw',
-        status: 'pending',
-      }).select('amount');
-      const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
-
-      const expectedLocked = gameLocked + withdrawLocked;
-      if (user.lockedBalance !== expectedLocked) {
-        fixes.push({
-          username: user.username,
-          before: user.lockedBalance,
-          after: expectedLocked,
-          delta: expectedLocked - user.lockedBalance,
-        });
-        user.lockedBalance = expectedLocked;
-        await user.save();
-      }
-    }
-
-    res.json({
-      message: `Reconciled ${fixes.length} users`,
-      fixes,
-      totalUnlocked: fixes.reduce((sum, f) => sum + Math.max(0, -f.delta), 0),
-    });
-  } catch (err) {
-    console.error('Reconcile error:', err);
-    res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
