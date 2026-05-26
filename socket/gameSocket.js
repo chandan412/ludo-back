@@ -39,7 +39,8 @@ function startWaitingTimer(io, roomCode) {
       const creator = await User.findById(game.players[0].user);
       if (creator) {
         const before = creator.balance;
-        creator.balance += game.betAmount;
+        // Refund = release the locked bet only. Balance was never debited,
+        // so do NOT add to balance (that caused balance inflation).
         creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
         await creator.save();
 
@@ -218,13 +219,6 @@ module.exports = (io) => {
         );
         game.players[playerIdx].isConnected = true;
         await game.save();
-
-        // ✅ Track this player's live socket id so a stale/old socket's later
-        // disconnect can't wrongly mark them offline after they've reconnected.
-        if (!activeRooms.has(roomCode)) activeRooms.set(roomCode, {});
-        const roomMeta = activeRooms.get(roomCode);
-        if (!roomMeta.sockets) roomMeta.sockets = {};
-        roomMeta.sockets[socket.user._id.toString()] = socket.id;
 
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
@@ -462,15 +456,6 @@ module.exports = (io) => {
         );
         if (playerIdx === -1) return;
 
-        // ✅ Stale-socket guard: if this player already reconnected on a newer
-        // socket, this disconnect belongs to the dead old socket. Ignore it so
-        // we don't mark an actively-playing player offline or start a kill timer.
-        const roomMeta = activeRooms.get(socket.currentRoom);
-        const currentSocketId = roomMeta?.sockets?.[socket.user._id.toString()];
-        if (game.status !== 'waiting' && currentSocketId && currentSocketId !== socket.id) {
-          return;
-        }
-
         // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
         if (game.status === 'waiting') {
           cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
@@ -483,7 +468,8 @@ module.exports = (io) => {
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
             const before = creator.balance;
-            creator.balance += game.betAmount;
+            // Refund = release the locked bet only. Balance was never debited,
+            // so do NOT add to balance (that caused balance inflation).
             creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
             await creator.save();
 
@@ -581,13 +567,6 @@ module.exports = (io) => {
           await game.save();
           socket.join(roomCode);
           socket.currentRoom = roomCode;
-
-          // ✅ This new socket is now the player's live socket.
-          if (!activeRooms.has(roomCode)) activeRooms.set(roomCode, {});
-          const meta = activeRooms.get(roomCode);
-          if (!meta.sockets) meta.sockets = {};
-          meta.sockets[socket.user._id.toString()] = socket.id;
-
           socket.emit('game-state', sanitizeGame(game, socket.user._id));
           socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
         }
