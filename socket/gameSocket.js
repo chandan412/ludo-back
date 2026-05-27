@@ -39,8 +39,6 @@ function startWaitingTimer(io, roomCode) {
       const creator = await User.findById(game.players[0].user);
       if (creator) {
         const before = creator.balance;
-        // Refund = release the locked bet only. Balance was never debited,
-        // so do NOT add to balance (that caused balance inflation).
         creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
         await creator.save();
 
@@ -468,8 +466,6 @@ module.exports = (io) => {
           const creator = await User.findById(game.players[0].user._id);
           if (creator) {
             const before = creator.balance;
-            // Refund = release the locked bet only. Balance was never debited,
-            // so do NOT add to balance (that caused balance inflation).
             creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
             await creator.save();
 
