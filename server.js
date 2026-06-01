@@ -49,6 +49,7 @@ const io = new Server(server, {
 app.use(cors({
   origin: function (origin, callback) {
     if (isOriginAllowed(origin)) return callback(null, true);
+    console.warn('⚠️ CORS blocked origin:', origin); // shows exactly what was rejected
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
