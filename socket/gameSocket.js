@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Game = require('../models/Game');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
@@ -6,6 +7,30 @@ const jwt = require('jsonwebtoken');
 
 const activeRooms = new Map();
 const roomTimers = new Map(); // tracks 2-min auto-abort timers
+
+// ============================
+// CHAT setup (shared global chat room)
+// ============================
+const CHAT_ROOM = 'global-chat';
+const chatSockets = new Set(); // socket ids currently in chat — used for the online count
+
+// Reuse the ChatMessage model registered by routes/chat.js if it already exists,
+// otherwise define it here. No `type` enum so both 'chat' and 'invite' are allowed.
+let ChatMessage;
+try {
+  ChatMessage = mongoose.model('ChatMessage');
+} catch {
+  const chatSchema = new mongoose.Schema({
+    userId:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    username:  { type: String, required: true },
+    type:      { type: String, default: 'chat' },
+    text:      { type: String, default: '' },
+    betAmount: { type: Number, default: 0 },
+    roomCode:  { type: String, default: '' },
+    createdAt: { type: Date, default: Date.now, expires: 86400 }, // auto-delete after 24h
+  });
+  ChatMessage = mongoose.model('ChatMessage', chatSchema);
+}
 
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
@@ -174,6 +199,82 @@ module.exports = (io) => {
 
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.user.username} (${socket.id})`);
+
+    // ============================
+    // CHAT: join / leave / send / invite / invite-accepted
+    // Shared global chat room — independent of game rooms, touches no game logic.
+    // ============================
+    const broadcastChatCount = () => {
+      io.to(CHAT_ROOM).emit('chat-online-count', { count: chatSockets.size });
+    };
+
+    socket.on('join-chat', () => {
+      socket.join(CHAT_ROOM);
+      chatSockets.add(socket.id);
+      broadcastChatCount();
+    });
+
+    socket.on('leave-chat', () => {
+      socket.leave(CHAT_ROOM);
+      chatSockets.delete(socket.id);
+      broadcastChatCount();
+    });
+
+    // Plain text message → save + broadcast to everyone in chat
+    socket.on('send-chat', async ({ text }) => {
+      try {
+        const clean = (text || '').toString().trim().slice(0, 200);
+        if (!clean) return;
+        const msg = await ChatMessage.create({
+          userId:   socket.user._id,
+          username: socket.user.username,
+          type:     'chat',
+          text:     clean,
+        });
+        io.to(CHAT_ROOM).emit('chat-message', {
+          _id:       msg._id.toString(),
+          userId:    socket.user._id.toString(),
+          username:  socket.user.username,
+          type:      'chat',
+          text:      clean,
+          createdAt: msg.createdAt,
+        });
+      } catch (err) {
+        console.error('send-chat error:', err);
+      }
+    });
+
+    // Challenge / invite card → save + broadcast so others can tap Accept
+    socket.on('send-invite', async ({ betAmount, roomCode }) => {
+      try {
+        const amount = Number(betAmount) || 0;
+        if (amount < 10 || !roomCode) return;
+        const msg = await ChatMessage.create({
+          userId:    socket.user._id,
+          username:  socket.user.username,
+          type:      'invite',
+          betAmount: amount,
+          roomCode:  roomCode,
+          text:      '',
+        });
+        io.to(CHAT_ROOM).emit('chat-message', {
+          _id:       msg._id.toString(),
+          userId:    socket.user._id.toString(),
+          username:  socket.user.username,
+          type:      'invite',
+          betAmount: amount,
+          roomCode:  roomCode,
+          createdAt: msg.createdAt,
+        });
+      } catch (err) {
+        console.error('send-invite error:', err);
+      }
+    });
+
+    // Relay invite acceptance — frontend filters so only the challenger reacts
+    socket.on('invite-accepted', ({ roomCode, challengerId, acceptedBy }) => {
+      io.to(CHAT_ROOM).emit('invite-accepted', { roomCode, challengerId, acceptedBy });
+    });
 
     // ============================
     // created-room: fired by creator right after creating a game
@@ -441,6 +542,14 @@ module.exports = (io) => {
     // ============================
     socket.on('disconnect', async () => {
       console.log(`User disconnected: ${socket.user.username}`);
+
+      // ✅ Chat cleanup — must run BEFORE the game-room early-return below,
+      // because chat-only users never have socket.currentRoom set.
+      if (chatSockets.has(socket.id)) {
+        chatSockets.delete(socket.id);
+        io.to(CHAT_ROOM).emit('chat-online-count', { count: chatSockets.size });
+      }
+
       if (!socket.currentRoom) return;
 
       try {
