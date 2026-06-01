@@ -17,6 +17,8 @@ const server = http.createServer(app);
 // ✅ Fixed CORS
 const allowedOrigins = [
   'https://ludo-fron.vercel.app',
+  'https://ludo-king.in',
+  'https://www.ludo-king.in',
   'http://localhost:3000'
 ];
 // Optional extra origin from env (e.g. a custom domain), comma-separated
