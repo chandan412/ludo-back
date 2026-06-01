@@ -9,10 +9,6 @@ const walletRoutes = require('./routes/wallet');
 const gameRoutes = require('./routes/game');
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
-// ✅ Newly mounted routes (previously defined but not registered)
-const chatRoutes = require('./routes/chat');           // exports { router, setIO }
-const cricketRoutes = require('./routes/cricket');     // exports router
-const notificationsRoutes = require('./routes/notifications'); // exports router
 const gameSocket = require('./socket/gameSocket');
 
 const app = express();
@@ -21,14 +17,30 @@ const server = http.createServer(app);
 // ✅ Fixed CORS
 const allowedOrigins = [
   'https://ludo-fron.vercel.app',
-  'https://ludo-king.in',
-  'https://www.ludo-king.in',
   'http://localhost:3000'
 ];
+// Optional extra origin from env (e.g. a custom domain), comma-separated
+if (process.env.FRONTEND_URL) {
+  process.env.FRONTEND_URL.split(',').forEach(o => {
+    const t = o.trim();
+    if (t && !allowedOrigins.includes(t)) allowedOrigins.push(t);
+  });
+}
+
+// ✅ Accept the fixed list above PLUS any *.vercel.app preview/branch URL.
+// Vercel gives preview & branch deploys a different subdomain each time
+// (e.g. ludo-fron-git-main-xxx.vercel.app), which would otherwise be blocked
+// by CORS and surface on the frontend as a generic "Login failed".
+function isOriginAllowed(origin) {
+  if (!origin) return true; // mobile apps / curl / same-origin
+  if (allowedOrigins.includes(origin)) return true;
+  if (/^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) return true;
+  return false;
+}
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => callback(null, isOriginAllowed(origin)),
     methods: ['GET', 'POST'],
     credentials: true
   }
@@ -36,11 +48,7 @@ const io = new Server(server, {
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+    if (isOriginAllowed(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
@@ -50,14 +58,6 @@ app.use(cors({
 
 app.use(express.json({ limit: '10mb' }));
 
-// ✅ No-cache: prevent Railway/browser from serving stale API responses
-app.use((req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
-  next();
-});
-
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
 app.use('/api/auth', authRoutes);
@@ -66,20 +66,7 @@ app.use('/api/game', gameRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/settings', settingsRoutes);
 
-// ✅ Newly mounted: chat (with io binding), cricket toss, FCM notifications
-app.use('/api/chat', chatRoutes.router);
-app.use('/api/cricket', cricketRoutes);
-app.use('/api/notifications', notificationsRoutes);
-
 gameSocket(io);
-
-// ✅ Bind io to chat routes so chat-message broadcasts work
-if (typeof chatRoutes.setIO === 'function') chatRoutes.setIO(io);
-
-// ✅ Keep-alive ping every 4 minutes — prevents Railway from sleeping the dyno
-setInterval(() => {
-  console.log(`[keep-alive] tick at ${new Date().toISOString()}`);
-}, 4 * 60 * 1000);
 
 const PORT = process.env.PORT || 5000;
 mongoose.connect(process.env.MONGODB_URI)
