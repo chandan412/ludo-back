@@ -43,39 +43,62 @@ router.get('/player/:id', adminAuth, async (req, res) => {
 router.post('/add-balance', adminAuth, async (req, res) => {
   try {
     const { userId, amount, note, transactionId } = req.body;
-    if (!userId || !amount || amount <= 0)
+    const amt = parseFloat(amount);
+    if (!userId || !amt || amt <= 0)
       return res.status(400).json({ message: 'userId and valid amount required' });
 
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ message: 'Player not found' });
     if (user.role !== 'player') return res.status(400).json({ message: 'Can only add balance to players' });
 
-    const balanceBefore = user.balance;
-    user.balance += parseFloat(amount);
-    await user.save();
-
+    // ── CASE A: Approving a pending recharge request (transactionId provided) ──
     if (transactionId) {
-      await Transaction.findByIdAndUpdate(transactionId, {
-        status: 'approved',
-        balanceAfter: user.balance,
-        processedBy: req.user._id,
-        processedAt: new Date()
-      });
-    } else {
-      await Transaction.create({
-        user: userId,
-        type: 'recharge',
-        amount: parseFloat(amount),
-        balanceBefore,
-        balanceAfter: user.balance,
-        status: 'approved',
-        rechargeNote: note || 'Manual recharge by admin',
-        processedBy: req.user._id,
-        processedAt: new Date()
-      });
+      // ✅ DOUBLE-CREDIT FIX: atomically flip the transaction pending → approved.
+      // findOneAndUpdate with { status: 'pending' } in the filter means only the
+      // FIRST call succeeds; a second click (double-tap / retry) matches nothing and
+      // returns null, so we add the balance EXACTLY ONCE. Previously the balance was
+      // added before any status check, so two clicks doubled the money.
+      const tx = await Transaction.findOneAndUpdate(
+        { _id: transactionId, type: 'recharge', status: 'pending' },
+        { status: 'approved', processedBy: req.user._id, processedAt: new Date() },
+        { new: true }
+      );
+
+      if (!tx) {
+        // Already processed (or not a pending recharge) — do NOT add balance again.
+        return res.status(400).json({ message: 'This recharge was already processed.' });
+      }
+
+      const balanceBefore = user.balance;
+      user.balance += amt;
+      await user.save();
+
+      // Record the resulting balance on the now-approved transaction.
+      tx.balanceBefore = balanceBefore;
+      tx.balanceAfter  = user.balance;
+      await tx.save();
+
+      return res.json({ message: `₹${amt} added to ${user.username}'s account`, newBalance: user.balance });
     }
 
-    res.json({ message: `₹${amount} added to ${user.username}'s account`, newBalance: user.balance });
+    // ── CASE B: Manual ad-hoc credit (no transactionId) ──
+    const balanceBefore = user.balance;
+    user.balance += amt;
+    await user.save();
+
+    await Transaction.create({
+      user: userId,
+      type: 'recharge',
+      amount: amt,
+      balanceBefore,
+      balanceAfter: user.balance,
+      status: 'approved',
+      rechargeNote: note || 'Manual recharge by admin',
+      processedBy: req.user._id,
+      processedAt: new Date()
+    });
+
+    res.json({ message: `₹${amt} added to ${user.username}'s account`, newBalance: user.balance });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -130,15 +153,16 @@ router.post('/reject-recharge', adminAuth, async (req, res) => {
     const { transactionId, reason } = req.body;
     if (!transactionId) return res.status(400).json({ message: 'transactionId required' });
 
-    const transaction = await Transaction.findById(transactionId).populate('user');
-    if (!transaction) return res.status(404).json({ message: 'Transaction not found' });
-    if (transaction.type !== 'recharge') return res.status(400).json({ message: 'Not a recharge transaction' });
-    if (transaction.status !== 'pending') return res.status(400).json({ message: 'Already processed' });
+    // ✅ Atomic flip pending → rejected so a double-click can't double-process.
+    const transaction = await Transaction.findOneAndUpdate(
+      { _id: transactionId, type: 'recharge', status: 'pending' },
+      { status: 'rejected', processedBy: req.user._id, processedAt: new Date() },
+      { new: true }
+    ).populate('user');
 
-    transaction.status = 'rejected';
+    if (!transaction) return res.status(400).json({ message: 'Transaction not found or already processed' });
+
     transaction.rechargeNote = reason || 'Rejected by admin — payment not received';
-    transaction.processedBy = req.user._id;
-    transaction.processedAt = new Date();
     await transaction.save();
 
     res.json({ message: `Recharge request rejected for ${transaction.user?.username}` });
@@ -154,45 +178,41 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
     if (!transactionId || !action)
       return res.status(400).json({ message: 'transactionId and action required' });
 
-    const transaction = await Transaction.findById(transactionId).populate('user');
-    if (!transaction) return res.status(404).json({ message: 'Transaction not found' });
-    if (transaction.type !== 'withdraw') return res.status(400).json({ message: 'Not a withdrawal transaction' });
-    if (transaction.status !== 'pending') return res.status(400).json({ message: 'Transaction already processed' });
+    // ✅ Atomic claim: flip pending → processing-marker so a double-click can't
+    // settle the same withdrawal twice. Only the first call gets the doc.
+    const transaction = await Transaction.findOneAndUpdate(
+      { _id: transactionId, type: 'withdraw', status: 'pending' },
+      { status: action === 'approve' ? 'completed' : 'rejected', processedBy: req.user._id, processedAt: new Date() },
+      { new: true }
+    ).populate('user');
+
+    if (!transaction) return res.status(400).json({ message: 'Transaction not found or already processed' });
 
     const user = await User.findById(transaction.user._id);
 
     if (action === 'approve') {
-      // ✅ FIX: withdraw-request only LOCKED the money (lockedBalance += amount),
-      // it never reduced balance. On approval the money actually leaves the wallet:
-      // deduct from BOTH balance and lockedBalance. (Previously this did neither, so
-      // balance was never deducted and lockedBalance stayed inflated forever.)
+      // ✅ withdraw-request only LOCKED the money (lockedBalance += amount), it never
+      // reduced balance. On approval the money actually leaves the wallet: deduct from
+      // BOTH balance and lockedBalance.
       const balanceBefore = user.balance;
       user.balance       = Math.max(0, user.balance - transaction.amount);
       user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
       await user.save();
 
-      transaction.status = 'completed';
       transaction.balanceBefore = balanceBefore;
       transaction.balanceAfter = user.balance;
       transaction.withdrawNote = adminNote || 'Payment sent by admin';
-      transaction.processedBy = req.user._id;
-      transaction.processedAt = new Date();
       await transaction.save();
       res.json({ message: `Withdrawal of ₹${transaction.amount} approved for ${user.username}` });
     } else if (action === 'reject') {
-      // ✅ FIX: withdraw only LOCKED the money — balance was never reduced. So on
-      // reject we simply RELEASE the lock (lockedBalance -= amount). The previous
-      // code did `balance += amount` which CREATED money out of nothing (the funds
-      // were never removed from balance), inflating the wallet. We only unlock here.
+      // ✅ withdraw only LOCKED the money — balance was never reduced. So on reject we
+      // simply RELEASE the lock (lockedBalance -= amount). No balance change.
       const availableBefore = user.balance - user.lockedBalance;
       user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
       await user.save();
       const availableAfter = user.balance - user.lockedBalance;
 
-      transaction.status = 'rejected';
       transaction.withdrawNote = adminNote || 'Rejected by admin';
-      transaction.processedBy = req.user._id;
-      transaction.processedAt = new Date();
       await transaction.save();
 
       await Transaction.create({
