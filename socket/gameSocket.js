@@ -14,23 +14,8 @@ const roomTimers = new Map(); // tracks 2-min auto-abort timers
 const CHAT_ROOM = 'global-chat';
 const chatSockets = new Set(); // socket ids currently in chat — used for the online count
 
-// Reuse the ChatMessage model registered by routes/chat.js if it already exists,
-// otherwise define it here. No `type` enum so both 'chat' and 'invite' are allowed.
-let ChatMessage;
-try {
-  ChatMessage = mongoose.model('ChatMessage');
-} catch {
-  const chatSchema = new mongoose.Schema({
-    userId:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    username:  { type: String, required: true },
-    type:      { type: String, default: 'chat' },
-    text:      { type: String, default: '' },
-    betAmount: { type: Number, default: 0 },
-    roomCode:  { type: String, default: '' },
-    createdAt: { type: Date, default: Date.now, expires: 86400 }, // auto-delete after 24h
-  });
-  ChatMessage = mongoose.model('ChatMessage', chatSchema);
-}
+// Shared chat message model (same one routes/chat.js reads history from).
+const ChatMessage = require('../models/ChatMessage');
 
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
