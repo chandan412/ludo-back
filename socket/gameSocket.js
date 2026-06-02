@@ -307,6 +307,28 @@ module.exports = (io) => {
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
+        // ✅ ANTI-CHEAT resync: if it's this player's turn and they already rolled
+        // (lastDiceRoll set), restore the dice + valid moves on their refreshed UI
+        // so they can't re-roll and don't get a blank dice.
+        if (game.status === 'active' &&
+            game.lastDiceRoll !== null && game.lastDiceRoll !== undefined &&
+            game.currentTurn.toString() === socket.user._id.toString()) {
+          const pIdx = playerIdx;
+          const oIdx = pIdx === 0 ? 1 : 0;
+          if (game.players[oIdx]) {
+            const existing = LudoEngine.getValidMoves(game.players[pIdx], game.lastDiceRoll, game.players[oIdx]);
+            socket.emit('dice-rolled', {
+              diceRoll:       game.lastDiceRoll,
+              playerId:       socket.user._id,
+              playerUsername: socket.user.username,
+              validMoves:     existing.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
+              hasValidMoves:  existing.length > 0,
+              currentTurn:    game.currentTurn.toString(),
+              resync:         true,
+            });
+          }
+        }
+
         // ✅ Count connected players — if both are in, cancel the waiting timer
         const connectedCount = game.players.filter(p => p.isConnected).length;
         if (connectedCount >= 2) {
@@ -336,6 +358,25 @@ module.exports = (io) => {
 
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
+
+        // ✅ ANTI-CHEAT: if a dice value is already committed for this turn (player
+        // refreshed or re-emitted roll-dice), DO NOT roll again. Re-send the existing
+        // value + valid moves so the UI restores, but the number cannot change.
+        if (game.lastDiceRoll !== null && game.lastDiceRoll !== undefined) {
+          const pIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+          const oIdx = pIdx === 0 ? 1 : 0;
+          const existing = LudoEngine.getValidMoves(game.players[pIdx], game.lastDiceRoll, game.players[oIdx]);
+          socket.emit('dice-rolled', {
+            diceRoll:       game.lastDiceRoll,
+            playerId:       socket.user._id,
+            playerUsername: socket.user.username,
+            validMoves:     existing.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
+            hasValidMoves:  existing.length > 0,
+            currentTurn:    game.currentTurn.toString(),
+            resync:         true,
+          });
+          return;
+        }
 
         const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
         const opponentIdx = playerIdx === 0 ? 1 : 0;
