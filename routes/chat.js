@@ -1,63 +1,24 @@
-// routes/chat.js — simple chat only, no game creation
 const express = require('express');
-const router  = express.Router();
-const mongoose = require('mongoose');
+const router = express.Router();
+const ChatMessage = require('../models/ChatMessage');
 const { auth } = require('../middleware/auth');
 
-// ── Chat Message schema — auto-delete after 24 hours ──
-const chatSchema = new mongoose.Schema({
-  userId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  username: { type: String, required: true },
-  text:     { type: String, required: true },
-  createdAt:{ type: Date, default: Date.now, expires: 86400 }, // 24h TTL
-});
-
-let ChatMessage;
-try { ChatMessage = mongoose.model('ChatMessage'); }
-catch { ChatMessage = mongoose.model('ChatMessage', chatSchema); }
-
-let _io = null;
-function setIO(io) { _io = io; }
-
-// GET /api/chat/messages — last 100 messages (oldest → newest)
+// GET /api/chat/messages
+// Returns the last 100 chat messages in chronological order (oldest first),
+// so GameChat.js can render history on page load / refresh. Without this,
+// messages live only in browser memory and vanish on refresh.
 router.get('/messages', auth, async (req, res) => {
   try {
-    // Fetch newest 100, then reverse so the client renders oldest→newest top→bottom.
-    const msgs = await ChatMessage.find().sort({ createdAt: -1 }).limit(100).lean();
-    res.json(msgs.reverse().map(m => ({
-      _id:       m._id,
-      userId:    m.userId?.toString(),
-      username:  m.username,
-      text:      m.text,
-      createdAt: m.createdAt,
-    })));
-  } catch { res.status(500).json({ message: 'Server error' }); }
+    const messages = await ChatMessage.find()
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+    messages.reverse(); // oldest -> newest for display
+    res.json(messages);
+  } catch (err) {
+    console.error('chat history error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
-// POST /api/chat/message — send a message
-router.post('/message', auth, async (req, res) => {
-  try {
-    const { text } = req.body;
-    if (!text?.trim()) return res.status(400).json({ message: 'Message required' });
-    if (text.length > 150) return res.status(400).json({ message: 'Max 150 characters' });
-
-    const msg = await ChatMessage.create({
-      userId:   req.user._id,
-      username: req.user.username,
-      text:     text.trim(),
-    });
-
-    const payload = {
-      _id:       msg._id,
-      userId:    req.user._id.toString(),
-      username:  req.user.username,
-      text:      msg.text,
-      createdAt: msg.createdAt,
-    };
-
-    if (_io) _io.emit('chat-message', payload);
-    res.status(201).json(payload);
-  } catch { res.status(500).json({ message: 'Server error' }); }
-});
-
-module.exports = { router, setIO };
+module.exports = router;
