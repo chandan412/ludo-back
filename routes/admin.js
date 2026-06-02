@@ -162,16 +162,32 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
     const user = await User.findById(transaction.user._id);
 
     if (action === 'approve') {
+      // ✅ FIX: withdraw-request only LOCKED the money (lockedBalance += amount),
+      // it never reduced balance. On approval the money actually leaves the wallet:
+      // deduct from BOTH balance and lockedBalance. (Previously this did neither, so
+      // balance was never deducted and lockedBalance stayed inflated forever.)
+      const balanceBefore = user.balance;
+      user.balance       = Math.max(0, user.balance - transaction.amount);
+      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
+      await user.save();
+
       transaction.status = 'completed';
+      transaction.balanceBefore = balanceBefore;
+      transaction.balanceAfter = user.balance;
       transaction.withdrawNote = adminNote || 'Payment sent by admin';
       transaction.processedBy = req.user._id;
       transaction.processedAt = new Date();
       await transaction.save();
       res.json({ message: `Withdrawal of ₹${transaction.amount} approved for ${user.username}` });
     } else if (action === 'reject') {
-      const balanceBefore = user.balance;
-      user.balance += transaction.amount;
+      // ✅ FIX: withdraw only LOCKED the money — balance was never reduced. So on
+      // reject we simply RELEASE the lock (lockedBalance -= amount). The previous
+      // code did `balance += amount` which CREATED money out of nothing (the funds
+      // were never removed from balance), inflating the wallet. We only unlock here.
+      const availableBefore = user.balance - user.lockedBalance;
+      user.lockedBalance = Math.max(0, user.lockedBalance - transaction.amount);
       await user.save();
+      const availableAfter = user.balance - user.lockedBalance;
 
       transaction.status = 'rejected';
       transaction.withdrawNote = adminNote || 'Rejected by admin';
@@ -181,17 +197,17 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
 
       await Transaction.create({
         user: user._id,
-        type: 'recharge',
+        type: 'withdraw',
         amount: transaction.amount,
-        balanceBefore,
-        balanceAfter: user.balance,
-        status: 'completed',
-        rechargeNote: `Withdrawal rejected - refund. Reason: ${adminNote || 'N/A'}`,
+        balanceBefore: availableBefore,
+        balanceAfter: availableAfter,
+        status: 'rejected',
+        withdrawNote: `Withdrawal rejected - amount unlocked. Reason: ${adminNote || 'N/A'}`,
         processedBy: req.user._id,
         processedAt: new Date()
       });
 
-      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} refunded to ${user.username}` });
+      res.json({ message: `Withdrawal rejected. ₹${transaction.amount} unlocked for ${user.username}` });
     } else {
       res.status(400).json({ message: 'Invalid action. Use approve or reject' });
     }
