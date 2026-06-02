@@ -81,6 +81,48 @@ router.post('/add-balance', adminAuth, async (req, res) => {
   }
 });
 
+// POST /api/admin/deduct-balance
+// Manually remove balance from a player (e.g. correcting an erroneous credit,
+// clawing back a mistaken recharge). Only ever touches `balance` — never
+// `lockedBalance` — and refuses to deduct more than the player's AVAILABLE
+// (unlocked) balance, so money committed to an in-progress game is protected.
+router.post('/deduct-balance', adminAuth, async (req, res) => {
+  try {
+    const { userId, amount, note } = req.body;
+    const amt = parseFloat(amount);
+    if (!userId || !amt || amt <= 0)
+      return res.status(400).json({ message: 'userId and valid amount required' });
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: 'Player not found' });
+    if (user.role !== 'player') return res.status(400).json({ message: 'Can only deduct balance from players' });
+
+    const available = user.balance - (user.lockedBalance || 0);
+    if (amt > available)
+      return res.status(400).json({ message: `Cannot deduct ₹${amt}. Available (unlocked) balance is only ₹${available}` });
+
+    const balanceBefore = user.balance;
+    user.balance = balanceBefore - amt;
+    await user.save();
+
+    await Transaction.create({
+      user: userId,
+      type: 'withdraw',
+      amount: amt,
+      balanceBefore,
+      balanceAfter: user.balance,
+      status: 'completed',
+      withdrawNote: note || 'Manual deduction by admin',
+      processedBy: req.user._id,
+      processedAt: new Date()
+    });
+
+    res.json({ message: `₹${amt} deducted from ${user.username}'s account`, newBalance: user.balance });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // POST /api/admin/reject-recharge
 // Reject a fake/invalid recharge request — no balance added
 router.post('/reject-recharge', adminAuth, async (req, res) => {
