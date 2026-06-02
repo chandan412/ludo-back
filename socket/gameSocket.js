@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 
 const activeRooms = new Map();
 const roomTimers = new Map(); // tracks 2-min auto-abort timers
+const waitingGraceTimers = new Map(); // brief grace window so a refresh doesn't abort a waiting room
 
 // ============================
 // CHAT setup (shared global chat room)
@@ -304,6 +305,11 @@ module.exports = (io) => {
         game.players[playerIdx].isConnected = true;
         await game.save();
 
+        // ✅ Player came back (e.g. from a refresh) — cancel any pending
+        // waiting-room grace abort so their room isn't killed.
+        const gt = waitingGraceTimers.get(roomCode);
+        if (gt) { clearTimeout(gt); waitingGraceTimers.delete(roomCode); }
+
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
@@ -589,38 +595,54 @@ module.exports = (io) => {
         );
         if (playerIdx === -1) return;
 
-        // ✅ SCENARIO 1: Player leaves while room is still waiting → abort immediately
+        // ✅ SCENARIO 1: Player disconnects while room is still WAITING.
+        // Do NOT abort immediately — a page refresh looks identical to leaving.
+        // Give a short grace window; if they don't reconnect (join-room clears this),
+        // THEN abort + refund. The existing 2-min timer still backstops truly idle rooms.
         if (game.status === 'waiting') {
-          cancelWaitingTimer(socket.currentRoom); // stop the 2-min countdown
-
-          game.status = 'aborted';
-          game.finishedAt = new Date();
+          game.players[playerIdx].isConnected = false;
           await game.save();
 
-          // Refund creator (only creator has paid at this point)
-          const creator = await User.findById(game.players[0].user._id);
-          if (creator) {
-            const before = creator.balance;
-            creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
-            await creator.save();
+          const roomForGrace = socket.currentRoom;
+          const graceTimer = setTimeout(async () => {
+            waitingGraceTimers.delete(roomForGrace);
+            try {
+              const fresh = await Game.findOne({ roomCode: roomForGrace, status: 'waiting' });
+              if (!fresh) return; // already started (opponent joined) or aborted — nothing to do
 
-            await Transaction.create({
-              user: creator._id,
-              type: 'refund',
-              amount: game.betAmount,
-              balanceBefore: before,
-              balanceAfter: creator.balance,
-              status: 'completed',
-              gameId: game._id,
-            });
-          }
+              // Still waiting and creator never came back → abort + refund.
+              cancelWaitingTimer(roomForGrace);
+              fresh.status = 'aborted';
+              fresh.finishedAt = new Date();
+              await fresh.save();
 
-          io.to(socket.currentRoom).emit('game-aborted', {
-            reason: 'creator_left',
-            message: 'Room creator left. Game aborted. Bet refunded.',
-          });
+              const creator = await User.findById(fresh.players[0].user);
+              if (creator) {
+                const before = creator.balance;
+                creator.lockedBalance = Math.max(0, creator.lockedBalance - fresh.betAmount);
+                await creator.save();
+                await Transaction.create({
+                  user: creator._id,
+                  type: 'refund',
+                  amount: fresh.betAmount,
+                  balanceBefore: before,
+                  balanceAfter: creator.balance,
+                  status: 'completed',
+                  gameId: fresh._id,
+                });
+              }
 
-          return; // stop here — no 60s timer needed
+              io.to(roomForGrace).emit('game-aborted', {
+                reason: 'creator_left',
+                message: 'Room creator left. Game aborted. Bet refunded.',
+              });
+            } catch (e) {
+              console.error('waiting grace abort error:', e);
+            }
+          }, 20000); // 20s grace — long enough to cover a refresh, short enough to free the room
+
+          waitingGraceTimers.set(roomForGrace, graceTimer);
+          return; // don't run the active-game 60s logic below
         }
 
         // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
