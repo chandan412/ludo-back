@@ -426,7 +426,7 @@ module.exports = (io) => {
             currentTurn: game.currentTurn.toString(),
           });
 
-          // 2) Pass the turn ~1.8s later, so the dice number stays visible first.
+          // 2) Pass the turn ~1.5s later, so the dice number stays visible first.
           //    (The turn is already committed in the DB above; this only controls
           //    when the clients are told to clear the dice and move on.)
           const passRoom = roomCode;
@@ -437,7 +437,7 @@ module.exports = (io) => {
           };
           setTimeout(() => {
             io.to(passRoom).emit('turn-passed', passPayload);
-          }, 1800);
+          }, 1500);
           return;
         }
 
