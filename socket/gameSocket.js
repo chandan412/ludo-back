@@ -582,6 +582,62 @@ module.exports = (io) => {
     });
 
     // ============================
+    // forfeit: player intentionally exits an ACTIVE game (pressed the Exit button).
+    // The exiting player LOSES their bet and the opponent WINS immediately. Money is
+    // settled here and a game-over is broadcast to both players in real time.
+    // NOTE: this is NOT a network disconnect — a disconnect gives a 60s rejoin window
+    // and is handled separately in the disconnect handler below.
+    // ============================
+    socket.on('forfeit', async ({ roomCode }) => {
+      try {
+        // ✅ Atomic + membership guard in one step: only proceed if the game is still
+        // ACTIVE and this user is actually a player in it. Flipping to 'finished'
+        // atomically means a forfeit can NEVER double-settle (e.g. racing a normal
+        // win or a disconnect-timeout win) — whichever flips it first wins, the rest
+        // match nothing and no-op.
+        const game = await Game.findOneAndUpdate(
+          { roomCode: roomCode.toUpperCase(), status: 'active', 'players.user': socket.user._id },
+          { $set: { status: 'finished', finishedAt: new Date() } },
+          { new: true }
+        ).populate('players.user', 'username');
+
+        if (!game) return; // not an active game this player is in (already over, etc.)
+
+        const loserIdx  = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const winnerIdx = loserIdx === 0 ? 1 : 0;
+        const winnerId  = game.players[winnerIdx].user._id;
+        const loserId   = game.players[loserIdx].user._id;
+
+        const pot         = game.betAmount * 2;
+        const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+        const winAmount   = pot - platformFee;
+
+        game.winner      = winnerId;
+        game.loser       = loserId;
+        game.winAmount   = winAmount;
+        game.platformFee = platformFee;
+        await game.save();
+
+        // Same settlement as a normal win: loser loses their bet, winner gets pot − fee.
+        await settleGame(game, winnerId, loserId, winAmount, platformFee);
+
+        io.to(roomCode).emit('game-over', {
+          reason:      'forfeit',
+          winner:      { id: winnerId.toString(), username: game.players[winnerIdx].user.username },
+          loser:       { id: loserId.toString(),  username: game.players[loserIdx].user.username },
+          winAmount,
+          platformFee,
+          pot,
+        });
+
+        console.log(`Forfeit: ${game.players[loserIdx].user.username} exited, ${game.players[winnerIdx].user.username} wins ₹${winAmount}`);
+      } catch (err) {
+        console.error('forfeit error:', err);
+        socket.emit('error', { message: 'Failed to forfeit' });
+      }
+    });
+
+    // ============================
     // disconnect
     // ============================
     socket.on('disconnect', async () => {
@@ -601,6 +657,11 @@ module.exports = (io) => {
           .populate('players.user', 'username');
 
         if (!game) return;
+
+        // ✅ If the game is already over (player forfeited via Exit, or it finished
+        // normally), there is nothing to do on disconnect — don't fire a spurious
+        // "opponent disconnected" or start a 60s timer.
+        if (game.status !== 'waiting' && game.status !== 'active') return;
 
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
