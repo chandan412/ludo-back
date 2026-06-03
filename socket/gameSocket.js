@@ -406,12 +406,17 @@ module.exports = (io) => {
 
         const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
 
-        // No valid moves — pass turn instantly
+        // No valid moves — emit the rolled number, then pass the turn AFTER a short
+        // delay so both players can actually SEE the number on the dice. Previously
+        // 'turn-passed' was emitted in the same instant as 'dice-rolled', and the
+        // client's turn-passed handler cleared the dice immediately — so the number
+        // flashed for a few ms and the player never saw it on a no-move roll.
         if (validMoves.length === 0) {
           game.currentTurn  = opponentState.user._id;
           game.lastDiceRoll = null;
           await game.save();
 
+          // 1) Show the number to BOTH players right away.
           io.to(roomCode).emit('dice-rolled', {
             diceRoll,
             playerId: socket.user._id,
@@ -421,11 +426,18 @@ module.exports = (io) => {
             currentTurn: game.currentTurn.toString(),
           });
 
-          io.to(roomCode).emit('turn-passed', {
+          // 2) Pass the turn ~1.8s later, so the dice number stays visible first.
+          //    (The turn is already committed in the DB above; this only controls
+          //    when the clients are told to clear the dice and move on.)
+          const passRoom = roomCode;
+          const passPayload = {
             reason: 'No valid moves',
             nextTurn: opponentState.user._id.toString(),
             nextTurnUsername: opponentState.user.username,
-          });
+          };
+          setTimeout(() => {
+            io.to(passRoom).emit('turn-passed', passPayload);
+          }, 1800);
           return;
         }
 
