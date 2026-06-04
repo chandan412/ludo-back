@@ -361,9 +361,23 @@ module.exports = (io) => {
         const connectedCount = game.players.filter(p => p.isConnected).length;
         if (connectedCount >= 2) {
           cancelWaitingTimer(roomCode);
+
+          const creatorId    = game.players[0]?.user?._id?.toString();
+          const opponentName = game.players[1]?.user?.username;
+
           io.to(roomCode).emit('opponent-joined', {
             username: socket.user.username,
             message: 'Opponent joined! Game starting...',
+            roomCode,      // ✅ so a global "game started" banner knows which room to open
+            creatorId,     // ✅ so ONLY the creator shows the join banner (not the joiner)
+            opponentName,  // ✅ who just joined
+          });
+
+          // ✅ Tell the global chat this invite's room is now full → the matching
+          // invite card flips to green / "Accepted" for everyone in chat.
+          io.to(CHAT_ROOM).emit('invite-filled', {
+            roomCode,
+            acceptedBy: opponentName || socket.user.username,
           });
         }
 
