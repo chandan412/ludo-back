@@ -678,6 +678,28 @@ module.exports = (io) => {
     });
 
     // ============================
+    // player-away / player-back
+    // The client emits these on visibilitychange (app backgrounded / tab hidden,
+    // then returned) WHILE the socket is still alive. We use them to tell apart
+    // "stepped away, will be back" from a real network drop:
+    //   • away signalled  → a later disconnect is treated as "away" (calm)
+    //   • no away signal  → a disconnect is treated as "network" (Wi-Fi alarm)
+    // This changes ONLY the label/icon shown to the opponent — it does NOT touch
+    // isConnected, the 60s reconnect timer, or any money logic.
+    // ============================
+    socket.on('player-away', ({ roomCode } = {}) => {
+      socket._away = true;
+      const room = roomCode || socket.currentRoom;
+      if (room) socket.to(room).emit('opponent-away', { username: socket.user.username });
+    });
+
+    socket.on('player-back', ({ roomCode } = {}) => {
+      socket._away = false;
+      const room = roomCode || socket.currentRoom;
+      if (room) socket.to(room).emit('opponent-back', { username: socket.user.username });
+    });
+
+    // ============================
     // disconnect
     // ============================
     socket.on('disconnect', async () => {
@@ -762,9 +784,16 @@ module.exports = (io) => {
         game.players[playerIdx].isConnected = false;
         await game.save();
 
+        // ✅ Was this a deliberate "step away" (backgrounded, socket later dropped),
+        // or an unexpected network drop? Drives a calm "away" UI vs a Wi-Fi alarm on
+        // the opponent's screen. The 60s reconnect→forfeit window is identical either way.
+        const wasAway = socket._away === true;
         socket.to(socket.currentRoom).emit('player-disconnected', {
           username: socket.user.username,
-          message: `${socket.user.username} disconnected. Waiting 60 seconds for reconnect...`,
+          reason: wasAway ? 'away' : 'network',
+          message: wasAway
+            ? `${socket.user.username} stepped away. Waiting 60s...`
+            : `${socket.user.username} lost connection. Waiting 60s for reconnect...`,
         });
 
         const timer = setTimeout(async () => {
