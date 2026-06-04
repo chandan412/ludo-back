@@ -10,6 +10,28 @@ const roomTimers = new Map(); // tracks 2-min auto-abort timers
 const waitingGraceTimers = new Map(); // brief grace window so a refresh doesn't abort a waiting room
 
 // ============================
+// Per-room lock — serializes game-mutating handlers (roll-dice, move-token)
+// so two events on the same room can never read-modify-save concurrently.
+// This is what prevents the Mongoose "VersionError: No matching document...version N"
+// crash and any double-move from a double-tap: the second event waits, then reads the
+// already-updated game and harmlessly no-ops instead of racing the first save.
+// ============================
+const roomLocks = new Map(); // roomCode -> tail promise
+
+function withRoomLock(roomCode, fn) {
+  const key = String(roomCode || '').toUpperCase();
+  const prev = roomLocks.get(key) || Promise.resolve();
+  const result = prev.then(() => fn());
+  const tail = result.catch(() => {}); // never rejects — keeps the chain alive
+  roomLocks.set(key, tail);
+  // drop the map entry once nothing else is queued behind us (prevents leak)
+  tail.then(() => {
+    if (roomLocks.get(key) === tail) roomLocks.delete(key);
+  });
+  return result;
+}
+
+// ============================
 // CHAT setup (shared global chat room)
 // ============================
 const CHAT_ROOM = 'global-chat';
@@ -355,6 +377,7 @@ module.exports = (io) => {
     // roll-dice
     // ============================
     socket.on('roll-dice', async ({ roomCode }) => {
+      await withRoomLock(roomCode, async () => {
       try {
         const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
           .populate('players.user', 'username');
@@ -460,12 +483,14 @@ module.exports = (io) => {
         console.error('roll-dice error:', err);
         socket.emit('error', { message: 'Server error' });
       }
+      });
     });
 
     // ============================
     // move-token
     // ============================
     socket.on('move-token', async ({ roomCode, tokenIndex }) => {
+      await withRoomLock(roomCode, async () => {
       try {
         const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
           .populate('players.user', 'username');
@@ -579,6 +604,7 @@ module.exports = (io) => {
         console.error('move-token error:', err);
         socket.emit('error', { message: 'Server error' });
       }
+      });
     });
 
     // ============================
