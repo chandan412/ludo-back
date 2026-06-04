@@ -285,6 +285,23 @@ module.exports = (io) => {
     });
 
     // ============================
+    // delete-chat: ADMIN ONLY. Permanently removes a chat message for everyone.
+    // The admin check is enforced HERE on the server (socket.user.role), so even a
+    // forged event from a non-admin client is ignored. On success we broadcast
+    // 'chat-deleted' so every connected client removes the message live.
+    // ============================
+    socket.on('delete-chat', async ({ messageId } = {}) => {
+      try {
+        if (!socket.user || socket.user.role !== 'admin') return; // only admins may delete
+        if (!messageId) return;
+        await ChatMessage.findByIdAndDelete(messageId);
+        io.to(CHAT_ROOM).emit('chat-deleted', { messageId: messageId.toString() });
+      } catch (err) {
+        console.error('delete-chat error:', err);
+      }
+    });
+
+    // ============================
     // created-room: fired by creator right after creating a game
     // Starts the 2-minute waiting countdown
     // ============================
