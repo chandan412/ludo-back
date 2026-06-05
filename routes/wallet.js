@@ -65,6 +65,14 @@ router.post('/recharge-request', auth, async (req, res) => {
     const { amount, paymentNote } = req.body;
     if (!amount || amount < 10)
       return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
+
+    // ✅ One pending deposit at a time — mirror of the withdrawal guard below.
+    // A player can't stack multiple deposit requests; they must wait for the
+    // current one to be approved/rejected first.
+    const pending = await Transaction.findOne({ user: req.user._id, type: 'recharge', status: 'pending' });
+    if (pending)
+      return res.status(400).json({ message: 'You already have a pending deposit request. Please wait for it to be processed.' });
+
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'recharge',
