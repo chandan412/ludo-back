@@ -90,6 +90,17 @@ function startWaitingTimer(io, roomCode) {
         reason: 'no_opponent',
         message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
       });
+
+      // ✅ Flip this game's chat invite card to "expired" for everyone, permanently.
+      try {
+        await ChatMessage.findOneAndUpdate(
+          { type: 'invite', roomCode: String(roomCode).toUpperCase() },
+          { $set: { status: 'expired' } }
+        );
+        io.to(CHAT_ROOM).emit('invite-expired', { roomCode });
+      } catch (e) {
+        console.error('invite-expire (timeout) error:', e);
+      }
     } catch (err) {
       console.error('Auto-abort error:', err);
     } finally {
@@ -396,6 +407,17 @@ module.exports = (io) => {
             roomCode,
             acceptedBy: opponentName || socket.user.username,
           });
+
+          // ✅ Persist accepted status so the card stays "Accepted" after a refresh.
+          // Matched by the invite's stored (uppercase) roomCode. Non-fatal.
+          try {
+            await ChatMessage.findOneAndUpdate(
+              { type: 'invite', roomCode: String(roomCode).toUpperCase() },
+              { $set: { status: 'accepted' } }
+            );
+          } catch (e) {
+            console.error('invite-accept persist error:', e);
+          }
         }
 
         console.log(`${socket.user.username} joined room ${roomCode}`);
@@ -788,6 +810,17 @@ module.exports = (io) => {
                 reason: 'creator_left',
                 message: 'Room creator left. Game aborted. Bet refunded.',
               });
+
+              // ✅ Expire this game's chat invite card too, permanently.
+              try {
+                await ChatMessage.findOneAndUpdate(
+                  { type: 'invite', roomCode: String(roomForGrace).toUpperCase() },
+                  { $set: { status: 'expired' } }
+                );
+                io.to(CHAT_ROOM).emit('invite-expired', { roomCode: roomForGrace });
+              } catch (e) {
+                console.error('invite-expire (grace) error:', e);
+              }
             } catch (e) {
               console.error('waiting grace abort error:', e);
             }
