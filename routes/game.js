@@ -7,6 +7,14 @@ const { auth } = require('../middleware/auth');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
+// Fresh set of 4 home tokens for a new player
+const freshTokens = () => ([
+  { position: -1, isHome: true, isFinished: false },
+  { position: -1, isHome: true, isFinished: false },
+  { position: -1, isHome: true, isFinished: false },
+  { position: -1, isHome: true, isFinished: false }
+]);
+
 // GET /api/game/lobby
 router.get('/lobby', auth, async (req, res) => {
   try {
@@ -74,6 +82,9 @@ router.get('/my-games/history', auth, async (req, res) => {
 });
 
 // POST /api/game/create
+// Auto-match first: if another player already has a WAITING room at the SAME bet,
+// join it atomically and start the match. Otherwise open a new waiting room
+// (original behaviour, fully preserved).
 router.post('/create', auth, async (req, res) => {
   try {
     const { betAmount } = req.body;
@@ -92,6 +103,66 @@ router.post('/create', auth, async (req, res) => {
     if (existingGame)
       return res.status(400).json({ message: 'You already have an active game' });
 
+    // ── AUTO-MATCH ──────────────────────────────────────────────────────────
+    // Atomically claim the OLDEST waiting room at this bet from another player by
+    // flipping waiting → active. Document-level atomicity means only ONE concurrent
+    // request can win this flip; any racing creator gets `null` and falls through
+    // to open its own room below. No money is touched by this step.
+    const claimed = await Game.findOneAndUpdate(
+      { status: 'waiting', betAmount, createdBy: { $ne: req.user._id } },
+      { $set: { status: 'active', startedAt: new Date() } },
+      { new: true, sort: { createdAt: 1 } } // FIFO — oldest waiter matched first
+    );
+
+    if (claimed) {
+      try {
+        // We now exclusively own this room. Add ourselves as player 2 via the SAME
+        // full-document save path the join route uses, so subdocument defaults
+        // (isConnected:false, finishedTokens:0, token defaults) are applied exactly
+        // the same way. (Deliberately NOT using $push, which can skip those defaults.)
+        claimed.players.push({
+          user: req.user._id,
+          color: 'blue',
+          tokens: freshTokens()
+        });
+        claimed.currentTurn = claimed.players[0].user; // creator takes the first turn
+        await claimed.save();
+
+        // Lock our bet AFTER the game is safely active with 2 players.
+        // (Only ever touch lockedBalance — never balance.)
+        user.lockedBalance += betAmount;
+        await user.save();
+      } catch (matchErr) {
+        // Self-heal: undo the player add and release the room back to 'waiting'
+        // so the creator's 2-min timer resumes and refunds normally. Then ask the
+        // caller to retry — we do NOT silently fall through (avoids any double-lock).
+        console.error('auto-match finalize error:', matchErr);
+        try {
+          claimed.players = claimed.players.filter(
+            p => p.user.toString() !== req.user._id.toString()
+          );
+          claimed.status = 'waiting';
+          claimed.startedAt = null;
+          claimed.currentTurn = null;
+          await claimed.save();
+        } catch (revertErr) {
+          console.error('auto-match revert error:', revertErr);
+        }
+        return res.status(500).json({ message: 'Match failed, please try again' });
+      }
+
+      // Non-fatal: populate for the response. Even if this throws, the match is
+      // already committed (game active + balance locked), so don't unwind.
+      try { await claimed.populate('players.user', 'username'); } catch (e) {}
+
+      return res.status(200).json({
+        matched: true,
+        message: 'Opponent found! Match starting.',
+        game: claimed,
+      });
+    }
+
+    // ── No match → open a new waiting room (ORIGINAL behaviour) ───────────────
     user.lockedBalance += betAmount;
     await user.save();
 
@@ -103,17 +174,16 @@ router.post('/create', auth, async (req, res) => {
       players: [{
         user: req.user._id,
         color: 'red',
-        tokens: [
-          { position: -1, isHome: true, isFinished: false },
-          { position: -1, isHome: true, isFinished: false },
-          { position: -1, isHome: true, isFinished: false },
-          { position: -1, isHome: true, isFinished: false }
-        ]
+        tokens: freshTokens()
       }]
     });
 
     await game.populate('createdBy', 'username');
-    res.status(201).json({ message: 'Game created! Share the room code.', game });
+    res.status(201).json({
+      matched: false,
+      message: 'Game created! Share the room code.',
+      game
+    });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
