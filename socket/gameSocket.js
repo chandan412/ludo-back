@@ -1,466 +1,892 @@
-import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import axios from 'axios';
-import toast from 'react-hot-toast';
-import { useAuth } from '../context/AuthContext';
-import Nav from '../components/Nav';
-import { getSocket } from '../socket/socket'; // ✅ use your existing singleton
+const mongoose = require('mongoose');
+const Game = require('../models/Game');
+const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const LudoEngine = require('./ludoEngine');
+const jwt = require('jsonwebtoken');
 
-const BET_AMOUNTS = [50, 100, 200, 500, 1000, 2000, 5000];
+const activeRooms = new Map();
+const roomTimers = new Map(); // tracks 2-min auto-abort timers
+const waitingGraceTimers = new Map(); // brief grace window so a refresh doesn't abort a waiting room
 
-export default function Lobby() {
-  const { user, refreshUser } = useAuth();
-  const navigate = useNavigate();
+// ============================
+// Per-room lock — serializes game-mutating handlers (roll-dice, move-token)
+// so two events on the same room can never read-modify-save concurrently.
+// This is what prevents the Mongoose "VersionError: No matching document...version N"
+// crash and any double-move from a double-tap: the second event waits, then reads the
+// already-updated game and harmlessly no-ops instead of racing the first save.
+// ============================
+const roomLocks = new Map(); // roomCode -> tail promise
 
-  const [openGames, setOpenGames]           = useState([]);
-  const [activeGame, setActiveGame]         = useState(null);
-  const [loading, setLoading]               = useState(true);
-  const [creating, setCreating]             = useState(false);
-  const [joining, setJoining]               = useState(null);
-  const [cancelling, setCancelling]         = useState(false);
-  const [betAmount, setBetAmount]           = useState(100);
-  const [customBet, setCustomBet]           = useState('');
-  const [roomCode, setRoomCode]             = useState('');
-  const [tab, setTab]                       = useState('browse');
-  const [waitingSeconds, setWaitingSeconds] = useState(null); // ✅ live countdown
+function withRoomLock(roomCode, fn) {
+  const key = String(roomCode || '').toUpperCase();
+  const prev = roomLocks.get(key) || Promise.resolve();
+  const result = prev.then(() => fn());
+  const tail = result.catch(() => {}); // never rejects — keeps the chain alive
+  roomLocks.set(key, tail);
+  // drop the map entry once nothing else is queued behind us (prevents leak)
+  tail.then(() => {
+    if (roomLocks.get(key) === tail) roomLocks.delete(key);
+  });
+  return result;
+}
 
-  const available = (user?.balance || 0) - (user?.lockedBalance || 0);
+// ============================
+// CHAT setup (shared global chat room)
+// ============================
+const CHAT_ROOM = 'global-chat';
+const chatSockets = new Set(); // socket ids currently in chat — used for the online count
 
-  // ============================
-  // Socket listeners
-  // ============================
-  useEffect(() => {
-    const socket = getSocket();
-    if (!socket) return;
+// Shared chat message model (same one routes/chat.js reads history from).
+const ChatMessage = require('../models/ChatMessage');
 
-    // ✅ Live 2-min countdown from server
-    socket.on('waiting-countdown', ({ secondsLeft }) => {
-      setWaitingSeconds(secondsLeft);
+// ============================
+// Helper: Start 2-min waiting timer with live countdown
+// ============================
+function startWaitingTimer(io, roomCode) {
+  const WAIT_DURATION = 2 * 60 * 1000; // 2 minutes
+  let remainingSeconds = 120;
+
+  // Emit countdown every second
+  const tickInterval = setInterval(() => {
+    remainingSeconds -= 1;
+    io.to(roomCode).emit('waiting-countdown', {
+      secondsLeft: remainingSeconds,
+      message: `Waiting for opponent... ${remainingSeconds}s`,
     });
+    if (remainingSeconds <= 0) clearInterval(tickInterval);
+  }, 1000);
 
-    // ✅ Game aborted — no opponent OR creator left
-    socket.on('game-aborted', ({ message }) => {
-      setActiveGame(null);
-      setWaitingSeconds(null);
-      refreshUser();
-      toast.error(message || 'Game aborted. Bet refunded.', { duration: 5000 });
-    });
-
-    // ✅ Opponent joined — clear countdown
-    socket.on('opponent-joined', ({ username }) => {
-      setWaitingSeconds(null);
-      toast.success(`${username} joined! Starting game...`);
-    });
-
-    return () => {
-      // ✅ Only remove these listeners — don't kill the shared socket
-      socket.off('waiting-countdown');
-      socket.off('game-aborted');
-      socket.off('opponent-joined');
-    };
-  }, []);
-
-  // ============================
-  // If user already has a waiting game on Lobby load,
-  // rejoin its socket room so countdown keeps ticking
-  // ============================
-  useEffect(() => {
-    const socket = getSocket();
-    if (!socket || !activeGame) return;
-    if (activeGame.status === 'waiting') {
-      socket.emit('join-room', { roomCode: activeGame.roomCode });
-    }
-  }, [activeGame]);
-
-  // ============================
-  // Data fetching
-  // ============================
-  useEffect(() => {
-    fetchGames();
-    fetchActiveGame();
-    refreshUser();
-    const interval = setInterval(fetchGames, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const fetchGames = async () => {
+  // Auto-abort after 2 minutes
+  const abortTimer = setTimeout(async () => {
+    clearInterval(tickInterval);
     try {
-      const res = await axios.get('/api/game/lobby');
-      setOpenGames(res.data);
-    } catch (err) {}
-    finally { setLoading(false); }
-  };
+      const game = await Game.findOne({ roomCode, status: 'waiting' });
+      if (!game) return; // already started or aborted
 
-  const fetchActiveGame = async () => {
-    try {
-      const res = await axios.get('/api/game/my-games/history');
-      const found = res.data.find(
-        g => g.status === 'waiting' || g.status === 'active'
-      );
-      setActiveGame(found || null);
-    } catch (err) {
-      console.error('fetchActiveGame error:', err);
-    }
-  };
+      game.status = 'aborted';
+      game.finishedAt = new Date();
+      await game.save();
 
-  // ============================
-  // Actions
-  // ============================
-  const handleCancelGame = async () => {
-    if (!activeGame) return;
-    setCancelling(true);
-    try {
-      await axios.post(`/api/game/cancel/${activeGame.roomCode}`);
-      setActiveGame(null);
-      setWaitingSeconds(null);
-      refreshUser();
-      toast.success('Game cancelled. Bet refunded.');
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Cannot cancel this game');
-    } finally {
-      setCancelling(false);
-    }
-  };
+      // Refund creator
+      const creator = await User.findById(game.players[0].user);
+      if (creator) {
+        const before = creator.balance;
+        creator.lockedBalance = Math.max(0, creator.lockedBalance - game.betAmount);
+        await creator.save();
 
-  const handleCreate = async () => {
-    if (activeGame) {
-      toast.error('You already have an active game!', { icon: '⚠️' });
-      return;
-    }
-    const amount = customBet ? parseFloat(customBet) : betAmount;
-    if (!amount || amount < 10) return toast.error('Minimum bet is ₹10');
-    if (amount > available) return toast.error(`Insufficient balance. Available: ₹${available}`);
-
-    setCreating(true);
-    try {
-      const res = await axios.post('/api/game/create', { betAmount: amount });
-      const newRoomCode = res.data.game.roomCode;
-
-      // ✅ Tell server this socket is the creator → starts 2-min timer on backend
-      const socket = getSocket();
-      if (socket) {
-        socket.emit('created-room', { roomCode: newRoomCode });
-        // ✅ Also post this game as an invite card into the global chat, so players
-        // browsing chat can see it and join. (Same event GameChat uses.)
-        socket.emit('send-invite', { betAmount: amount, roomCode: newRoomCode });
+        await Transaction.create({
+          user: creator._id,
+          type: 'refund',
+          amount: game.betAmount,
+          balanceBefore: before,
+          balanceAfter: creator.balance,
+          status: 'completed',
+          gameId: game._id,
+        });
       }
 
-      toast.success(`Room created! Code: ${newRoomCode}`);
-      navigate(`/game/${newRoomCode}`);
+      io.to(roomCode).emit('game-aborted', {
+        reason: 'no_opponent',
+        message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
+      });
     } catch (err) {
-      const msg = err.response?.data?.message || 'Failed to create game';
-      toast.error(msg);
-      if (msg.toLowerCase().includes('active game')) fetchActiveGame();
+      console.error('Auto-abort error:', err);
     } finally {
-      setCreating(false);
+      roomTimers.delete(roomCode);
     }
-  };
+  }, WAIT_DURATION);
 
-  const handleJoin = async (code) => {
-    setJoining(code);
-    try {
-      const res = await axios.post(`/api/game/join/${code}`);
-      toast.success('Joined! Game starting...');
-      navigate(`/game/${res.data.game.roomCode}`);
-    } catch (err) {
-      toast.error(err.response?.data?.message || 'Failed to join game');
-    } finally {
-      setJoining(null);
-    }
-  };
-
-  const handleJoinByCode = async (e) => {
-    e.preventDefault();
-    if (!roomCode.trim()) return toast.error('Enter room code');
-    handleJoin(roomCode.trim().toUpperCase());
-  };
-
-  // ============================
-  // Countdown display  e.g. 87 → "1:27"
-  // ============================
-  const formatCountdown = (secs) => {
-    if (secs === null || secs === undefined) return null;
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${m}:${s.toString().padStart(2, '0')}`;
-  };
-
-  // ============================
-  // Render
-  // ============================
-  return (
-    <div style={{ paddingBottom: 'calc(72px + env(safe-area-inset-bottom))' }}>
-      <Nav />
-      <div className="page">
-        <div style={{ marginTop: 20, marginBottom: 20 }} className="fade-in">
-          <div style={{ fontSize: 13, color: 'var(--text-muted)', fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase' }}>Game Lobby</div>
-          <h2 className="title-display" style={{ fontSize: 30, marginTop: 4, letterSpacing: '-0.03em' }}>
-            Find your match
-          </h2>
-          <p style={{ color: 'var(--text-soft)', marginTop: 6, fontSize: 14 }}>
-            Balance: <strong style={{ color: 'var(--gold)' }}>₹{available.toFixed(0)}</strong>
-          </p>
-        </div>
-
-        {/* ============================
-            Active Game Banner
-        ============================ */}
-        {activeGame && (
-          <div style={{
-            background: activeGame.status === 'active'
-              ? 'linear-gradient(135deg, rgba(39,174,96,0.2) 0%, rgba(39,174,96,0.05) 100%)'
-              : 'linear-gradient(135deg, rgba(241,196,15,0.2) 0%, rgba(241,196,15,0.05) 100%)',
-            border: `2px solid ${activeGame.status === 'active' ? 'var(--green)' : 'var(--yellow)'}`,
-            borderRadius: 14,
-            padding: '14px 16px',
-            marginBottom: 16,
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
-              <div style={{ flex: 1 }}>
-                {/* Status dot + label */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                  <div style={{
-                    width: 9, height: 9, borderRadius: '50%',
-                    background: activeGame.status === 'active' ? 'var(--green)' : 'var(--yellow)',
-                    animation: 'pulse 1.5s infinite',
-                  }} />
-                  <span style={{ fontWeight: 800, fontSize: 14, color: activeGame.status === 'active' ? 'var(--green)' : 'var(--yellow)' }}>
-                    {activeGame.status === 'active' ? '🟢 Game in Progress' : '⏳ Waiting for Opponent'}
-                  </span>
-                </div>
-
-                {/* Room + bet */}
-                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                  Room: <strong style={{ color: 'var(--text)', letterSpacing: 2 }}>{activeGame.roomCode}</strong>
-                  {' • '}
-                  Bet: <strong style={{ color: 'var(--yellow)' }}>₹{activeGame.betAmount}</strong>
-                </div>
-
-                {/* ✅ Live countdown + progress bar */}
-                {activeGame.status === 'waiting' && waitingSeconds !== null && (
-                  <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-                      Auto-cancels in
-                    </span>
-                    <span style={{
-                      fontWeight: 800,
-                      fontSize: 14,
-                      fontVariantNumeric: 'tabular-nums',
-                      color: waitingSeconds <= 30 ? 'var(--red)' : 'var(--yellow)',
-                      minWidth: 36,
-                    }}>
-                      {formatCountdown(waitingSeconds)}
-                    </span>
-                    <div style={{ flex: 1, height: 5, background: 'var(--border)', borderRadius: 4, overflow: 'hidden' }}>
-                      <div style={{
-                        height: '100%',
-                        width: `${(waitingSeconds / 120) * 100}%`,
-                        background: waitingSeconds <= 30 ? 'var(--red)' : 'var(--yellow)',
-                        borderRadius: 4,
-                        transition: 'width 1s linear, background 0.3s',
-                      }} />
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Buttons */}
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button
-                  className="btn btn-green btn-sm"
-                  onClick={() => navigate(`/game/${activeGame.roomCode}`)}
-                  style={{ fontWeight: 800 }}
-                >
-                  ▶ {activeGame.status === 'active' ? 'Rejoin' : 'Enter Room'}
-                </button>
-                {activeGame.status === 'waiting' && (
-                  <button className="btn btn-red btn-sm" onClick={handleCancelGame} disabled={cancelling}>
-                    {cancelling ? '...' : '✕ Cancel'}
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Tab Switcher */}
-        <div style={{ display: 'flex', gap: 4, marginBottom: 20, background: 'var(--surface)', borderRadius: 'var(--r-md)', padding: 4, border: '1px solid var(--border)' }}>
-          {[['browse', 'Browse', '🏆'], ['create', 'Create', '➕'], ['join', 'Join', '🔑']].map(([key, label, icon]) => (
-            <button key={key} onClick={() => setTab(key)}
-              style={{
-                flex: 1, padding: '10px 6px', border: 'none', borderRadius: 'var(--r-sm)',
-                cursor: 'pointer', fontWeight: 700, fontSize: 13,
-                transition: 'all 0.2s',
-                background: tab === key ? 'var(--grad-gold)' : 'transparent',
-                color: tab === key ? '#1A1A2E' : 'var(--text-muted)',
-                boxShadow: tab === key ? '0 2px 8px rgba(244,196,48,0.3)' : 'none',
-              }}>
-              <span style={{ marginRight: 6 }}>{icon}</span>{label}
-            </button>
-          ))}
-        </div>
-
-        {/* Browse Tab */}
-        {tab === 'browse' && (
-          <div>
-            {loading ? (
-              <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}>Loading games...</div>
-            ) : openGames.length === 0 ? (
-              <div className="card" style={{ textAlign: 'center', padding: 40 }}>
-                <div style={{ fontSize: 48, marginBottom: 12 }}>🎲</div>
-                <div style={{ fontWeight: 700, marginBottom: 8 }}>No open games right now</div>
-                <p style={{ color: 'var(--text-muted)', marginBottom: 20, fontSize: 14 }}>Create a game and wait for an opponent!</p>
-                <button className="btn btn-primary" onClick={() => setTab('create')}>Create Game</button>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {openGames.map(game => (
-                  <div key={game._id} className="card card-hover" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 16 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, flex: 1, minWidth: 0 }}>
-                      <div style={{
-                        width: 44, height: 44, borderRadius: 12,
-                        background: 'var(--grad-gold)',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        color: '#1A1A2E', fontWeight: 800, fontSize: 14,
-                        flexShrink: 0,
-                        boxShadow: '0 4px 12px rgba(244,196,48,0.25)',
-                      }}>
-                        {game.createdBy?.username?.charAt(0).toUpperCase()}
-                      </div>
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                          <span style={{ fontWeight: 800, fontSize: 18, fontFeatureSettings: '"tnum"' }}>₹{game.betAmount}</span>
-                          <span className="pill pill-green">WIN +₹{Math.floor(game.betAmount * 0.95)}</span>
-                        </div>
-                        <div style={{ fontSize: 12, color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          <strong style={{ color: 'var(--text-soft)' }}>{game.createdBy?.username}</strong> · {game.createdBy?.gamesWon}W/{game.createdBy?.gamesPlayed}P
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={() => handleJoin(game.roomCode)}
-                      disabled={joining === game.roomCode || game.betAmount > available}
-                      style={{ flexShrink: 0 }}
-                    >
-                      {joining === game.roomCode ? '...' : game.betAmount > available ? 'Low ₹' : 'Join'}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Create Tab */}
-        {tab === 'create' && (
-          <div className="card">
-            {activeGame ? (
-              <div style={{ textAlign: 'center', padding: '20px 0' }}>
-                <div style={{ fontSize: 40, marginBottom: 12 }}>⚠️</div>
-                <div style={{ fontWeight: 800, fontSize: 16, marginBottom: 8 }}>You already have an active game</div>
-                <p style={{ color: 'var(--text-muted)', fontSize: 14, marginBottom: 20 }}>
-                  Finish or cancel your current game before creating a new one.
-                </p>
-                <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
-                  <button className="btn btn-green" onClick={() => navigate(`/game/${activeGame.roomCode}`)} style={{ fontWeight: 800 }}>
-                    ▶ {activeGame.status === 'active' ? 'Rejoin Game' : 'Enter Room'}
-                  </button>
-                  {activeGame.status === 'waiting' && (
-                    <button className="btn btn-red" onClick={handleCancelGame} disabled={cancelling}>
-                      {cancelling ? 'Cancelling...' : '✕ Cancel Game'}
-                    </button>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <>
-                <h4 style={{ marginBottom: 14, fontWeight: 700, fontSize: 16 }}>Choose Bet Amount</h4>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 16 }}>
-                  {BET_AMOUNTS.map(a => {
-                    const isSelected = betAmount === a && !customBet;
-                    return (
-                      <button key={a} onClick={() => { setBetAmount(a); setCustomBet(''); }}
-                        style={{
-                          padding: '14px 8px',
-                          display: 'flex', flexDirection: 'column', gap: 2,
-                          background: isSelected ? 'var(--grad-gold)' : 'var(--surface)',
-                          color: isSelected ? '#1A1A2E' : 'var(--text)',
-                          border: isSelected ? '1px solid transparent' : '1px solid var(--border)',
-                          borderRadius: 'var(--r-md)',
-                          cursor: 'pointer',
-                          transition: 'all 0.2s',
-                          fontFamily: 'inherit',
-                          boxShadow: isSelected ? '0 4px 16px rgba(244,196,48,0.35)' : 'none',
-                        }}>
-                        <span style={{ fontWeight: 800, fontSize: 17, fontFeatureSettings: '"tnum"' }}>₹{a}</span>
-                        <span style={{ fontSize: 11, opacity: 0.75, fontWeight: 600 }}>Win +₹{Math.floor(a * 0.95)}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Custom amount</label>
-                  <input className="form-input" type="number" placeholder="Min ₹10" value={customBet} onChange={e => setCustomBet(e.target.value)} min={10} />
-                </div>
-                <div style={{ background: 'var(--grad-gold-soft)', border: '1px solid var(--border-gold)', borderRadius: 'var(--r-md)', padding: 14, marginBottom: 16, fontSize: 14 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <span style={{ color: 'var(--text-soft)' }}>Your bet</span>
-                    <span style={{ fontWeight: 700 }}>₹{customBet || betAmount}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <span style={{ color: 'var(--text-soft)' }}>Opponent's bet</span>
-                    <span style={{ fontWeight: 700 }}>₹{customBet || betAmount}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                    <span style={{ color: 'var(--text-soft)' }}>Platform fee (5%)</span>
-                    <span style={{ color: 'var(--red)', fontWeight: 700 }}>-₹{Math.floor((customBet || betAmount) * 0.05)}</span>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid var(--border-gold)', paddingTop: 8, marginTop: 4 }}>
-                    <span style={{ color: 'var(--text)', fontWeight: 700 }}>Net win</span>
-                    <span style={{ color: 'var(--green)', fontWeight: 800, fontSize: 16 }}>+₹{Math.floor((customBet || betAmount) * 0.95)}</span>
-                  </div>
-                </div>
-                <button className="btn btn-primary btn-lg btn-full" onClick={handleCreate} disabled={creating || (customBet || betAmount) > available}>
-                  {creating ? 'Creating...' : available < (customBet || betAmount) ? 'Insufficient Balance' : `▶ Create Game · ₹${customBet || betAmount}`}
-                </button>
-                {available < 100 && (
-                  <p style={{ textAlign: 'center', marginTop: 12, fontSize: 13, color: 'var(--text-muted)' }}>
-                    Low balance? <a href="/wallet" style={{ color: 'var(--gold)' }}>Add money →</a>
-                  </p>
-                )}
-              </>
-            )}
-          </div>
-        )}
-
-        {/* Join Tab */}
-        {tab === 'join' && (
-          <div className="card">
-            <h4 style={{ marginBottom: 8, fontWeight: 800 }}>Join with Room Code</h4>
-            <p style={{ color: 'var(--text-muted)', fontSize: 14, marginBottom: 20 }}>Ask your friend for their room code</p>
-            <form onSubmit={handleJoinByCode}>
-              <div className="form-group">
-                <label className="form-label">Room Code</label>
-                <input className="form-input" type="text" placeholder="e.g. ABC123" value={roomCode}
-                  onChange={e => setRoomCode(e.target.value.toUpperCase())} maxLength={6}
-                  style={{ letterSpacing: 4, fontWeight: 800, fontSize: 20, textAlign: 'center' }} required />
-              </div>
-              <button className="btn btn-primary btn-full" type="submit" disabled={!!joining}>
-                {joining ? 'Joining...' : 'Join Game'}
-              </button>
-            </form>
-          </div>
-        )}
-      </div>
-
-      <style>{`
-        @keyframes pulse {
-          0%   { opacity: 1; transform: scale(1); }
-          50%  { opacity: 0.5; transform: scale(1.4); }
-          100% { opacity: 1; transform: scale(1); }
-        }
-      `}</style>
-    </div>
-  );
+  roomTimers.set(roomCode, { abortTimer, tickInterval });
 }
+
+// ============================
+// Helper: Cancel waiting timer (when opponent joins)
+// ============================
+function cancelWaitingTimer(roomCode) {
+  const timers = roomTimers.get(roomCode);
+  if (timers) {
+    clearTimeout(timers.abortTimer);
+    clearInterval(timers.tickInterval);
+    roomTimers.delete(roomCode);
+  }
+}
+
+// ============================
+// Helper: Settle game finances
+// ============================
+async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
+  try {
+    const winner = await User.findById(winnerId);
+    const loser  = await User.findById(loserId);
+
+    winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
+    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
+    loser.balance        = Math.max(0, loser.balance - game.betAmount);
+
+    const winnerBalanceBefore = winner.balance;
+    const netWin = game.betAmount - platformFee;
+    winner.balance     += netWin;
+    winner.gamesWon    += 1;
+    winner.gamesPlayed += 1;
+    winner.totalEarned += netWin;
+    loser.gamesPlayed  += 1;
+    loser.totalLost    += game.betAmount;
+
+    await winner.save();
+    await loser.save();
+
+    await Transaction.create({
+      user: winnerId,
+      type: 'game_win',
+      amount: netWin,
+      balanceBefore: winnerBalanceBefore,
+      balanceAfter:  winner.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    const loserBalanceBefore = loser.balance + game.betAmount;
+    await Transaction.create({
+      user: loserId,
+      type: 'game_loss',
+      amount: game.betAmount,
+      balanceBefore: loserBalanceBefore,
+      balanceAfter:  loser.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    await Transaction.create({
+      user: winnerId,
+      type: 'platform_fee',
+      amount: platformFee,
+      balanceBefore: winner.balance,
+      balanceAfter:  winner.balance,
+      status: 'completed',
+      gameId: game._id,
+    });
+
+    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
+  } catch (err) {
+    console.error('Game settlement error:', err);
+  }
+}
+
+// ============================
+// Helper: Sanitize game object for client
+// ============================
+function sanitizeGame(game, userId) {
+  const gameObj = game.toObject ? game.toObject() : game;
+  return {
+    ...gameObj,
+    currentTurn: gameObj.currentTurn?.toString(),
+    myColor: gameObj.players.find(p => p.user._id?.toString() === userId?.toString())?.color,
+  };
+}
+
+// ============================
+// Main socket module
+// ============================
+module.exports = (io) => {
+
+  // Auth middleware
+  io.use(async (socket, next) => {
+    try {
+      const token = socket.handshake.auth.token;
+      if (!token) return next(new Error('Authentication required'));
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const user = await User.findById(decoded.id).select('-password');
+      if (!user || user.isBanned) return next(new Error('Unauthorized'));
+      socket.user = user;
+      next();
+    } catch (err) {
+      next(new Error('Invalid token'));
+    }
+  });
+
+  io.on('connection', (socket) => {
+    console.log(`User connected: ${socket.user.username} (${socket.id})`);
+
+    // ============================
+    // CHAT: join / leave / send / invite / invite-accepted
+    // Shared global chat room — independent of game rooms, touches no game logic.
+    // ============================
+    const broadcastChatCount = () => {
+      io.to(CHAT_ROOM).emit('chat-online-count', { count: chatSockets.size });
+    };
+
+    socket.on('join-chat', () => {
+      socket.join(CHAT_ROOM);
+      chatSockets.add(socket.id);
+      broadcastChatCount();
+    });
+
+    socket.on('leave-chat', () => {
+      socket.leave(CHAT_ROOM);
+      chatSockets.delete(socket.id);
+      broadcastChatCount();
+    });
+
+    // Plain text message → save + broadcast to everyone in chat
+    socket.on('send-chat', async ({ text }) => {
+      try {
+        const clean = (text || '').toString().trim().slice(0, 200);
+        if (!clean) return;
+        const msg = await ChatMessage.create({
+          userId:   socket.user._id,
+          username: socket.user.username,
+          type:     'chat',
+          text:     clean,
+        });
+        io.to(CHAT_ROOM).emit('chat-message', {
+          _id:       msg._id.toString(),
+          userId:    socket.user._id.toString(),
+          username:  socket.user.username,
+          type:      'chat',
+          text:      clean,
+          createdAt: msg.createdAt,
+        });
+      } catch (err) {
+        console.error('send-chat error:', err);
+      }
+    });
+
+    // Challenge / invite card → save + broadcast so others can tap Accept
+    socket.on('send-invite', async ({ betAmount, roomCode }) => {
+      try {
+        const amount = Number(betAmount) || 0;
+        if (amount < 10 || !roomCode) return;
+        const msg = await ChatMessage.create({
+          userId:    socket.user._id,
+          username:  socket.user.username,
+          type:      'invite',
+          betAmount: amount,
+          roomCode:  roomCode,
+          text:      '',
+        });
+        io.to(CHAT_ROOM).emit('chat-message', {
+          _id:       msg._id.toString(),
+          userId:    socket.user._id.toString(),
+          username:  socket.user.username,
+          type:      'invite',
+          betAmount: amount,
+          roomCode:  roomCode,
+          createdAt: msg.createdAt,
+        });
+      } catch (err) {
+        console.error('send-invite error:', err);
+      }
+    });
+
+    // Relay invite acceptance — frontend filters so only the challenger reacts
+    socket.on('invite-accepted', ({ roomCode, challengerId, acceptedBy }) => {
+      io.to(CHAT_ROOM).emit('invite-accepted', { roomCode, challengerId, acceptedBy });
+    });
+
+    // ============================
+    // delete-chat: ADMIN ONLY. Permanently removes a chat message for everyone.
+    // The admin check is enforced HERE on the server (socket.user.role), so even a
+    // forged event from a non-admin client is ignored. On success we broadcast
+    // 'chat-deleted' so every connected client removes the message live.
+    // ============================
+    socket.on('delete-chat', async ({ messageId } = {}) => {
+      try {
+        if (!socket.user || socket.user.role !== 'admin') return; // only admins may delete
+        if (!messageId) return;
+        await ChatMessage.findByIdAndDelete(messageId);
+        io.to(CHAT_ROOM).emit('chat-deleted', { messageId: messageId.toString() });
+      } catch (err) {
+        console.error('delete-chat error:', err);
+      }
+    });
+
+    // ============================
+    // created-room: fired by creator right after creating a game
+    // Starts the 2-minute waiting countdown
+    // ============================
+    socket.on('created-room', async ({ roomCode }) => {
+      try {
+        socket.join(roomCode);
+        socket.currentRoom = roomCode;
+
+        // Start 2-minute auto-abort countdown
+        startWaitingTimer(io, roomCode);
+
+        console.log(`${socket.user.username} created room ${roomCode}, waiting timer started`);
+      } catch (err) {
+        console.error('created-room error:', err);
+        socket.emit('error', { message: 'Failed to initialize room' });
+      }
+    });
+
+    // ============================
+    // join-room: fired when a player enters an existing room
+    // ============================
+    socket.on('join-room', async ({ roomCode }) => {
+      try {
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username gamesPlayed gamesWon');
+
+        if (!game) return socket.emit('error', { message: 'Game not found' });
+
+        const isPlayer = game.players.some(
+          p => p.user._id.toString() === socket.user._id.toString()
+        );
+        if (!isPlayer) return socket.emit('error', { message: 'Not a player in this game' });
+
+        socket.join(roomCode);
+        socket.currentRoom = roomCode;
+
+        const playerIdx = game.players.findIndex(
+          p => p.user._id.toString() === socket.user._id.toString()
+        );
+        game.players[playerIdx].isConnected = true;
+        await game.save();
+
+        // ✅ Player came back (e.g. from a refresh) — cancel any pending
+        // waiting-room grace abort so their room isn't killed.
+        const gt = waitingGraceTimers.get(roomCode);
+        if (gt) { clearTimeout(gt); waitingGraceTimers.delete(roomCode); }
+
+        socket.emit('game-state', sanitizeGame(game, socket.user._id));
+        socket.to(roomCode).emit('player-connected', { username: socket.user.username });
+
+        // ✅ ANTI-CHEAT resync: if it's this player's turn and they already rolled
+        // (lastDiceRoll set), restore the dice + valid moves on their refreshed UI
+        // so they can't re-roll and don't get a blank dice.
+        if (game.status === 'active' &&
+            game.lastDiceRoll !== null && game.lastDiceRoll !== undefined &&
+            game.currentTurn.toString() === socket.user._id.toString()) {
+          const pIdx = playerIdx;
+          const oIdx = pIdx === 0 ? 1 : 0;
+          if (game.players[oIdx]) {
+            const existing = LudoEngine.getValidMoves(game.players[pIdx], game.lastDiceRoll, game.players[oIdx]);
+            socket.emit('dice-rolled', {
+              diceRoll:       game.lastDiceRoll,
+              playerId:       socket.user._id,
+              playerUsername: socket.user.username,
+              validMoves:     existing.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
+              hasValidMoves:  existing.length > 0,
+              currentTurn:    game.currentTurn.toString(),
+              resync:         true,
+            });
+          }
+        }
+
+        // ✅ Count connected players — if both are in, cancel the waiting timer
+        const connectedCount = game.players.filter(p => p.isConnected).length;
+        if (connectedCount >= 2) {
+          cancelWaitingTimer(roomCode);
+
+          const creatorId    = game.players[0]?.user?._id?.toString();
+          const opponentName = game.players[1]?.user?.username;
+
+          io.to(roomCode).emit('opponent-joined', {
+            username: socket.user.username,
+            message: 'Opponent joined! Game starting...',
+            roomCode,      // ✅ so a global "game started" banner knows which room to open
+            creatorId,     // ✅ so ONLY the creator shows the join banner (not the joiner)
+            opponentName,  // ✅ who just joined
+          });
+
+          // ✅ Tell the global chat this invite's room is now full → the matching
+          // invite card flips to green / "Accepted" for everyone in chat.
+          io.to(CHAT_ROOM).emit('invite-filled', {
+            roomCode,
+            acceptedBy: opponentName || socket.user.username,
+          });
+        }
+
+        console.log(`${socket.user.username} joined room ${roomCode}`);
+      } catch (err) {
+        socket.emit('error', { message: 'Failed to join room' });
+      }
+    });
+
+    // ============================
+    // roll-dice
+    // ============================
+    socket.on('roll-dice', async ({ roomCode }) => {
+      await withRoomLock(roomCode, async () => {
+      try {
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username');
+
+        if (!game || game.status !== 'active')
+          return socket.emit('error', { message: 'Game not active' });
+
+        if (game.currentTurn.toString() !== socket.user._id.toString())
+          return socket.emit('error', { message: 'Not your turn' });
+
+        // ✅ ANTI-CHEAT: if a dice value is already committed for this turn (player
+        // refreshed or re-emitted roll-dice), DO NOT roll again. Re-send the existing
+        // value + valid moves so the UI restores, but the number cannot change.
+        if (game.lastDiceRoll !== null && game.lastDiceRoll !== undefined) {
+          const pIdx = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+          const oIdx = pIdx === 0 ? 1 : 0;
+          const existing = LudoEngine.getValidMoves(game.players[pIdx], game.lastDiceRoll, game.players[oIdx]);
+          socket.emit('dice-rolled', {
+            diceRoll:       game.lastDiceRoll,
+            playerId:       socket.user._id,
+            playerUsername: socket.user.username,
+            validMoves:     existing.map(m => ({ tokenIndex: m.tokenIndex, newProgress: m.newProgress, canCapture: m.canCapture })),
+            hasValidMoves:  existing.length > 0,
+            currentTurn:    game.currentTurn.toString(),
+            resync:         true,
+          });
+          return;
+        }
+
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const opponentIdx = playerIdx === 0 ? 1 : 0;
+        const playerState   = game.players[playerIdx];
+        const opponentState = game.players[opponentIdx];
+
+        // ✅ If player already has 2 consecutive sixes, 3rd roll must NOT be six — reroll until non-six
+        let diceRoll = LudoEngine.rollDice();
+        if ((game.consecutiveSixes || 0) >= 2) {
+          while (diceRoll === 6) {
+            diceRoll = LudoEngine.rollDice();
+          }
+        }
+        game.lastDiceRoll = diceRoll;
+
+        if (diceRoll === 6) {
+          game.consecutiveSixes = (game.consecutiveSixes || 0) + 1;
+        } else {
+          game.consecutiveSixes = 0;
+        }
+
+        const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
+
+        // No valid moves — emit the rolled number, then pass the turn AFTER a short
+        // delay so both players can actually SEE the number on the dice. Previously
+        // 'turn-passed' was emitted in the same instant as 'dice-rolled', and the
+        // client's turn-passed handler cleared the dice immediately — so the number
+        // flashed for a few ms and the player never saw it on a no-move roll.
+        if (validMoves.length === 0) {
+          game.currentTurn  = opponentState.user._id;
+          game.lastDiceRoll = null;
+          await game.save();
+
+          // 1) Show the number to BOTH players right away.
+          io.to(roomCode).emit('dice-rolled', {
+            diceRoll,
+            playerId: socket.user._id,
+            playerUsername: socket.user.username,
+            validMoves: [],
+            hasValidMoves: false,
+            currentTurn: game.currentTurn.toString(),
+          });
+
+          // 2) Pass the turn ~1.5s later, so the dice number stays visible first.
+          //    (The turn is already committed in the DB above; this only controls
+          //    when the clients are told to clear the dice and move on.)
+          const passRoom = roomCode;
+          const passPayload = {
+            reason: 'No valid moves',
+            nextTurn: opponentState.user._id.toString(),
+            nextTurnUsername: opponentState.user.username,
+          };
+          setTimeout(() => {
+            io.to(passRoom).emit('turn-passed', passPayload);
+          }, 1500);
+          return;
+        }
+
+        await game.save();
+
+        io.to(roomCode).emit('dice-rolled', {
+          diceRoll,
+          playerId: socket.user._id,
+          playerUsername: socket.user.username,
+          validMoves: validMoves.map(m => ({
+            tokenIndex: m.tokenIndex,
+            newProgress: m.newProgress,
+            canCapture: m.canCapture,
+          })),
+          hasValidMoves: true,
+          currentTurn: game.currentTurn.toString(),
+        });
+
+      } catch (err) {
+        console.error('roll-dice error:', err);
+        socket.emit('error', { message: 'Server error' });
+      }
+      });
+    });
+
+    // ============================
+    // move-token
+    // ============================
+    socket.on('move-token', async ({ roomCode, tokenIndex }) => {
+      await withRoomLock(roomCode, async () => {
+      try {
+        const game = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+          .populate('players.user', 'username');
+
+        if (!game || game.status !== 'active')
+          return socket.emit('error', { message: 'Game not active' });
+
+        if (game.currentTurn.toString() !== socket.user._id.toString())
+          return socket.emit('error', { message: 'Not your turn' });
+
+        // ✅ FIX: Capture diceRoll into a local variable FIRST before nulling game.lastDiceRoll
+        const diceRoll = game.lastDiceRoll;
+        if (diceRoll === null || diceRoll === undefined)
+          return socket.emit('error', { message: 'Roll dice first' });
+
+        const playerIdx   = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const opponentIdx = playerIdx === 0 ? 1 : 0;
+        const playerState   = game.players[playerIdx];
+        const opponentState = game.players[opponentIdx];
+
+        // ✅ FIX: Use local diceRoll variable (not game.lastDiceRoll) for all validation & logic
+        const validMoves = LudoEngine.getValidMoves(playerState, diceRoll, opponentState);
+        const move = validMoves.find(m => m.tokenIndex === tokenIndex);
+        if (!move) return socket.emit('error', { message: 'Invalid move' });
+
+        // ✅ FIX: Use local diceRoll variable here too
+        const result = LudoEngine.applyMove(playerState, opponentState, tokenIndex, diceRoll);
+
+        game.players[playerIdx].tokens         = result.newPlayerTokens;
+        game.players[playerIdx].finishedTokens = result.finishedCount;
+        game.players[opponentIdx].tokens       = result.newOpponentTokens;
+
+        game.moveHistory.push({
+          player: socket.user._id,
+          dice: diceRoll, // ✅ FIX: use local variable
+          tokenIndex,
+          fromPosition: move.currentProgress,
+          toPosition:   move.newProgress,
+        });
+
+        // ✅ FIX: Null lastDiceRoll AFTER all logic that depends on it is done
+        game.lastDiceRoll = null;
+
+        const moveData = {
+          playerId: socket.user._id.toString(),
+          playerUsername: socket.user.username,
+          tokenIndex,
+          fromProgress:  move.currentProgress,
+          toProgress:    move.newProgress,
+          captured:      result.captured,
+          extraTurn:     result.extraTurn,
+          finishedCount: result.finishedCount,
+        };
+
+        // Game over
+        if (result.gameOver) {
+          game.status     = 'finished';
+          game.winner     = socket.user._id;
+          game.loser      = opponentState.user._id;
+          game.finishedAt = new Date();
+
+          const pot         = game.betAmount * 2;
+          const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+          const winAmount   = pot - platformFee;
+          game.winAmount    = winAmount;
+          game.platformFee  = platformFee;
+
+          await game.save();
+          await settleGame(game, socket.user._id, opponentState.user._id, winAmount, platformFee);
+
+          io.to(roomCode).emit('game-over', {
+            ...moveData,
+            winner: { id: socket.user._id.toString(), username: socket.user.username },
+            loser:  { id: opponentState.user._id.toString(), username: opponentState.user.username },
+            winAmount,
+            platformFee,
+            pot,
+          });
+          return;
+        }
+
+        if (result.extraTurn) {
+          game.currentTurn = socket.user._id;
+          // ✅ FIX: Use local diceRoll variable (game.lastDiceRoll is already null here)
+          if (diceRoll !== 6 && result.captured) {
+            game.consecutiveSixes = 0;
+          }
+        } else {
+          game.currentTurn      = opponentState.user._id;
+          game.consecutiveSixes = 0; // ✅ reset when turn passes to opponent
+        }
+
+        await game.save();
+
+        io.to(roomCode).emit('token-moved', {
+          ...moveData,
+          gameState: {
+            players: game.players.map(p => ({
+              userId:         p.user._id.toString(),
+              username:       p.user.username,
+              color:          p.color,
+              tokens:         p.tokens,
+              finishedTokens: p.finishedTokens,
+            })),
+            currentTurn:      game.currentTurn.toString(),
+            nextTurnUsername: result.extraTurn ? socket.user.username : opponentState.user.username,
+          },
+        });
+
+      } catch (err) {
+        console.error('move-token error:', err);
+        socket.emit('error', { message: 'Server error' });
+      }
+      });
+    });
+
+    // ============================
+    // forfeit: player intentionally exits an ACTIVE game (pressed the Exit button).
+    // The exiting player LOSES their bet and the opponent WINS immediately. Money is
+    // settled here and a game-over is broadcast to both players in real time.
+    // NOTE: this is NOT a network disconnect — a disconnect gives a 60s rejoin window
+    // and is handled separately in the disconnect handler below.
+    // ============================
+    socket.on('forfeit', async ({ roomCode }) => {
+      try {
+        // ✅ Atomic + membership guard in one step: only proceed if the game is still
+        // ACTIVE and this user is actually a player in it. Flipping to 'finished'
+        // atomically means a forfeit can NEVER double-settle (e.g. racing a normal
+        // win or a disconnect-timeout win) — whichever flips it first wins, the rest
+        // match nothing and no-op.
+        const game = await Game.findOneAndUpdate(
+          { roomCode: roomCode.toUpperCase(), status: 'active', 'players.user': socket.user._id },
+          { $set: { status: 'finished', finishedAt: new Date() } },
+          { new: true }
+        ).populate('players.user', 'username');
+
+        if (!game) return; // not an active game this player is in (already over, etc.)
+
+        const loserIdx  = game.players.findIndex(p => p.user._id.toString() === socket.user._id.toString());
+        const winnerIdx = loserIdx === 0 ? 1 : 0;
+        const winnerId  = game.players[winnerIdx].user._id;
+        const loserId   = game.players[loserIdx].user._id;
+
+        const pot         = game.betAmount * 2;
+        const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+        const winAmount   = pot - platformFee;
+
+        game.winner      = winnerId;
+        game.loser       = loserId;
+        game.winAmount   = winAmount;
+        game.platformFee = platformFee;
+        await game.save();
+
+        // Same settlement as a normal win: loser loses their bet, winner gets pot − fee.
+        await settleGame(game, winnerId, loserId, winAmount, platformFee);
+
+        io.to(roomCode).emit('game-over', {
+          reason:      'forfeit',
+          winner:      { id: winnerId.toString(), username: game.players[winnerIdx].user.username },
+          loser:       { id: loserId.toString(),  username: game.players[loserIdx].user.username },
+          winAmount,
+          platformFee,
+          pot,
+        });
+
+        console.log(`Forfeit: ${game.players[loserIdx].user.username} exited, ${game.players[winnerIdx].user.username} wins ₹${winAmount}`);
+      } catch (err) {
+        console.error('forfeit error:', err);
+        socket.emit('error', { message: 'Failed to forfeit' });
+      }
+    });
+
+    // ============================
+    // player-away / player-back
+    // The client emits these on visibilitychange (app backgrounded / tab hidden,
+    // then returned) WHILE the socket is still alive. We use them to tell apart
+    // "stepped away, will be back" from a real network drop:
+    //   • away signalled  → a later disconnect is treated as "away" (calm)
+    //   • no away signal  → a disconnect is treated as "network" (Wi-Fi alarm)
+    // This changes ONLY the label/icon shown to the opponent — it does NOT touch
+    // isConnected, the 60s reconnect timer, or any money logic.
+    // ============================
+    socket.on('player-away', ({ roomCode } = {}) => {
+      socket._away = true;
+      const room = roomCode || socket.currentRoom;
+      if (room) socket.to(room).emit('opponent-away', { username: socket.user.username });
+    });
+
+    socket.on('player-back', ({ roomCode } = {}) => {
+      socket._away = false;
+      const room = roomCode || socket.currentRoom;
+      if (room) socket.to(room).emit('opponent-back', { username: socket.user.username });
+    });
+
+    // ============================
+    // disconnect
+    // ============================
+    socket.on('disconnect', async () => {
+      console.log(`User disconnected: ${socket.user.username}`);
+
+      // ✅ Chat cleanup — must run BEFORE the game-room early-return below,
+      // because chat-only users never have socket.currentRoom set.
+      if (chatSockets.has(socket.id)) {
+        chatSockets.delete(socket.id);
+        io.to(CHAT_ROOM).emit('chat-online-count', { count: chatSockets.size });
+      }
+
+      if (!socket.currentRoom) return;
+
+      try {
+        const game = await Game.findOne({ roomCode: socket.currentRoom })
+          .populate('players.user', 'username');
+
+        if (!game) return;
+
+        // ✅ If the game is already over (player forfeited via Exit, or it finished
+        // normally), there is nothing to do on disconnect — don't fire a spurious
+        // "opponent disconnected" or start a 60s timer.
+        if (game.status !== 'waiting' && game.status !== 'active') return;
+
+        const playerIdx = game.players.findIndex(
+          p => p.user._id.toString() === socket.user._id.toString()
+        );
+        if (playerIdx === -1) return;
+
+        // ✅ SCENARIO 1: Player disconnects while room is still WAITING.
+        // Do NOT abort immediately — a page refresh looks identical to leaving.
+        // Give a short grace window; if they don't reconnect (join-room clears this),
+        // THEN abort + refund. The existing 2-min timer still backstops truly idle rooms.
+        if (game.status === 'waiting') {
+          game.players[playerIdx].isConnected = false;
+          await game.save();
+
+          const roomForGrace = socket.currentRoom;
+          const graceTimer = setTimeout(async () => {
+            waitingGraceTimers.delete(roomForGrace);
+            try {
+              const fresh = await Game.findOne({ roomCode: roomForGrace, status: 'waiting' });
+              if (!fresh) return; // already started (opponent joined) or aborted — nothing to do
+
+              // Still waiting and creator never came back → abort + refund.
+              cancelWaitingTimer(roomForGrace);
+              fresh.status = 'aborted';
+              fresh.finishedAt = new Date();
+              await fresh.save();
+
+              const creator = await User.findById(fresh.players[0].user);
+              if (creator) {
+                const before = creator.balance;
+                creator.lockedBalance = Math.max(0, creator.lockedBalance - fresh.betAmount);
+                await creator.save();
+                await Transaction.create({
+                  user: creator._id,
+                  type: 'refund',
+                  amount: fresh.betAmount,
+                  balanceBefore: before,
+                  balanceAfter: creator.balance,
+                  status: 'completed',
+                  gameId: fresh._id,
+                });
+              }
+
+              io.to(roomForGrace).emit('game-aborted', {
+                reason: 'creator_left',
+                message: 'Room creator left. Game aborted. Bet refunded.',
+              });
+            } catch (e) {
+              console.error('waiting grace abort error:', e);
+            }
+          }, 20000); // 20s grace — long enough to cover a refresh, short enough to free the room
+
+          waitingGraceTimers.set(roomForGrace, graceTimer);
+          return; // don't run the active-game 60s logic below
+        }
+
+        // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
+        game.players[playerIdx].isConnected = false;
+        await game.save();
+
+        // ✅ Was this a deliberate "step away" (backgrounded, socket later dropped),
+        // or an unexpected network drop? Drives a calm "away" UI vs a Wi-Fi alarm on
+        // the opponent's screen. The 60s reconnect→forfeit window is identical either way.
+        const wasAway = socket._away === true;
+        socket.to(socket.currentRoom).emit('player-disconnected', {
+          username: socket.user.username,
+          reason: wasAway ? 'away' : 'network',
+          message: wasAway
+            ? `${socket.user.username} stepped away. Waiting 60s...`
+            : `${socket.user.username} lost connection. Waiting 60s for reconnect...`,
+        });
+
+        const timer = setTimeout(async () => {
+          const freshGame = await Game.findOne({ roomCode: socket.currentRoom, status: 'active' });
+          if (!freshGame) return;
+
+          const disconnectedIdx = freshGame.players.findIndex(
+            p => p.user._id.toString() === socket.user._id.toString()
+          );
+          if (disconnectedIdx === -1 || freshGame.players[disconnectedIdx].isConnected) return;
+
+          const opponentIdx = disconnectedIdx === 0 ? 1 : 0;
+          const winnerId    = freshGame.players[opponentIdx].user;
+          const loserId     = socket.user._id;
+
+          const pot         = freshGame.betAmount * 2;
+          const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+          const winAmount   = pot - platformFee;
+
+          freshGame.status      = 'finished';
+          freshGame.winner      = winnerId;
+          freshGame.loser       = loserId;
+          freshGame.winAmount   = winAmount;
+          freshGame.platformFee = platformFee;
+          freshGame.finishedAt  = new Date();
+          await freshGame.save();
+
+          await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
+
+          io.to(socket.currentRoom).emit('game-over', {
+            reason:  'opponent_disconnected',
+            winner:  { id: winnerId.toString() },
+            loser:   { id: loserId.toString(), username: socket.user.username },
+            winAmount,
+            message: `${socket.user.username} disconnected. You win!`,
+          });
+        }, 60000);
+
+        if (!activeRooms.has(socket.currentRoom)) activeRooms.set(socket.currentRoom, {});
+        activeRooms.get(socket.currentRoom).disconnectTimer = timer;
+
+      } catch (err) {
+        console.error('disconnect handler error:', err);
+      }
+    });
+
+    // ============================
+    // reconnect-room: player comes back within 60s
+    // ============================
+    socket.on('reconnect-room', async ({ roomCode }) => {
+      try {
+        const room = activeRooms.get(roomCode);
+        if (room?.disconnectTimer) {
+          clearTimeout(room.disconnectTimer);
+          room.disconnectTimer = null;
+        }
+
+        const game = await Game.findOne({ roomCode }).populate('players.user', 'username');
+        if (!game) return;
+
+        const playerIdx = game.players.findIndex(
+          p => p.user._id.toString() === socket.user._id.toString()
+        );
+        if (playerIdx !== -1) {
+          game.players[playerIdx].isConnected = true;
+          await game.save();
+          socket.join(roomCode);
+          socket.currentRoom = roomCode;
+          socket.emit('game-state', sanitizeGame(game, socket.user._id));
+          socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
+        }
+      } catch (err) {
+        console.error('reconnect-room error:', err);
+      }
+    });
+
+  }); // end io.on('connection')
+
+}; // end module.exports
