@@ -13,6 +13,19 @@ const chatRoutes = require('./routes/chat');
 const gameSocket = require('./socket/gameSocket');
 const app = express();
 const server = http.createServer(app);
+
+// ✅ GLOBAL SAFETY NETS. A single unhandled async error must NOT silently take down
+// the whole server (which would freeze every live game and break logins). Log loudly.
+// For a money platform, continuing in a corrupted state is worse than a clean restart,
+// so on a truly fatal uncaughtException we log then let the platform restart a fresh
+// process — but in-flight money ops are already guarded by atomic DB updates.
+process.on('unhandledRejection', (reason) => {
+  console.error('🛑 UNHANDLED REJECTION:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('🛑 UNCAUGHT EXCEPTION:', err);
+  setTimeout(() => process.exit(1), 250); // flush logs, then clean restart
+});
 // ✅ Fixed CORS
 const allowedOrigins = [
   'https://ludo-fron.vercel.app',
@@ -64,23 +77,42 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/chat', chatRoutes);
 gameSocket(io);
 const PORT = process.env.PORT || 5000;
-// ✅ Connection resilience options. Without these, a slow/unreachable DB made queries
-// hang indefinitely (the cascade behind "login failed" under load). Now the driver
-// caps the pool, fails fast on an unreachable DB, and drops stuck sockets.
-mongoose.connect(process.env.MONGODB_URI, {
-  maxPoolSize: 50,                 // cap concurrent connections (stays well within Atlas limits)
-  minPoolSize: 5,                  // keep a few warm so the first queries aren't cold
-  serverSelectionTimeoutMS: 10000, // fail fast if the DB can't be reached instead of hanging
-  socketTimeoutMS: 45000,          // give up on a stuck query rather than holding the socket forever
-})
-  .then(() => {
-    console.log('✅ MongoDB connected');
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(`✅ Server running on port ${PORT}`);
+
+// ✅ Start listening IMMEDIATELY — do NOT block the server on MongoDB. This is the
+// key fix for recurring "login failed / no response": previously the server only
+// called listen() after Mongo connected and did process.exit(1) on any error, so a
+// transient Atlas hiccup made the whole app refuse connections or restart-loop, and
+// every in-progress game froze. Now /health and the API are always reachable; if the
+// DB is momentarily down, individual requests fail fast (and retry) instead of the
+// entire server going dark.
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
+
+// ✅ Connect to MongoDB in the background with auto-retry. Never exit on a transient
+// failure — Mongoose also auto-reconnects on its own once the first connection succeeds.
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI, {
+      maxPoolSize: 50,                 // cap concurrent connections (stays well within Atlas limits)
+      minPoolSize: 5,                  // keep a few warm so the first queries aren't cold
+      serverSelectionTimeoutMS: 10000, // fail fast if the DB can't be reached instead of hanging
+      socketTimeoutMS: 45000,          // give up on a stuck query rather than holding the socket forever
     });
-  })
-  .catch(err => {
-    console.error('❌ MongoDB Connection Error:', err.message);
-    process.exit(1);
-  });
+    console.log('✅ MongoDB connected');
+  } catch (err) {
+    console.error('❌ MongoDB initial connection error:', err.message, '— retrying in 5s');
+    setTimeout(connectDB, 5000);
+  }
+};
+
+// ✅ Runtime visibility — THESE are the lines to watch in Railway logs when
+// "login failed / no response" happens. They tell you if the DB link is the cause.
+mongoose.connection.on('connected',    () => console.log('✅ Mongoose connected'));
+mongoose.connection.on('disconnected', () => console.warn('⚠️ Mongoose disconnected — driver will auto-reconnect'));
+mongoose.connection.on('reconnected',  () => console.log('🔄 Mongoose reconnected'));
+mongoose.connection.on('error',        (e) => console.error('❌ Mongoose error:', e.message));
+
+connectDB();
+
 module.exports = { app, io };
