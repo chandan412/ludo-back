@@ -90,6 +90,17 @@ function startWaitingTimer(io, roomCode) {
         reason: 'no_opponent',
         message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
       });
+
+      // ✅ Flip this game's chat invite card to "expired" for everyone, permanently.
+      try {
+        await ChatMessage.findOneAndUpdate(
+          { type: 'invite', roomCode: String(roomCode).toUpperCase() },
+          { $set: { status: 'expired' } }
+        );
+        io.to(CHAT_ROOM).emit('invite-expired', { roomCode });
+      } catch (e) {
+        console.error('invite-expire (timeout) error:', e);
+      }
     } catch (err) {
       console.error('Auto-abort error:', err);
     } finally {
@@ -396,6 +407,17 @@ module.exports = (io) => {
             roomCode,
             acceptedBy: opponentName || socket.user.username,
           });
+
+          // ✅ Persist accepted status so the card stays "Accepted" after a refresh.
+          // Matched by the invite's stored (uppercase) roomCode. Non-fatal.
+          try {
+            await ChatMessage.findOneAndUpdate(
+              { type: 'invite', roomCode: String(roomCode).toUpperCase() },
+              { $set: { status: 'accepted' } }
+            );
+          } catch (e) {
+            console.error('invite-accept persist error:', e);
+          }
         }
 
         console.log(`${socket.user.username} joined room ${roomCode}`);
@@ -788,6 +810,17 @@ module.exports = (io) => {
                 reason: 'creator_left',
                 message: 'Room creator left. Game aborted. Bet refunded.',
               });
+
+              // ✅ Expire this game's chat invite card too, permanently.
+              try {
+                await ChatMessage.findOneAndUpdate(
+                  { type: 'invite', roomCode: String(roomForGrace).toUpperCase() },
+                  { $set: { status: 'expired' } }
+                );
+                io.to(CHAT_ROOM).emit('invite-expired', { roomCode: roomForGrace });
+              } catch (e) {
+                console.error('invite-expire (grace) error:', e);
+              }
             } catch (e) {
               console.error('waiting grace abort error:', e);
             }
@@ -823,6 +856,52 @@ module.exports = (io) => {
           if (disconnectedIdx === -1 || freshGame.players[disconnectedIdx].isConnected) return;
 
           const opponentIdx = disconnectedIdx === 0 ? 1 : 0;
+
+          // ✅ MONEY-SAFETY GUARD: only forfeit the disconnected player if their
+          // opponent is ACTUALLY still connected. If BOTH are disconnected, this is
+          // almost certainly a server/network-wide drop — NOT someone quitting — so
+          // declaring a winner would take an innocent player's money. Instead abort
+          // and refund BOTH (unlock lockedBalance only; balance is never touched).
+          // The status flip is atomic, so the opponent's own 60s timer can't
+          // double-process it (whichever flips 'active' first wins; the other no-ops).
+          if (!freshGame.players[opponentIdx].isConnected) {
+            try {
+              const aborted = await Game.findOneAndUpdate(
+                { roomCode: socket.currentRoom, status: 'active' },
+                { $set: { status: 'aborted', finishedAt: new Date() } },
+                { new: true }
+              );
+              if (!aborted) return; // already handled by the other player's timer
+
+              for (const p of aborted.players) {
+                const u = await User.findById(p.user);
+                if (u) {
+                  const before = u.balance;
+                  u.lockedBalance = Math.max(0, u.lockedBalance - aborted.betAmount);
+                  await u.save();
+                  await Transaction.create({
+                    user: u._id,
+                    type: 'refund',
+                    amount: aborted.betAmount,
+                    balanceBefore: before,
+                    balanceAfter: u.balance,
+                    status: 'completed',
+                    gameId: aborted._id,
+                  });
+                }
+              }
+
+              io.to(socket.currentRoom).emit('game-aborted', {
+                reason: 'connection_lost',
+                message: 'Both players lost connection. Game aborted — bets refunded.',
+              });
+              console.log(`Both-disconnected: room ${socket.currentRoom} aborted, both players refunded`);
+            } catch (e) {
+              console.error('both-disconnected refund error:', e);
+            }
+            return;
+          }
+
           const winnerId    = freshGame.players[opponentIdx].user;
           const loserId     = socket.user._id;
 
