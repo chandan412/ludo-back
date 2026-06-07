@@ -94,8 +94,8 @@ server.listen(PORT, '0.0.0.0', () => {
 const connectDB = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI, {
-      maxPoolSize: 50,                 // cap concurrent connections (stays well within Atlas limits)
-      minPoolSize: 5,                  // keep a few warm so the first queries aren't cold
+      maxPoolSize: 10,                 // M0 free tier is shared — keep the pool small and gentle
+      minPoolSize: 2,                  // keep a couple warm so the first queries aren't cold
       serverSelectionTimeoutMS: 10000, // fail fast if the DB can't be reached instead of hanging
       socketTimeoutMS: 45000,          // give up on a stuck query rather than holding the socket forever
     });
