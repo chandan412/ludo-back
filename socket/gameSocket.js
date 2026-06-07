@@ -352,8 +352,13 @@ module.exports = (io) => {
         const playerIdx = game.players.findIndex(
           p => p.user._id.toString() === socket.user._id.toString()
         );
-        game.players[playerIdx].isConnected = true;
-        await game.save();
+        game.players[playerIdx].isConnected = true; // in-memory copy for the logic below
+        // ✅ ATOMIC isConnected write — a positional $set never bumps the document __v,
+        // so it can't VersionError an in-flight roll/move the way a full game.save() can.
+        await Game.updateOne(
+          { _id: game._id, 'players.user': socket.user._id },
+          { $set: { 'players.$.isConnected': true } }
+        );
 
         // ✅ Player came back (e.g. from a refresh) — cancel any pending
         // waiting-room grace abort so their room isn't killed.
@@ -774,8 +779,12 @@ module.exports = (io) => {
         // Give a short grace window; if they don't reconnect (join-room clears this),
         // THEN abort + refund. The existing 2-min timer still backstops truly idle rooms.
         if (game.status === 'waiting') {
-          game.players[playerIdx].isConnected = false;
-          await game.save();
+          game.players[playerIdx].isConnected = false; // in-memory copy for the logic below
+          // ✅ ATOMIC isConnected write — positional $set, no __v bump, no move-race.
+          await Game.updateOne(
+            { _id: game._id, 'players.user': socket.user._id },
+            { $set: { 'players.$.isConnected': false } }
+          );
 
           const roomForGrace = socket.currentRoom;
           const graceTimer = setTimeout(async () => {
@@ -831,8 +840,12 @@ module.exports = (io) => {
         }
 
         // ✅ SCENARIO 2: Player disconnects during active game → 60s reconnect window
-        game.players[playerIdx].isConnected = false;
-        await game.save();
+        game.players[playerIdx].isConnected = false; // in-memory copy for the logic below
+        // ✅ ATOMIC isConnected write — positional $set, no __v bump, no move-race.
+        await Game.updateOne(
+          { _id: game._id, 'players.user': socket.user._id },
+          { $set: { 'players.$.isConnected': false } }
+        );
 
         // ✅ Was this a deliberate "step away" (backgrounded, socket later dropped),
         // or an unexpected network drop? Drives a calm "away" UI vs a Wi-Fi alarm on
@@ -954,8 +967,12 @@ module.exports = (io) => {
           p => p.user._id.toString() === socket.user._id.toString()
         );
         if (playerIdx !== -1) {
-          game.players[playerIdx].isConnected = true;
-          await game.save();
+          game.players[playerIdx].isConnected = true; // in-memory copy for the logic below
+          // ✅ ATOMIC isConnected write — positional $set, no __v bump, no move-race.
+          await Game.updateOne(
+            { _id: game._id, 'players.user': socket.user._id },
+            { $set: { 'players.$.isConnected': true } }
+          );
           socket.join(roomCode);
           socket.currentRoom = roomCode;
           socket.emit('game-state', sanitizeGame(game, socket.user._id));
