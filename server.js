@@ -89,6 +89,78 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
 
+// ============================================================================
+// ✅ STARTUP SWEEP — release orphaned WAITING rooms on every boot.
+//
+// A server restart (e.g. a Railway redeploy) loses the in-memory 2-min and 20s
+// waiting-room timers. Any room that was 'waiting' at that moment would otherwise
+// be stranded as 'waiting' forever, with the creator's bet locked indefinitely.
+// On boot we abort each such room and UNLOCK the stake.
+//
+// MONEY SAFETY (matches the app's rules exactly):
+//   • Refund = UNLOCK only: lockedBalance -= betAmount. balance is NEVER touched.
+//   • Each room is flipped waiting → aborted ATOMICALLY before refunding, so this
+//     can never double-refund (a racing request that already handled a room makes
+//     the flip return null and we skip it).
+//   • A 'refund' Transaction is written for every release (full audit trail).
+//   • Only 'waiting' rooms are touched. Active/finished/aborted games are untouched.
+//   • Runs ONCE per process and is fully self-contained: any error is caught and
+//     logged, so it can never disrupt the DB connection or the crash-handling above.
+// ============================================================================
+let startupSweepDone = false;
+const releaseOrphanedWaitingGames = async () => {
+  if (startupSweepDone) return;
+  startupSweepDone = true;
+  try {
+    const Game        = require('./models/Game');
+    const User        = require('./models/User');
+    const Transaction = require('./models/Transaction');
+
+    const waiting = await Game.find({ status: 'waiting' });
+    if (waiting.length === 0) {
+      console.log('🧹 Startup sweep: no orphaned waiting rooms.');
+      return;
+    }
+
+    let aborted = 0;
+    let released = 0;
+    for (const g of waiting) {
+      // Atomically claim this room (waiting → aborted). If something already handled
+      // it, `claimed` is null and we skip — this is what prevents any double-refund.
+      const claimed = await Game.findOneAndUpdate(
+        { _id: g._id, status: 'waiting' },
+        { $set: { status: 'aborted', finishedAt: new Date() } },
+        { new: true }
+      );
+      if (!claimed) continue;
+
+      // Waiting rooms normally hold just the creator; loop defensively over all.
+      for (const p of claimed.players) {
+        const u = await User.findById(p.user);
+        if (!u) continue;
+        const before = u.balance; // balance does NOT change — this only unlocks
+        u.lockedBalance = Math.max(0, u.lockedBalance - claimed.betAmount);
+        await u.save();
+        await Transaction.create({
+          user: u._id,
+          type: 'refund',
+          amount: claimed.betAmount,
+          balanceBefore: before,
+          balanceAfter: u.balance,
+          status: 'completed',
+          gameId: claimed._id,
+        });
+        released += claimed.betAmount;
+      }
+      aborted++;
+    }
+    console.log(`🧹 Startup sweep: aborted ${aborted} orphaned waiting room(s), released ₹${released} of locked balance.`);
+  } catch (err) {
+    // Non-fatal by design — never let cleanup disrupt boot or the DB link.
+    console.error('🧹 Startup sweep error (non-fatal):', err.message);
+  }
+};
+
 // ✅ Connect to MongoDB in the background with auto-retry. Never exit on a transient
 // failure — Mongoose also auto-reconnects on its own once the first connection succeeds.
 const connectDB = async () => {
@@ -100,6 +172,9 @@ const connectDB = async () => {
       socketTimeoutMS: 45000,          // give up on a stuck query rather than holding the socket forever
     });
     console.log('✅ MongoDB connected');
+    // ✅ One-time cleanup of orphaned waiting rooms, now that the DB is reachable.
+    // Self-guarded (never throws), so it can't trip the catch/retry below.
+    await releaseOrphanedWaitingGames();
   } catch (err) {
     console.error('❌ MongoDB initial connection error:', err.message, '— retrying in 5s');
     setTimeout(connectDB, 5000);
