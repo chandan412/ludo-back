@@ -54,6 +54,13 @@ const userSchema = new mongoose.Schema({
   gamesWon: { type: Number, default: 0 },
   totalEarned: { type: Number, default: 0 },
   totalLost: { type: Number, default: 0 },
+
+  // ✅ Referral system
+  referralCode:     { type: String, unique: true, sparse: true, uppercase: true, trim: true },
+  referredBy:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  referralCount:    { type: Number, default: 0 },
+  referralEarnings: { type: Number, default: 0 },
+
   createdAt: {
     type: Date,
     default: Date.now
