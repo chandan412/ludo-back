@@ -95,8 +95,8 @@ router.post('/withdraw-request', auth, async (req, res) => {
   try {
     const { amount, bankDetails } = req.body;
     const { accountHolderName, accountNumber, ifscCode, bankName, upiId } = bankDetails || {};
-    if (!amount || amount < 50)
-      return res.status(400).json({ message: 'Minimum withdrawal amount is ₹50' });
+    if (!amount || amount < 100)
+      return res.status(400).json({ message: 'Minimum withdrawal amount is ₹100' });
     const user = await User.findById(req.user._id);
     const available = user.balance - user.lockedBalance;
     if (amount > available)
