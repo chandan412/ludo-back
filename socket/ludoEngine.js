@@ -1,3 +1,5 @@
+const crypto = require('crypto');
+
 // ✅ Standard Ludo:
 //   - Physical board loop has 52 cells (global position 0..51)
 //   - Each player TRAVERSES 51 cells before entering home column
@@ -17,7 +19,12 @@ const SAFE_SQUARES = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
 class LudoEngine {
 
   static rollDice() {
-    return Math.floor(Math.random() * 6) + 1;
+    // ✅ Cryptographically secure, unbiased 1..6. crypto.randomInt(1, 7) returns an
+    // integer in [1, 7) — i.e. 1..6 inclusive — with no modulo bias and no
+    // predictability (unlike Math.random()). Appropriate for a real-money game.
+    // The custom six-rule (reroll on a 3rd consecutive six) lives in gameSocket and
+    // simply calls this again, so it is unaffected.
+    return crypto.randomInt(1, 7);
   }
 
   // Returns global physical board position (0-51) for tokens on main loop
