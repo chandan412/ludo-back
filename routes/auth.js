@@ -2,14 +2,30 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const Transaction = require('../models/Transaction');
+const crypto = require('crypto');
 const { auth } = require('../middleware/auth');
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
+// ✅ Referral config + unique-code generator. Codes are 6 chars from an unambiguous
+// alphabet (no 0/O/1/I), checked against existing users so they never collide.
+const REFERRAL_BONUS = parseInt(process.env.REFERRAL_BONUS || 50, 10);
+const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+async function generateUniqueReferralCode() {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    let code = '';
+    for (let i = 0; i < 6; i++) code += REF_ALPHABET[crypto.randomInt(0, REF_ALPHABET.length)];
+    const clash = await User.findOne({ referralCode: code }).select('_id');
+    if (!clash) return code;
+  }
+  return 'R' + Date.now().toString(36).toUpperCase().slice(-7); // extremely unlikely fallback
+}
+
 // ── REGISTER ──────────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, phone, password } = req.body;
+    const { username, email, phone, password, referralCode } = req.body;
     if (!username || !email || !phone || !password)
       return res.status(400).json({ message: 'All fields are required' });
 
@@ -26,7 +42,48 @@ router.post('/register', async (req, res) => {
       if (exists.phone    === phoneTrimmed)   return res.status(400).json({ message: 'Phone already registered' });
     }
 
-    const user = await User.create({ username: usernameTrimmed, email: emailLower, phone: phoneTrimmed, password });
+    // ✅ REFERRAL: resolve the referrer if a code was entered. The new account does
+    // not exist yet, so self-referral is impossible here. An unknown/invalid code is
+    // simply ignored — registration still succeeds, just with no bonus paid.
+    let referrer = null;
+    const enteredCode = (referralCode || '').toString().trim().toUpperCase();
+    if (enteredCode) referrer = await User.findOne({ referralCode: enteredCode });
+
+    // ✅ Every new user gets their own unique referral code.
+    const myReferralCode = await generateUniqueReferralCode();
+
+    const user = await User.create({
+      username: usernameTrimmed,
+      email: emailLower,
+      phone: phoneTrimmed,
+      password,
+      referralCode: myReferralCode,
+      referredBy: referrer ? referrer._id : null,
+    });
+
+    // ✅ Pay the REFERRER ₹50 — real, withdrawable balance (earned money, not a stake,
+    // so it credits `balance` directly). One credit per signup, logged as 'referral'.
+    // Non-fatal: the new account already exists; never fail signup over a bonus write.
+    if (referrer) {
+      try {
+        const before = referrer.balance;
+        referrer.balance         += REFERRAL_BONUS;
+        referrer.referralCount    = (referrer.referralCount || 0) + 1;
+        referrer.referralEarnings = (referrer.referralEarnings || 0) + REFERRAL_BONUS;
+        await referrer.save();
+        await Transaction.create({
+          user: referrer._id,
+          type: 'referral',
+          amount: REFERRAL_BONUS,
+          balanceBefore: before,
+          balanceAfter: referrer.balance,
+          status: 'completed',
+        });
+      } catch (refErr) {
+        console.error('referral credit error:', refErr);
+      }
+    }
+
     const token = generateToken(user._id);
     res.status(201).json({ token, user: user.toSafeObject() });
   } catch (err) {
@@ -90,6 +147,17 @@ router.post('/login', async (req, res) => {
 router.get('/me', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id).select('-password');
+    if (!user) return res.status(404).json({ message: 'Account not found' });
+    // ✅ Backfill a referral code for accounts created before referrals existed, so
+    // every user can share and earn. One-time, on the first /me after this update.
+    if (!user.referralCode) {
+      try {
+        user.referralCode = await generateUniqueReferralCode();
+        await user.save();
+      } catch (e) {
+        console.error('referral backfill error:', e);
+      }
+    }
     res.json(user);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
