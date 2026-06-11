@@ -241,12 +241,15 @@ router.post('/abandon/:roomCode', auth, async (req, res) => {
     );
     if (!isPlayer) return res.status(403).json({ message: 'Not a player in this game' });
 
-    // Refund both players
+    // Refund both players — UNLOCK ONLY. A stake is only ever locked (balance is
+    // never debited when a game starts), so a refund must only release lockedBalance.
+    // The previous `balance += betAmount` here double-credited the player (free money) —
+    // removed. balanceBefore === balanceAfter because balance is untouched, exactly like
+    // every other refund path (cancel, 2-min abort, both-disconnected, startup sweep).
     for (const p of game.players) {
       const u = await User.findById(p.user._id);
       if (u) {
         const before = u.balance;
-        u.balance += game.betAmount;
         u.lockedBalance = Math.max(0, u.lockedBalance - game.betAmount);
         await u.save();
 
