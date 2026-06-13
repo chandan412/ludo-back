@@ -42,6 +42,16 @@ const userSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
+  // ✅ Referral BONUS — the portion of `balance` that came from referral rewards and is
+  // NOT withdrawable. IMPORTANT: `balance` ALREADY INCLUDES this amount. This is a marker
+  // tracking how much of the balance is bonus, NOT a separate wallet. It makes bonus money
+  // spendable in games (it's part of balance) while keeping it out of withdrawals.
+  // Withdrawable = balance - lockedBalance - bonusBalance.
+  bonusBalance: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
   isActive: {
     type: Boolean,
     default: true
