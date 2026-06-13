@@ -162,6 +162,25 @@ router.post('/join/:roomCode', auth, async (req, res) => {
         message: `Insufficient balance. Need ₹${game.betAmount}, available: ₹${available}`
       });
 
+    // ✅ Anti-laundering (referral rule): referral-linked players — the referrer and the
+    // person who signed up with their code — may ONLY play each other with REAL money,
+    // never bonus. This blocks the "refer my own account, then play it to convert the free
+    // bonus into withdrawable winnings" trick. Bonus lives INSIDE `balance`; a stake is
+    // real-backed only if non-bonus balance covers the locked amount.
+    const creator = await User.findById(game.createdBy);
+    const linked =
+      (creator && creator.referredBy && creator.referredBy.toString() === user._id.toString()) ||
+      (creator && user.referredBy && user.referredBy.toString() === creator._id.toString());
+    if (linked) {
+      const joinerRealAvail   = user.balance - user.lockedBalance - (user.bonusBalance || 0);
+      const creatorRealBacked = (creator.balance - (creator.bonusBalance || 0)) >= creator.lockedBalance;
+      if (joinerRealAvail < game.betAmount || !creatorRealBacked) {
+        return res.status(400).json({
+          message: 'You and this player are referral-linked, so you can only play each other with real money — not bonus. Add real balance to play.'
+        });
+      }
+    }
+
     user.lockedBalance += game.betAmount;
     await user.save();
 
@@ -323,6 +342,9 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
     winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
     loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
     loser.balance        = Math.max(0, loser.balance - game.betAmount);
+    // ✅ Shrink the loser's bonus marker so it can't exceed real balance after the loss
+    // (mirrors settleGame in gameSocket.js — keep in sync). Bonus eaten by a loss is gone.
+    loser.bonusBalance   = Math.min(loser.bonusBalance || 0, loser.balance);
 
     winner.balance     += netWin;
     winner.gamesWon    += 1;
