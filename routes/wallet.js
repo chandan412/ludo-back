@@ -7,7 +7,7 @@ const { auth } = require('../middleware/auth');
 
 router.get('/balance', auth, async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('balance lockedBalance username');
+    const user = await User.findById(req.user._id).select('balance lockedBalance bonusBalance username');
 
     // ✅ Auto-reconcile lockedBalance against active games + pending withdrawals.
     // Prevents stale "money in game" when no game exists.
@@ -35,7 +35,11 @@ router.get('/balance', auth, async (req, res) => {
     res.json({
       balance: user.balance,
       lockedBalance: user.lockedBalance,
+      bonusBalance: user.bonusBalance || 0,
+      // availableBalance = what they can PLAY with (includes bonus, minus locks)
       availableBalance: user.balance - user.lockedBalance,
+      // withdrawableBalance = what they can WITHDRAW (excludes the non-withdrawable bonus)
+      withdrawableBalance: Math.max(0, user.balance - user.lockedBalance - (user.bonusBalance || 0)),
     });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -98,9 +102,16 @@ router.post('/withdraw-request', auth, async (req, res) => {
     if (!amount || amount < 100)
       return res.status(400).json({ message: 'Minimum withdrawal amount is ₹100' });
     const user = await User.findById(req.user._id);
-    const available = user.balance - user.lockedBalance;
-    if (amount > available)
-      return res.status(400).json({ message: `Insufficient balance. Available: ₹${available}` });
+    // ✅ Bonus is NON-withdrawable. Withdrawable money = real balance minus locks minus the
+    // bonus marker. If they try to withdraw into the bonus portion, tell them clearly.
+    const bonus = user.bonusBalance || 0;
+    const available = Math.max(0, user.balance - user.lockedBalance - bonus);
+    if (amount > available) {
+      const msg = bonus > 0
+        ? `You can't withdraw your referral bonus (₹${bonus}). Bonus can only be used to play. Withdrawable: ₹${available}`
+        : `Insufficient balance. Available: ₹${available}`;
+      return res.status(400).json({ message: msg });
+    }
     if (!upiId && (!accountNumber || !ifscCode || !accountHolderName))
       return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
     const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
