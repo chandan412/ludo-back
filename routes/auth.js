@@ -61,13 +61,18 @@ router.post('/register', async (req, res) => {
       referredBy: referrer ? referrer._id : null,
     });
 
-    // ✅ Pay the REFERRER ₹50 — real, withdrawable balance (earned money, not a stake,
-    // so it credits `balance` directly). One credit per signup, logged as 'referral'.
+    // ✅ Pay the REFERRER ₹50 as BONUS — playable but NOT withdrawable (credited into
+    // `balance` and simultaneously tracked in `bonusBalance`). This kills the "refer my own
+    // fake accounts and withdraw the reward" fraud: the ₹50 can be played but never cashed
+    // out. One credit per signup, logged as 'referral'.
     // Non-fatal: the new account already exists; never fail signup over a bonus write.
     if (referrer) {
       try {
         const before = referrer.balance;
         referrer.balance         += REFERRAL_BONUS;
+        // ✅ Tag this credit as BONUS — it sits inside `balance` (so it's playable) but is
+        // NOT withdrawable. Withdrawals subtract bonusBalance; see wallet.js.
+        referrer.bonusBalance     = (referrer.bonusBalance || 0) + REFERRAL_BONUS;
         referrer.referralCount    = (referrer.referralCount || 0) + 1;
         referrer.referralEarnings = (referrer.referralEarnings || 0) + REFERRAL_BONUS;
         await referrer.save();
