@@ -287,6 +287,11 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
     winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
     loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
     loser.balance        = Math.max(0, loser.balance - game.betAmount);
+    // ✅ Bonus is non-withdrawable and lives INSIDE `balance`. When the loser's balance
+    // falls, shrink their bonus marker so it can never exceed real balance — otherwise a
+    // later genuine deposit would be wrongly treated as non-withdrawable. Bonus eaten by a
+    // loss is simply gone. Winner's winnings stay fully withdrawable (by design).
+    loser.bonusBalance   = Math.min(loser.bonusBalance || 0, loser.balance);
 
     const winnerBalanceBefore = winner.balance;
     const netWin = game.betAmount - platformFee;
