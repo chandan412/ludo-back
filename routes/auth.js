@@ -5,6 +5,7 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const crypto = require('crypto');
 const { auth } = require('../middleware/auth');
+const lineverify = require('../utils/lineverify');
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
@@ -263,6 +264,68 @@ router.post('/forgot-reset', async (req, res) => {
   } catch (err) {
     console.error('forgot-reset error:', err);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── PHONE VERIFICATION (LineVerify) ─────────────────────────────────────────────
+// Step 1 — START. Verify the number SAVED ON THE ACCOUNT (never an arbitrary number the
+// user types), so a fake / non-WhatsApp number simply can't pass. Returns the hosted
+// verify_url for the frontend popup. If the feature is switched off (no key / disabled),
+// we report enabled:false and the frontend just lets the user through.
+router.post('/phone/start', auth, async (req, res) => {
+  try {
+    if (!lineverify.isEnabled()) return res.json({ enabled: false });
+
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ message: 'Account not found' });
+    if (user.phoneVerified) return res.json({ enabled: true, alreadyVerified: true });
+
+    const result = await lineverify.startVerification(user.phone, { userId: String(user._id) });
+    res.json({
+      enabled: true,
+      id: result.id,
+      verify_url: result.verify_url,
+      whatsapp_url: result.whatsapp_url || null,
+    });
+  } catch (err) {
+    console.error('phone/start error:', err.message);
+    res.status(502).json({ message: 'Could not start verification. Please try again.' });
+  }
+});
+
+// Step 3 — CONFIRM. The browser only hands us a verification_id; we confirm SERVER-SIDE
+// with our API key, and ONLY mark the user verified if the confirmed number MATCHES the
+// number on the account. This is what stops a fraudster from verifying some other real
+// number to bless an account that carries a fake one.
+router.post('/phone/confirm', auth, async (req, res) => {
+  try {
+    if (!lineverify.isEnabled()) return res.json({ verified: true, enabled: false });
+
+    const { verification_id } = req.body;
+    if (!verification_id) return res.status(400).json({ message: 'verification_id required' });
+
+    const result = await lineverify.confirmVerification(verification_id);
+
+    const user = await User.findById(req.user._id);
+    if (!user) return res.status(404).json({ message: 'Account not found' });
+
+    const confirmedE164 = lineverify.toE164(result.phone);
+    const accountE164   = lineverify.toE164(user.phone);
+    if (!result.verified || confirmedE164 !== accountE164) {
+      return res.status(400).json({
+        verified: false,
+        message: 'Verification did not match your registered number. Please verify the number on your account.',
+      });
+    }
+
+    user.phoneVerified   = true;
+    user.phoneVerifiedAt = new Date();
+    await user.save();
+
+    res.json({ verified: true });
+  } catch (err) {
+    console.error('phone/confirm error:', err.message);
+    res.status(502).json({ message: 'Could not confirm verification. Please try again.' });
   }
 });
 
