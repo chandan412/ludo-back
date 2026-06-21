@@ -32,6 +32,19 @@ function toE164(phone) {
   return '+' + digits;
 }
 
+// Force an absolute https URL. The LineVerify API can return verify_url WITHOUT a scheme
+// (e.g. "host/verify/34/<id>"). A schemeless URL is treated by the browser as RELATIVE, so
+// the embedded SDK iframe would load OUR OWN app (dark → black popup) instead of the verify
+// page. This guarantees a proper absolute URL.
+function ensureHttps(url) {
+  const s = String(url || '').trim();
+  if (!s) return s;
+  if (/^https?:\/\//i.test(s)) return s;   // already absolute
+  if (s.startsWith('//')) return 'https:' + s; // protocol-relative
+  if (s.startsWith('/')) return BASE_URL + s;  // path relative to the service
+  return 'https://' + s;                        // bare host+path
+}
+
 // Native https JSON request helper (mirrors utils/fcm.js httpsPost).
 function httpsRequest(method, url, headers, body) {
   return new Promise((resolve, reject) => {
@@ -70,7 +83,12 @@ async function startVerification(phone, metadata = {}) {
     { Authorization: `Bearer ${API_KEY}` },
     { phone: toE164(phone), method: 'whatsapp', metadata });
   if (!res.ok) throw new Error((res.json && (res.json.message || res.json.error)) || `LineVerify start failed (${res.status})`);
-  return res.json;
+  const data = res.json || {};
+  // ✅ Make the hosted URLs absolute so the embedded SDK iframe loads the real verify page
+  // (not our own app). The API may omit the https:// scheme on verify_url.
+  if (data.verify_url)   data.verify_url   = ensureHttps(data.verify_url);
+  if (data.whatsapp_url) data.whatsapp_url = ensureHttps(data.whatsapp_url);
+  return data;
 }
 
 // Step 3 — confirm a verification (one-time, trustworthy). Returns { verified, phone, ... }.
