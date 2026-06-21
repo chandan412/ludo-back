@@ -4,6 +4,7 @@ const Game = require('../models/Game');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
+const lineverify = require('../utils/lineverify');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -96,6 +97,11 @@ router.post('/create', auth, async (req, res) => {
       return res.status(400).json({ message: 'Minimum bet is ₹10' });
 
     const user = await User.findById(req.user._id);
+    // ✅ Phone-verification gate — new players must verify before they can play. Existing
+    // players are grandfathered (see server.js). needsPhoneVerification tells the frontend
+    // to route the user to the verify screen instead of showing a plain error.
+    if (lineverify.isEnabled() && !user.phoneVerified)
+      return res.status(403).json({ message: 'Please verify your phone number to play.', needsPhoneVerification: true });
     const available = user.balance - user.lockedBalance;
     if (available < betAmount)
       return res.status(400).json({ message: `Insufficient balance. Available: ₹${available}` });
@@ -156,6 +162,9 @@ router.post('/join/:roomCode', auth, async (req, res) => {
       return res.status(400).json({ message: 'You already have an active game' });
 
     const user = await User.findById(req.user._id);
+    // ✅ Phone-verification gate (same as create).
+    if (lineverify.isEnabled() && !user.phoneVerified)
+      return res.status(403).json({ message: 'Please verify your phone number to play.', needsPhoneVerification: true });
     const available = user.balance - user.lockedBalance;
     if (available < game.betAmount)
       return res.status(400).json({
