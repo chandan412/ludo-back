@@ -26,7 +26,7 @@ async function generateUniqueReferralCode() {
 // ── REGISTER ──────────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, phone, password, referralCode } = req.body;
+    const { username, email, phone, password, referralCode, verificationId } = req.body;
     if (!username || !email || !phone || !password)
       return res.status(400).json({ message: 'All fields are required' });
 
@@ -41,6 +41,28 @@ router.post('/register', async (req, res) => {
       if (exists.email    === emailLower)     return res.status(400).json({ message: 'Email already registered' });
       if (exists.username === usernameTrimmed) return res.status(400).json({ message: 'Username taken' });
       if (exists.phone    === phoneTrimmed)   return res.status(400).json({ message: 'Phone already registered' });
+    }
+
+    // ✅ PHONE VERIFICATION AT SIGNUP — the account is only created if the number was proven
+    // FIRST. The frontend verifies via the popup, then sends us the verification_id; we
+    // confirm it server-side (trustworthy) and require the confirmed number to MATCH the
+    // number being registered. Duplicate checks above run first, so a verified number is
+    // never wasted on an "already registered" error.
+    let phoneVerified = false;
+    if (lineverify.isEnabled()) {
+      if (!verificationId)
+        return res.status(400).json({ message: 'Phone verification required', needsPhoneVerification: true });
+      try {
+        const result = await lineverify.confirmVerification(verificationId);
+        const confirmedE164 = lineverify.toE164(result.phone);
+        const signupE164    = lineverify.toE164(phoneTrimmed);
+        if (!result.verified || confirmedE164 !== signupE164)
+          return res.status(400).json({ message: 'Phone verification did not match this number. Please verify again.', needsPhoneVerification: true });
+        phoneVerified = true;
+      } catch (vErr) {
+        console.error('register verify error:', vErr.message);
+        return res.status(502).json({ message: 'Could not confirm phone verification. Please try again.' });
+      }
     }
 
     // ✅ REFERRAL: resolve the referrer if a code was entered. The new account does
@@ -60,6 +82,8 @@ router.post('/register', async (req, res) => {
       password,
       referralCode: myReferralCode,
       referredBy: referrer ? referrer._id : null,
+      phoneVerified,
+      phoneVerifiedAt: phoneVerified ? new Date() : null,
     });
 
     // ✅ Pay the REFERRER ₹50 as BONUS — playable but NOT withdrawable (credited into
@@ -264,6 +288,46 @@ router.post('/forgot-reset', async (req, res) => {
   } catch (err) {
     console.error('forgot-reset error:', err);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── PHONE VERIFICATION — PRE-SIGNUP (no auth; the account doesn't exist yet) ─────
+// Starts a verification for the number a NEW user is signing up with, AND pre-checks that
+// the email / username / phone aren't already taken — so a verified number is never wasted
+// on a duplicate signup. The frontend opens the popup with verify_url, then passes the
+// resulting verification_id to /register, which confirms it before creating the account.
+router.post('/phone/start-signup', async (req, res) => {
+  try {
+    if (!lineverify.isEnabled()) return res.json({ enabled: false });
+
+    const { phone, email, username } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Phone number is required' });
+
+    const phoneTrimmed    = String(phone).trim();
+    const emailLower      = email ? String(email).toLowerCase().trim() : null;
+    const usernameTrimmed = username ? String(username).trim() : null;
+
+    const or = [{ phone: phoneTrimmed }];
+    if (emailLower)      or.push({ email: emailLower });
+    if (usernameTrimmed) or.push({ username: usernameTrimmed });
+    const exists = await User.findOne({ $or: or });
+    if (exists) {
+      if (exists.phone === phoneTrimmed)                          return res.status(400).json({ message: 'Phone already registered' });
+      if (emailLower && exists.email === emailLower)              return res.status(400).json({ message: 'Email already registered' });
+      if (usernameTrimmed && exists.username === usernameTrimmed) return res.status(400).json({ message: 'Username taken' });
+      return res.status(400).json({ message: 'Account already exists' });
+    }
+
+    const result = await lineverify.startVerification(phoneTrimmed, { signup: true });
+    res.json({
+      enabled: true,
+      id: result.id,
+      verify_url: result.verify_url,
+      whatsapp_url: result.whatsapp_url || null,
+    });
+  } catch (err) {
+    console.error('phone/start-signup error:', err.message);
+    res.status(502).json({ message: 'Could not start verification. Please try again.' });
   }
 });
 
