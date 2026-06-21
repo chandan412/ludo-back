@@ -673,14 +673,32 @@ module.exports = (io) => {
           // 2) Pass the turn ~1.5s later, so the dice number stays visible first.
           //    (The turn is already committed in the DB above; this only controls
           //    when the clients are told to clear the dice and move on.)
+          //
+          // ✅ RACE FIX (2.1): the opponent can roll within this 1.5s window. If they
+          //    have, a fresh 'dice-rolled' is already on their screen — emitting the
+          //    stale 'turn-passed' now would clear THEIR dice and strand them. So at
+          //    fire time we re-read the game and only clear if the opponent still
+          //    hasn't rolled (lastDiceRoll still null AND it's still their turn).
           const passRoom = roomCode;
+          const expectedNextTurn = opponentState.user._id.toString();
           const passPayload = {
             reason: 'No valid moves',
-            nextTurn: opponentState.user._id.toString(),
+            nextTurn: expectedNextTurn,
             nextTurnUsername: opponentState.user.username,
           };
-          setTimeout(() => {
-            io.to(passRoom).emit('turn-passed', passPayload);
+          setTimeout(async () => {
+            try {
+              const fresh = await Game.findOne({ roomCode: passRoom, status: 'active' });
+              if (fresh &&
+                  (fresh.lastDiceRoll === null || fresh.lastDiceRoll === undefined) &&
+                  fresh.currentTurn && fresh.currentTurn.toString() === expectedNextTurn) {
+                io.to(passRoom).emit('turn-passed', passPayload);
+              }
+              // else: opponent already rolled / turn moved on / game ended — do NOT
+              // clobber their dice.
+            } catch (e) {
+              console.error('delayed turn-pass check error:', e.message);
+            }
           }, 1500);
           return;
         }
@@ -1150,5 +1168,75 @@ module.exports = (io) => {
     });
 
   }); // end io.on('connection')
+
+  // ============================================================================
+  // ✅ ORPHANED ACTIVE-GAME SWEEP (restart recovery) — fixes the "stuck active game
+  // with locked balances after a redeploy" gap.
+  //
+  // A server restart wipes the in-memory disconnect (60s) and absence timers, so an
+  // active game whose players never reconnect would sit 'active' forever with both
+  // stakes locked. This periodic sweep ends + refunds those — and ONLY those.
+  //
+  // THREE guards make it impossible to abort a game that's actually being played:
+  //   1) PRESENCE — neither player is live in the room's socket (both truly gone).
+  //   2) STALENESS — the game hasn't been touched in > STALE_MS (no moves / no
+  //      reconnect writes). A reconnect ($set isConnected) or any move refreshes
+  //      updatedAt, so a resuming game is never stale.
+  //   3) GRACE — the first run is delayed by the interval, giving clients time to
+  //      reconnect after a redeploy before we judge anything orphaned.
+  //
+  // MONEY SAFETY: status is flipped active→aborted ATOMICALLY (so a racing
+  // settlement can't double-process), and the refund is UNLOCK-ONLY
+  // (lockedBalance -= bet; balance is never touched), with a 'refund' Transaction.
+  // ============================================================================
+  const ORPHAN_SWEEP_INTERVAL_MS = 120000; // run every 2 min (first run ~2 min after boot)
+  const ORPHAN_STALE_MS          = 90000;  // only touch games idle for > 90s
+  setInterval(async () => {
+    try {
+      const cutoff = new Date(Date.now() - ORPHAN_STALE_MS);
+      const stale = await Game.find({ status: 'active', updatedAt: { $lt: cutoff } });
+      for (const g of stale) {
+        const p0 = g.players[0]?.user?.toString();
+        const p1 = g.players[1]?.user?.toString();
+        const anyLive =
+          (p0 && isUserLiveInRoom(io, g.roomCode, p0)) ||
+          (p1 && isUserLiveInRoom(io, g.roomCode, p1));
+        if (anyLive) continue; // someone is present — normal flow owns this game
+
+        // Atomically claim it (active → aborted). If a settlement beat us, skip.
+        const aborted = await Game.findOneAndUpdate(
+          { _id: g._id, status: 'active' },
+          { $set: { status: 'aborted', finishedAt: new Date() } },
+          { new: true }
+        );
+        if (!aborted) continue;
+
+        for (const p of aborted.players) {
+          const u = await User.findById(p.user);
+          if (!u) continue;
+          const before = u.balance; // balance untouched — unlock only
+          u.lockedBalance = Math.max(0, u.lockedBalance - aborted.betAmount);
+          await u.save();
+          await Transaction.create({
+            user: u._id,
+            type: 'refund',
+            amount: aborted.betAmount,
+            balanceBefore: before,
+            balanceAfter: u.balance,
+            status: 'completed',
+            gameId: aborted._id,
+          });
+        }
+
+        io.to(aborted.roomCode).emit('game-aborted', {
+          reason: 'server_restart',
+          message: 'Game ended after a server restart — both bets refunded.',
+        });
+        console.log(`🧹 Orphan active sweep: aborted ${aborted.roomCode}, refunded both (₹${aborted.betAmount} each).`);
+      }
+    } catch (e) {
+      console.error('orphan active sweep error (non-fatal):', e.message);
+    }
+  }, ORPHAN_SWEEP_INTERVAL_MS);
 
 }; // end module.exports
