@@ -52,6 +52,17 @@ const userSchema = new mongoose.Schema({
     default: 0,
     min: 0
   },
+  // ✅ Phone verification (LineVerify). NEW users must verify their number before they can
+  // play. EXISTING users (created before this feature) are grandfathered to `true` by a
+  // one-time migration in server.js, so they're never blocked.
+  phoneVerified: {
+    type: Boolean,
+    default: false
+  },
+  phoneVerifiedAt: {
+    type: Date,
+    default: null
+  },
   isActive: {
     type: Boolean,
     default: true
