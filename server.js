@@ -175,6 +175,21 @@ const connectDB = async () => {
     // ✅ One-time cleanup of orphaned waiting rooms, now that the DB is reachable.
     // Self-guarded (never throws), so it can't trip the catch/retry below.
     await releaseOrphanedWaitingGames();
+
+    // ✅ Grandfather existing users into phone-verification. Accounts created before this
+    // feature have no `phoneVerified` field, so without this they'd be wrongly blocked from
+    // playing. We mark only those legacy docs as verified. Idempotent: new signups always
+    // write the field explicitly, so this never touches them and re-runs hit 0 docs.
+    try {
+      const User = require('./models/User');
+      const r = await User.updateMany(
+        { phoneVerified: { $exists: false } },
+        { $set: { phoneVerified: true } }
+      );
+      if (r.modifiedCount) console.log(`✅ Grandfathered ${r.modifiedCount} existing user(s) as phone-verified.`);
+    } catch (e) {
+      console.error('phoneVerified grandfather error (non-fatal):', e.message);
+    }
   } catch (err) {
     console.error('❌ MongoDB initial connection error:', err.message, '— retrying in 5s');
     setTimeout(connectDB, 5000);
