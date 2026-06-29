@@ -251,7 +251,12 @@ async function reEvaluateActivePresence(io, roomCode) {
         finished.platformFee = platformFee;
         await finished.save();
 
-        await settleGame(finished, winnerId, loserId, winAmount, platformFee);
+        try {
+          await settleGame(finished, winnerId, loserId, winAmount, platformFee);
+        } catch (settleErr) {
+          console.error('CRITICAL: absence-rearm settlement failed for game', finished._id, settleErr);
+          Game.findByIdAndUpdate(finished._id, { $set: { settlementFailed: true } }).catch(() => {});
+        }
 
         io.to(roomCode).emit('game-over', {
           reason: 'opponent_disconnected',
@@ -280,66 +285,63 @@ async function reEvaluateActivePresence(io, roomCode) {
 // Helper: Settle game finances
 // ============================
 async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
-  try {
-    const winner = await User.findById(winnerId);
-    const loser  = await User.findById(loserId);
+  // ✅ FIX BUG-3: No internal try-catch — errors bubble up to the caller.
+  // Each call site wraps this and decides whether to proceed with game-over.
+  // This prevents the silent wallet-failure bug where winner sees "You Won!"
+  // but their balance was never credited (MongoDB M0 timeout swallowed by catch).
+  const winner = await User.findById(winnerId);
+  const loser  = await User.findById(loserId);
 
-    winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
-    loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
-    loser.balance        = Math.max(0, loser.balance - game.betAmount);
-    // ✅ Bonus is non-withdrawable and lives INSIDE `balance`. When the loser's balance
-    // falls, shrink their bonus marker so it can never exceed real balance — otherwise a
-    // later genuine deposit would be wrongly treated as non-withdrawable. Bonus eaten by a
-    // loss is simply gone. Winner's winnings stay fully withdrawable (by design).
-    loser.bonusBalance   = Math.min(loser.bonusBalance || 0, loser.balance);
+  winner.lockedBalance = Math.max(0, winner.lockedBalance - game.betAmount);
+  loser.lockedBalance  = Math.max(0, loser.lockedBalance  - game.betAmount);
+  loser.balance        = Math.max(0, loser.balance - game.betAmount);
+  // ✅ Shrink bonus marker so it can never exceed real balance after the loss.
+  loser.bonusBalance   = Math.min(loser.bonusBalance || 0, loser.balance);
 
-    const winnerBalanceBefore = winner.balance;
-    const netWin = game.betAmount - platformFee;
-    winner.balance     += netWin;
-    winner.gamesWon    += 1;
-    winner.gamesPlayed += 1;
-    winner.totalEarned += netWin;
-    loser.gamesPlayed  += 1;
-    loser.totalLost    += game.betAmount;
+  const winnerBalanceBefore = winner.balance;
+  const netWin = game.betAmount - platformFee;
+  winner.balance     += netWin;
+  winner.gamesWon    += 1;
+  winner.gamesPlayed += 1;
+  winner.totalEarned += netWin;
+  loser.gamesPlayed  += 1;
+  loser.totalLost    += game.betAmount;
 
-    await winner.save();
-    await loser.save();
+  await winner.save();
+  await loser.save();
 
-    await Transaction.create({
-      user: winnerId,
-      type: 'game_win',
-      amount: netWin,
-      balanceBefore: winnerBalanceBefore,
-      balanceAfter:  winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
+  await Transaction.create({
+    user: winnerId,
+    type: 'game_win',
+    amount: netWin,
+    balanceBefore: winnerBalanceBefore,
+    balanceAfter:  winner.balance,
+    status: 'completed',
+    gameId: game._id,
+  });
 
-    const loserBalanceBefore = loser.balance + game.betAmount;
-    await Transaction.create({
-      user: loserId,
-      type: 'game_loss',
-      amount: game.betAmount,
-      balanceBefore: loserBalanceBefore,
-      balanceAfter:  loser.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
+  const loserBalanceBefore = loser.balance + game.betAmount;
+  await Transaction.create({
+    user: loserId,
+    type: 'game_loss',
+    amount: game.betAmount,
+    balanceBefore: loserBalanceBefore,
+    balanceAfter:  loser.balance,
+    status: 'completed',
+    gameId: game._id,
+  });
 
-    await Transaction.create({
-      user: winnerId,
-      type: 'platform_fee',
-      amount: platformFee,
-      balanceBefore: winner.balance,
-      balanceAfter:  winner.balance,
-      status: 'completed',
-      gameId: game._id,
-    });
+  await Transaction.create({
+    user: winnerId,
+    type: 'platform_fee',
+    amount: platformFee,
+    balanceBefore: winner.balance,
+    balanceAfter:  winner.balance,
+    status: 'completed',
+    gameId: game._id,
+  });
 
-    console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
-  } catch (err) {
-    console.error('Game settlement error:', err);
-  }
+  console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
 }
 
 // ============================
@@ -774,14 +776,15 @@ module.exports = (io) => {
         game.lastDiceRoll = null;
 
         const moveData = {
-          playerId: socket.user._id.toString(),
-          playerUsername: socket.user.username,
+          playerId:        socket.user._id.toString(),
+          playerUsername:  socket.user.username,
           tokenIndex,
-          fromProgress:  move.currentProgress,
-          toProgress:    move.newProgress,
-          captured:      result.captured,
-          extraTurn:     result.extraTurn,
-          finishedCount: result.finishedCount,
+          fromProgress:    move.currentProgress,
+          toProgress:      move.newProgress,
+          captured:        result.captured,
+          passiveCaptured: result.passiveCaptured, // ✅ BUG-8: passive capture feedback
+          extraTurn:       result.extraTurn,
+          finishedCount:   result.finishedCount,
         };
 
         // Game over
@@ -798,7 +801,19 @@ module.exports = (io) => {
           game.platformFee  = platformFee;
 
           await game.save();
-          await settleGame(game, socket.user._id, opponentState.user._id, winAmount, platformFee);
+
+          // ✅ BUG-3 FIX: settle BEFORE emitting game-over. If settlement fails (MongoDB M0
+          // timeout), mark the game for retry and still emit game-over so neither player
+          // gets stuck — but with a settlementPending flag so the UI can show a note.
+          let settlementOk = true;
+          try {
+            await settleGame(game, socket.user._id, opponentState.user._id, winAmount, platformFee);
+          } catch (settleErr) {
+            settlementOk = false;
+            console.error('CRITICAL: settlement failed for game', game._id, settleErr);
+            // Non-blocking — mark for manual review / retry, never throw here.
+            Game.findByIdAndUpdate(game._id, { $set: { settlementFailed: true } }).catch(() => {});
+          }
 
           io.to(roomCode).emit('game-over', {
             ...moveData,
@@ -807,6 +822,7 @@ module.exports = (io) => {
             winAmount,
             platformFee,
             pot,
+            settlementPending: !settlementOk, // frontend can show "wallet update in progress"
           });
           return;
         }
@@ -884,7 +900,12 @@ module.exports = (io) => {
         await game.save();
 
         // Same settlement as a normal win: loser loses their bet, winner gets pot − fee.
-        await settleGame(game, winnerId, loserId, winAmount, platformFee);
+        try {
+          await settleGame(game, winnerId, loserId, winAmount, platformFee);
+        } catch (settleErr) {
+          console.error('CRITICAL: forfeit settlement failed for game', game._id, settleErr);
+          Game.findByIdAndUpdate(game._id, { $set: { settlementFailed: true } }).catch(() => {});
+        }
 
         io.to(roomCode).emit('game-over', {
           reason:      'forfeit',
@@ -1111,7 +1132,12 @@ module.exports = (io) => {
           freshGame.finishedAt  = new Date();
           await freshGame.save();
 
-          await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
+          try {
+            await settleGame(freshGame, winnerId, loserId, winAmount, platformFee);
+          } catch (settleErr) {
+            console.error('CRITICAL: disconnect settlement failed for game', freshGame._id, settleErr);
+            Game.findByIdAndUpdate(freshGame._id, { $set: { settlementFailed: true } }).catch(() => {});
+          }
 
           io.to(socket.currentRoom).emit('game-over', {
             reason:  'opponent_disconnected',
@@ -1199,44 +1225,4 @@ module.exports = (io) => {
         const p0 = g.players[0]?.user?.toString();
         const p1 = g.players[1]?.user?.toString();
         const anyLive =
-          (p0 && isUserLiveInRoom(io, g.roomCode, p0)) ||
-          (p1 && isUserLiveInRoom(io, g.roomCode, p1));
-        if (anyLive) continue; // someone is present — normal flow owns this game
-
-        // Atomically claim it (active → aborted). If a settlement beat us, skip.
-        const aborted = await Game.findOneAndUpdate(
-          { _id: g._id, status: 'active' },
-          { $set: { status: 'aborted', finishedAt: new Date() } },
-          { new: true }
-        );
-        if (!aborted) continue;
-
-        for (const p of aborted.players) {
-          const u = await User.findById(p.user);
-          if (!u) continue;
-          const before = u.balance; // balance untouched — unlock only
-          u.lockedBalance = Math.max(0, u.lockedBalance - aborted.betAmount);
-          await u.save();
-          await Transaction.create({
-            user: u._id,
-            type: 'refund',
-            amount: aborted.betAmount,
-            balanceBefore: before,
-            balanceAfter: u.balance,
-            status: 'completed',
-            gameId: aborted._id,
-          });
-        }
-
-        io.to(aborted.roomCode).emit('game-aborted', {
-          reason: 'server_restart',
-          message: 'Game ended after a server restart — both bets refunded.',
-        });
-        console.log(`🧹 Orphan active sweep: aborted ${aborted.roomCode}, refunded both (₹${aborted.betAmount} each).`);
-      }
-    } catch (e) {
-      console.error('orphan active sweep error (non-fatal):', e.message);
-    }
-  }, ORPHAN_SWEEP_INTERVAL_MS);
-
-}; // end module.exports
+          (p0 && isUserLiveInRoom(io, g.roomCo
