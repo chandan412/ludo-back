@@ -136,8 +136,9 @@ class LudoEngine {
     token.position = newProgress;
     token.isHome   = false;
 
-    let captured = false;
-    let gameOver  = false;
+    let captured        = false;
+    let passiveCaptured = false;
+    let gameOver        = false;
 
     // Build temporary state objects reflecting the post-move token positions, so
     // count helpers see the new reality (the moved token is already at newProgress).
@@ -185,6 +186,7 @@ class LudoEngine {
           if (this.getGlobalPosition(movedColor, p) === oldGlobalPos) {
             myToken.position = -1;
             myToken.isHome   = true;
+            passiveCaptured  = true;
             // Note: this is the opponent capturing me — does NOT grant me a capture/extra turn
           }
         });
@@ -203,12 +205,8 @@ class LudoEngine {
     // ✅ Extra turn on 6 OR capture OR reaching main home (finishing a token)
     const extraTurn = diceRoll === 6 || captured || token.isFinished;
 
-    return { newPlayerTokens, newOpponentTokens, captured, extraTurn, gameOver, finishedCount };
+    return { newPlayerTokens, newOpponentTokens, captured, passiveCaptured, extraTurn, gameOver, finishedCount };
   }
 
   static hasValidMoves(playerState, diceRoll, opponentState) {
-    return this.getValidMoves(playerState, diceRoll, opponentState).length > 0;
-  }
-}
-
-module.exports = LudoEngine;
+    return this.
