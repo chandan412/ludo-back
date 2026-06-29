@@ -1225,4 +1225,44 @@ module.exports = (io) => {
         const p0 = g.players[0]?.user?.toString();
         const p1 = g.players[1]?.user?.toString();
         const anyLive =
-          (p0 && isUserLiveInRoom(io, g.roomCo
+          (p0 && isUserLiveInRoom(io, g.roomCode, p0)) ||
+          (p1 && isUserLiveInRoom(io, g.roomCode, p1));
+        if (anyLive) continue; // someone is present — normal flow owns this game
+
+        // Atomically claim it (active → aborted). If a settlement beat us, skip.
+        const aborted = await Game.findOneAndUpdate(
+          { _id: g._id, status: 'active' },
+          { $set: { status: 'aborted', finishedAt: new Date() } },
+          { new: true }
+        );
+        if (!aborted) continue;
+
+        for (const p of aborted.players) {
+          const u = await User.findById(p.user);
+          if (!u) continue;
+          const before = u.balance; // balance untouched — unlock only
+          u.lockedBalance = Math.max(0, u.lockedBalance - aborted.betAmount);
+          await u.save();
+          await Transaction.create({
+            user: u._id,
+            type: 'refund',
+            amount: aborted.betAmount,
+            balanceBefore: before,
+            balanceAfter: u.balance,
+            status: 'completed',
+            gameId: aborted._id,
+          });
+        }
+
+        io.to(aborted.roomCode).emit('game-aborted', {
+          reason: 'server_restart',
+          message: 'Game ended after a server restart — both bets refunded.',
+        });
+        console.log(`\u{1F9F9} Orphan active sweep: aborted ${aborted.roomCode}, refunded both (₹${aborted.betAmount} each).`);
+      }
+    } catch (e) {
+      console.error('orphan active sweep error (non-fatal):', e.message);
+    }
+  }, ORPHAN_SWEEP_INTERVAL_MS);
+
+}; // end module.exports
