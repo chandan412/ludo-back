@@ -137,7 +137,7 @@ class LudoEngine {
     token.isHome   = false;
 
     let captured        = false;
-    let passiveCaptured = false;
+    let passiveCaptured = false; // BUG-8
     let gameOver        = false;
 
     // Build temporary state objects reflecting the post-move token positions, so
@@ -186,7 +186,7 @@ class LudoEngine {
           if (this.getGlobalPosition(movedColor, p) === oldGlobalPos) {
             myToken.position = -1;
             myToken.isHome   = true;
-            passiveCaptured  = true;
+            passiveCaptured  = true; // BUG-8
             // Note: this is the opponent capturing me — does NOT grant me a capture/extra turn
           }
         });
@@ -209,4 +209,8 @@ class LudoEngine {
   }
 
   static hasValidMoves(playerState, diceRoll, opponentState) {
-    return this.
+    return this.getValidMoves(playerState, diceRoll, opponentState).length > 0;
+  }
+}
+
+module.exports = LudoEngine;
