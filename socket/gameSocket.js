@@ -285,7 +285,6 @@ async function reEvaluateActivePresence(io, roomCode) {
 // Helper: Settle game finances
 // ============================
 async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
-  // No internal try-catch — errors propagate to call-site
   const winner = await User.findById(winnerId);
   const loser  = await User.findById(loserId);
 
@@ -782,7 +781,7 @@ module.exports = (io) => {
           fromProgress:  move.currentProgress,
           toProgress:    move.newProgress,
           captured:      result.captured,
-          passiveCaptured: result.passiveCaptured, // BUG-8
+          passiveCaptured: result.passiveCaptured,
           extraTurn:     result.extraTurn,
           finishedCount: result.finishedCount,
         };
@@ -877,7 +876,25 @@ module.exports = (io) => {
         ).populate('players.user', 'username');
 
         if (!game) {
-          socket.emit('error', { message: 'Game already ended or not found.' });
+          // Game already finished — player likely missed game-over event (brief disconnect).
+          // Re-emit the result so they see the correct screen instead of being stuck.
+          try {
+            const ended = await Game.findOne({ roomCode: roomCode.toUpperCase() })
+              .populate('players.user', 'username');
+            if (ended && ended.winner) {
+              const winnerP = ended.players.find(p => p.user._id.toString() === ended.winner.toString());
+              const loserP  = ended.players.find(p => p.user._id.toString() !== ended.winner.toString());
+              socket.emit('game-over', {
+                reason:      'recovered',
+                winner:      { id: ended.winner.toString(),       username: winnerP?.user?.username },
+                loser:       { id: ended.loser?.toString() || '', username: loserP?.user?.username },
+                winAmount:   ended.winAmount,
+                platformFee: ended.platformFee,
+              });
+              return;
+            }
+          } catch (_) {}
+          socket.emit('error', { message: 'Game already ended.' });
           return;
         }
 
