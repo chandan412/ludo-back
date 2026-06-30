@@ -91,8 +91,9 @@ const gameSchema = new mongoose.Schema({
     type: [moveHistorySchema],
     default: [],
   },
-  startedAt:  { type: Date, default: null },
-  finishedAt: { type: Date, default: null },
+  startedAt:        { type: Date,    default: null },
+  finishedAt:       { type: Date,    default: null },
+  settlementFailed: { type: Boolean, default: false }, // flag if money settlement threw
 }, {
   timestamps: true,   // adds createdAt + updatedAt automatically
 });
