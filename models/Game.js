@@ -101,4 +101,6 @@ const gameSchema = new mongoose.Schema({
 gameSchema.index({ roomCode: 1 });
 gameSchema.index({ 'players.user': 1, status: 1 });
 gameSchema.index({ createdBy: 1, status: 1 });
-gameSchema.index({ status: 1, updatedAt: 1 }); // orph
+gameSchema.index({ status: 1, updatedAt: 1 }); // orphan sweep query
+
+module.exports = mongoose.model('Game', gameSchema);
