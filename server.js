@@ -55,7 +55,14 @@ const io = new Server(server, {
     origin: (origin, callback) => callback(null, isOriginAllowed(origin)),
     methods: ['GET', 'POST'],
     credentials: true
-  }
+  },
+  // ✅ Faster dead-connection detection for flaky mobile networks. Defaults
+  // (pingInterval 25s + pingTimeout 20s) mean the server can take ~45s to notice
+  // a dropped socket — during which the opponent sees nothing and stale-disconnect
+  // races are wide open. 10s+10s cuts that to ~20s worst case. The 60s reconnect
+  // window that protects players is unchanged.
+  pingInterval: 10000,
+  pingTimeout: 10000
 });
 app.use(cors({
   origin: function (origin, callback) {
