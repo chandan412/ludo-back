@@ -524,6 +524,22 @@ module.exports = (io) => {
         const gt = waitingGraceTimers.get(roomCode);
         if (gt) { clearTimeout(gt); waitingGraceTimers.delete(roomCode); }
 
+        // ✅ Also cancel any pending 60s disconnect→forfeit timer FOR THIS USER ONLY.
+        // The frontend reconnects via 'join-room' (not 'reconnect-room'), so this is
+        // the path that must disarm it. Timers are stored per-user so rejoining can
+        // never disarm a forfeit window armed against the OPPONENT.
+        const ar = activeRooms.get(roomCode);
+        const myId = socket.user._id.toString();
+        if (ar?.disconnectTimers?.[myId]) {
+          clearTimeout(ar.disconnectTimers[myId]);
+          delete ar.disconnectTimers[myId];
+        }
+        // Legacy single-slot timer (pre-fix rooms still in memory): only clear if it
+        // was armed for this same user.
+        if (ar?.disconnectTimer && ar.disconnectTimerUser === myId) {
+          clearTimeout(ar.disconnectTimer); ar.disconnectTimer = null;
+        }
+
         socket.emit('game-state', sanitizeGame(game, socket.user._id));
         socket.to(roomCode).emit('player-connected', { username: socket.user.username });
 
@@ -990,6 +1006,22 @@ module.exports = (io) => {
         );
         if (playerIdx === -1) return;
 
+        // ✅ STALE-DISCONNECT GUARD (the "player loses while still playing" bug).
+        // On flaky mobile networks the client reconnects with a NEW socket in ~1-2s,
+        // but the OLD socket's 'disconnect' event fires on the server up to ~45s
+        // LATER (default pingInterval 25s + pingTimeout 20s). Without this guard the
+        // late disconnect flips isConnected=false and arms a fresh 60s forfeit timer
+        // for a player who is actively playing on the new socket — and since they
+        // never re-emit join-room, nothing flips it back, so 60s later they FORFEIT
+        // and LOSE MONEY mid-game.
+        // At 'disconnect' time this socket has already left all rooms, so
+        // isUserLiveInRoom only sees OTHER live sockets of the same user: if one
+        // exists, this disconnect is stale — ignore it completely.
+        if (isUserLiveInRoom(io, socket.currentRoom, socket.user._id)) {
+          console.log(`Stale disconnect ignored for ${socket.user.username} (newer socket live in ${socket.currentRoom})`);
+          return;
+        }
+
         // ✅ SCENARIO 1: Player disconnects while room is still WAITING.
         // Do NOT abort immediately — a page refresh looks identical to leaving.
         // Give a short grace window; if they don't reconnect (join-room clears this),
@@ -1079,6 +1111,12 @@ module.exports = (io) => {
           const freshGame = await Game.findOne({ roomCode: socket.currentRoom, status: 'active' });
           if (!freshGame) return;
 
+          // ✅ FINAL SAFETY NET at fire time: the DB flag can be stale, but a LIVE
+          // socket in the room cannot lie. If the player actually has a live socket
+          // here (reconnected via any path), NEVER forfeit them — real presence
+          // always beats the isConnected flag.
+          if (isUserLiveInRoom(io, socket.currentRoom, socket.user._id)) return;
+
           const disconnectedIdx = freshGame.players.findIndex(
             p => p.user._id.toString() === socket.user._id.toString()
           );
@@ -1162,8 +1200,15 @@ module.exports = (io) => {
           });
         }, 60000);
 
+        // ✅ Store the forfeit timer PER USER (not per room) so one player's rejoin
+        // can never disarm the window armed against the other. Any older timer for
+        // this same user is replaced (cleared) first.
         if (!activeRooms.has(socket.currentRoom)) activeRooms.set(socket.currentRoom, {});
-        activeRooms.get(socket.currentRoom).disconnectTimer = timer;
+        const roomEntry = activeRooms.get(socket.currentRoom);
+        roomEntry.disconnectTimers = roomEntry.disconnectTimers || {};
+        const uidKey = socket.user._id.toString();
+        if (roomEntry.disconnectTimers[uidKey]) clearTimeout(roomEntry.disconnectTimers[uidKey]);
+        roomEntry.disconnectTimers[uidKey] = timer;
 
       } catch (err) {
         console.error('disconnect handler error:', err);
@@ -1176,7 +1221,13 @@ module.exports = (io) => {
     socket.on('reconnect-room', async ({ roomCode }) => {
       try {
         const room = activeRooms.get(roomCode);
-        if (room?.disconnectTimer) {
+        // ✅ Clear only THIS user's forfeit timer — never the opponent's.
+        const rcUid = socket.user._id.toString();
+        if (room?.disconnectTimers?.[rcUid]) {
+          clearTimeout(room.disconnectTimers[rcUid]);
+          delete room.disconnectTimers[rcUid];
+        }
+        if (room?.disconnectTimer && room.disconnectTimerUser === rcUid) {
           clearTimeout(room.disconnectTimer);
           room.disconnectTimer = null;
         }
