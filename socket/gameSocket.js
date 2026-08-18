@@ -62,6 +62,117 @@ const chatSockets = new Set(); // socket ids currently in chat — used for the 
 // Shared chat message model (same one routes/chat.js reads history from).
 const ChatMessage = require('../models/ChatMessage');
 
+// ============================================================================
+// Helper: syncInviteCard — SINGLE SOURCE OF TRUTH for an invite card's state
+//
+// Every invite posted in global chat is a ChatMessage with type:'invite' and a
+// roomCode. This helper reads the matching Game document and pushes the real
+// outcome onto that card — who joined, whether it expired, who won — then
+// broadcasts 'invite-updated' so every client in chat repaints the card LIVE.
+//
+// Why derive from the Game doc instead of passing values in at each call site:
+// there are five separate places a game can end (normal win, forfeit, absence
+// re-arm, disconnect forfeit, abort). Hand-passing a winner at each one is five
+// chances to pass the wrong player. Reading the Game — which is already the
+// authoritative record used for settlement — means the card can never disagree
+// with who actually got paid.
+//
+// MONEY SAFETY: read-only with respect to games and balances. This function
+// only ever writes DISPLAY fields onto a chat message. It never touches Game,
+// User.balance, User.lockedBalance, or Transaction. Every call is wrapped so a
+// failure here can never interrupt settlement or game flow.
+// ============================================================================
+async function syncInviteCard(io, roomCode) {
+  try {
+    if (!roomCode) return;
+    const code = String(roomCode).toUpperCase();
+
+    // Skip entirely if there is no invite card for this room (games created
+    // from the Lobby never post one) — avoids a pointless Game lookup.
+    const card = await ChatMessage.findOne({ type: 'invite', roomCode: code })
+      .select('_id status')
+      .lean();
+    if (!card) return;
+    if (card.status === 'finished' || card.status === 'expired') return; // terminal
+
+    const game = await Game.findOne({ roomCode: code })
+      .populate('players.user', 'username')
+      .select('roomCode status players winner winAmount betAmount')
+      .lean();
+
+    const patch = deriveInviteState(game);
+    if (!patch) return;
+
+    await ChatMessage.updateOne({ _id: card._id }, { $set: patch });
+
+    io.to(CHAT_ROOM).emit('invite-updated', { roomCode: code, ...patch });
+  } catch (e) {
+    // Non-fatal by design — a chat card never blocks a real game.
+    console.error('syncInviteCard error (non-fatal):', e.message);
+  }
+}
+
+// Derive an invite card's display state from its Game document.
+// Kept identical in shape to the copy in routes/chat.js so the live socket path
+// and the history/backfill path can never disagree about what a card should say.
+function deriveInviteState(game) {
+  if (!game) {
+    return { status: 'expired', resultReason: 'no_opponent' };
+  }
+
+  const players  = Array.isArray(game.players) ? game.players : [];
+  const opponent = players[1]?.user;
+
+  if (game.status === 'waiting') {
+    return { status: 'waiting' };
+  }
+
+  if (game.status === 'aborted' || game.status === 'cancelled') {
+    return {
+      status: 'expired',
+      resultReason: game.status === 'cancelled' ? 'cancelled' : 'no_opponent',
+      acceptedBy: opponent?.username || '',
+      acceptedById: opponent?._id || null,
+    };
+  }
+
+  if (game.status === 'active') {
+    return {
+      status: 'accepted',
+      acceptedBy: opponent?.username || '',
+      acceptedById: opponent?._id || null,
+    };
+  }
+
+  if (game.status === 'finished') {
+    const winnerIdStr = game.winner ? String(game.winner) : '';
+    const winnerP = players.find(p => String(p.user?._id) === winnerIdStr);
+    const loserP  = players.find(p => String(p.user?._id) !== winnerIdStr);
+
+    if (!winnerIdStr) {
+      return {
+        status: 'expired',
+        resultReason: 'connection_lost',
+        acceptedBy: opponent?.username || '',
+        acceptedById: opponent?._id || null,
+      };
+    }
+
+    return {
+      status: 'finished',
+      acceptedBy: opponent?.username || '',
+      acceptedById: opponent?._id || null,
+      winnerName: winnerP?.user?.username || '',
+      winnerId: game.winner || null,
+      loserName: loserP?.user?.username || '',
+      winAmount: game.winAmount || 0,
+      resultReason: 'win',
+    };
+  }
+
+  return null;
+}
+
 // ============================
 // Helper: Start 2-min waiting timer with live countdown
 // ============================
@@ -114,15 +225,9 @@ function startWaitingTimer(io, roomCode) {
       });
 
       // ✅ Flip this game's chat invite card to "expired" for everyone, permanently.
-      try {
-        await ChatMessage.findOneAndUpdate(
-          { type: 'invite', roomCode: String(roomCode).toUpperCase() },
-          { $set: { status: 'expired' } }
-        );
-        io.to(CHAT_ROOM).emit('invite-expired', { roomCode });
-      } catch (e) {
-        console.error('invite-expire (timeout) error:', e);
-      }
+      // The game row is already status:'aborted' above, so syncInviteCard reads
+      // that and writes + broadcasts the expired state.
+      await syncInviteCard(io, roomCode);
     } catch (err) {
       console.error('Auto-abort error:', err);
     } finally {
@@ -225,6 +330,9 @@ async function reEvaluateActivePresence(io, roomCode) {
             reason: 'connection_lost',
             message: 'Both players lost connection. Game aborted — bets refunded.',
           });
+          // ✅ Expire the chat invite card — the room no longer exists.
+          await syncInviteCard(io, roomCode);
+
           console.log(`Absence re-arm: room ${roomCode} both gone — aborted + refunded`);
           return;
         }
@@ -265,6 +373,9 @@ async function reEvaluateActivePresence(io, roomCode) {
           winAmount,
           message: 'Opponent did not return. You win!',
         });
+
+        // ✅ Stamp the winner permanently onto this game's chat invite card.
+        await syncInviteCard(io, roomCode);
         console.log(`Absence re-arm: room ${roomCode} ${finished.players[loseIdx].user.username} did not return — ${finished.players[winIdx].user.username} wins`);
       } catch (e) {
         console.error('absence timer error:', e);
@@ -427,13 +538,22 @@ module.exports = (io) => {
       try {
         const amount = Number(betAmount) || 0;
         if (amount < 10 || !roomCode) return;
+
+        // ✅ Store the roomCode UPPERCASED. Room codes are generated uppercase
+        // in routes/game.js, and every invite lookup filters on the uppercased
+        // value — storing the raw string risked a card that could never be
+        // matched (and so could never be flipped to expired/finished) if a
+        // lowercase code ever reached this handler.
+        const code = String(roomCode).toUpperCase();
+
         const msg = await ChatMessage.create({
           userId:    socket.user._id,
           username:  socket.user.username,
           type:      'invite',
           betAmount: amount,
-          roomCode:  roomCode,
+          roomCode:  code,
           text:      '',
+          status:    'waiting',
         });
         io.to(CHAT_ROOM).emit('chat-message', {
           _id:       msg._id.toString(),
@@ -441,7 +561,8 @@ module.exports = (io) => {
           username:  socket.user.username,
           type:      'invite',
           betAmount: amount,
-          roomCode:  roomCode,
+          roomCode:  code,
+          status:    'waiting',
           createdAt: msg.createdAt,
         });
       } catch (err) {
@@ -588,16 +709,10 @@ module.exports = (io) => {
             acceptedBy: opponentName || socket.user.username,
           });
 
-          // ✅ Persist accepted status so the card stays "Accepted" after a refresh.
-          // Matched by the invite's stored (uppercase) roomCode. Non-fatal.
-          try {
-            await ChatMessage.findOneAndUpdate(
-              { type: 'invite', roomCode: String(roomCode).toUpperCase() },
-              { $set: { status: 'accepted' } }
-            );
-          } catch (e) {
-            console.error('invite-accept persist error:', e);
-          }
+          // ✅ Persist accepted status + WHO joined, so the card still shows it
+          // after a refresh. syncInviteCard reads the Game row (now 'active'
+          // with both players) and broadcasts 'invite-updated' to all of chat.
+          await syncInviteCard(io, roomCode);
         }
 
         // ✅ Re-arm the 60s disconnect/forfeit window from REAL presence. Survives a
@@ -833,6 +948,9 @@ module.exports = (io) => {
             platformFee,
             pot,
           });
+
+          // ✅ Stamp the winner permanently onto this game's chat invite card.
+          await syncInviteCard(io, roomCode);
           return;
         }
 
@@ -945,6 +1063,9 @@ module.exports = (io) => {
           platformFee,
           pot,
         });
+
+        // ✅ Stamp the winner permanently onto this game's chat invite card.
+        await syncInviteCard(io, roomCode);
 
         console.log(`Forfeit: ${game.players[loserIdx].user.username} exited, ${game.players[winnerIdx].user.username} wins ₹${winAmount}`);
       } catch (err) {
@@ -1069,15 +1190,7 @@ module.exports = (io) => {
               });
 
               // ✅ Expire this game's chat invite card too, permanently.
-              try {
-                await ChatMessage.findOneAndUpdate(
-                  { type: 'invite', roomCode: String(roomForGrace).toUpperCase() },
-                  { $set: { status: 'expired' } }
-                );
-                io.to(CHAT_ROOM).emit('invite-expired', { roomCode: roomForGrace });
-              } catch (e) {
-                console.error('invite-expire (grace) error:', e);
-              }
+              await syncInviteCard(io, roomForGrace);
             } catch (e) {
               console.error('waiting grace abort error:', e);
             }
@@ -1162,6 +1275,9 @@ module.exports = (io) => {
                 reason: 'connection_lost',
                 message: 'Both players lost connection. Game aborted — bets refunded.',
               });
+              // ✅ Expire the chat invite card — the room no longer exists.
+              await syncInviteCard(io, socket.currentRoom);
+
               console.log(`Both-disconnected: room ${socket.currentRoom} aborted, both players refunded`);
             } catch (e) {
               console.error('both-disconnected refund error:', e);
@@ -1198,6 +1314,9 @@ module.exports = (io) => {
             winAmount,
             message: `${socket.user.username} disconnected. You win!`,
           });
+
+          // ✅ Stamp the winner permanently onto this game's chat invite card.
+          await syncInviteCard(io, socket.currentRoom);
         }, 60000);
 
         // ✅ Store the forfeit timer PER USER (not per room) so one player's rejoin
