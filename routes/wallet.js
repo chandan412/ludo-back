@@ -5,6 +5,30 @@ const Transaction = require('../models/Transaction');
 const Game = require('../models/Game');
 const { auth } = require('../middleware/auth');
 
+// ============================================================================
+// ✅ notifyAdmins — fire-and-forget push to the admin panel.
+//
+// Replaces admin-side polling entirely. The panel previously only showed new
+// deposit/withdrawal requests after a manual page refresh; polling for them
+// would have meant a permanent background query load (the counters endpoint
+// alone costs 9 DB queries per call). This emits ONLY at the moment a request is
+// actually created, so idle cost is zero.
+//
+// Never throws. A socket problem must not turn a player's successful deposit
+// request into a 500 — the row is already committed by the time this runs, and
+// the panel has a slow safety refresh that would pick it up regardless.
+// ============================================================================
+function notifyAdmins(req, payload) {
+  try {
+    const io = req.app.get('io');
+    if (!io) return; // server.js not wired yet, or running in a test harness
+    const room = req.app.get('ADMIN_ROOM') || 'admin-room';
+    io.to(room).emit('admin-pending-update', { ...payload, at: Date.now() });
+  } catch (e) {
+    console.error('notifyAdmins failed (non-fatal):', e.message);
+  }
+}
+
 router.get('/balance', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id).select('balance lockedBalance bonusBalance username');
@@ -86,6 +110,18 @@ router.post('/recharge-request', auth, async (req, res) => {
       status: 'pending',
       rechargeNote: paymentNote || 'Payment via QR'
     });
+
+    // ✅ Push to any admin with the panel open — no polling required.
+    // Deliberately a tiny signal, not the transaction itself: the panel refetches
+    // the pending list (one indexed query) so it always renders authoritative,
+    // fully-populated data rather than trusting a socket payload.
+    // Wrapped so a socket failure can never fail the player's request.
+    notifyAdmins(req, {
+      kind: 'recharge',
+      username: req.user.username,
+      amount,
+    });
+
     res.status(201).json({
       message: 'Recharge request submitted. Admin will add balance after verifying payment.',
       transaction
@@ -128,6 +164,14 @@ router.post('/withdraw-request', auth, async (req, res) => {
     });
     user.lockedBalance += amount;
     await user.save();
+
+    // ✅ Push to any admin with the panel open — no polling required.
+    notifyAdmins(req, {
+      kind: 'withdraw',
+      username: req.user.username,
+      amount,
+    });
+
     res.status(201).json({
       message: 'Withdrawal request submitted. Admin will process within 24 hours.',
       transaction
