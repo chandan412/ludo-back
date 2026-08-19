@@ -83,6 +83,45 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/chat', chatRoutes);
 gameSocket(io);
+
+// ============================================================================
+// ✅ ADMIN LIVE UPDATES — zero-polling push channel.
+//
+// Deposit/withdrawal requests used to appear only after the admin manually
+// refreshed the page. The obvious fix is polling, but the admin panel's counters
+// endpoint (/api/admin/dashboard-stats) costs NINE database queries per call —
+// six countDocuments plus three aggregates that scan the whole transactions
+// collection and get slower every day. Polling that every 5s is ~108 queries a
+// minute, forever, whether or not anything actually changed.
+//
+// Instead the server pushes a tiny signal at the only moment that matters: when
+// a player actually submits a request. Idle cost is ZERO queries.
+//
+// This is registered as a SECOND io.on('connection') listener rather than being
+// added inside socket/gameSocket.js. Socket.IO supports multiple connection
+// handlers, so this keeps live game/money socket code completely untouched.
+// The io.use() JWT middleware inside gameSocket has already run by this point,
+// so socket.user is populated and trustworthy here.
+// ============================================================================
+const ADMIN_ROOM = 'admin-room';
+
+io.on('connection', (socket) => {
+  socket.on('join-admin', () => {
+    // Re-checked server-side against the JWT-verified user, never trusted from
+    // the client — a player emitting 'join-admin' gets nothing.
+    if (socket.user?.role !== 'admin') return;
+    socket.join(ADMIN_ROOM);
+  });
+
+  socket.on('leave-admin', () => {
+    socket.leave(ADMIN_ROOM);
+  });
+});
+
+// ✅ Make io reachable from Express routes via req.app.get('io'), so
+// routes/wallet.js can notify admins the instant a request is created.
+app.set('io', io);
+app.set('ADMIN_ROOM', ADMIN_ROOM);
 const PORT = process.env.PORT || 5000;
 
 // ✅ Start listening IMMEDIATELY — do NOT block the server on MongoDB. This is the
