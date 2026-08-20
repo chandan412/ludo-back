@@ -154,16 +154,28 @@ router.post('/reject-recharge', adminAuth, async (req, res) => {
     if (!transactionId) return res.status(400).json({ message: 'transactionId required' });
 
     // ✅ Atomic flip pending → rejected so a double-click can't double-process.
+    // The remark is written IN THE SAME UPDATE rather than in a follow-up save():
+    // one write instead of two, and no window where a rejected row exists with no
+    // reason attached for the player to read.
+    //
+    // ⚠️ FIXED: this used to do `transaction.rechargeNote = reason` afterwards,
+    // which OVERWROTE the player's own UTR / payment reference with your reason —
+    // losing the exact detail you'd need if they later disputed the rejection.
+    // The reason now goes to its own `adminRemark` field and rechargeNote is left
+    // untouched. `remarkAck: false` is what makes the card appear for the player.
     const transaction = await Transaction.findOneAndUpdate(
       { _id: transactionId, type: 'recharge', status: 'pending' },
-      { status: 'rejected', processedBy: req.user._id, processedAt: new Date() },
+      {
+        status: 'rejected',
+        processedBy: req.user._id,
+        processedAt: new Date(),
+        adminRemark: reason || 'Rejected by admin — payment not received',
+        remarkAck: false,
+      },
       { new: true }
     ).populate('user');
 
     if (!transaction) return res.status(400).json({ message: 'Transaction not found or already processed' });
-
-    transaction.rechargeNote = reason || 'Rejected by admin — payment not received';
-    await transaction.save();
 
     res.json({ message: `Recharge request rejected for ${transaction.user?.username}` });
   } catch (err) {
@@ -213,6 +225,10 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
       const availableAfter = user.balance - user.lockedBalance;
 
       transaction.withdrawNote = adminNote || 'Rejected by admin';
+      // ✅ Same remark card as a rejected deposit, so the player is told WHY their
+      // withdrawal was refused instead of just seeing the money silently unlock.
+      transaction.adminRemark  = adminNote || 'Withdrawal rejected by admin';
+      transaction.remarkAck    = false;
       await transaction.save();
 
       await Transaction.create({
@@ -223,6 +239,9 @@ router.post('/process-withdrawal', adminAuth, async (req, res) => {
         balanceAfter: availableAfter,
         status: 'rejected',
         withdrawNote: `Withdrawal rejected - amount unlocked. Reason: ${adminNote || 'N/A'}`,
+        // ⚠️ No adminRemark on this audit row on purpose — it's a duplicate of the
+        // rejection above, and setting it here would show the player TWO identical
+        // cards for one rejection.
         processedBy: req.user._id,
         processedAt: new Date()
       });
