@@ -29,43 +29,133 @@ function notifyAdmins(req, payload) {
   }
 }
 
+// ============================================================================
+// ⚠️ CRITICAL FIX — the lockedBalance reconcile was a DOUBLE-SPEND vector.
+//
+// The previous version did a blind read-modify-write:
+//
+//     if (user.lockedBalance !== expectedLocked) {
+//       user.lockedBalance = expectedLocked;   // ← overwrite from a stale snapshot
+//       await user.save();
+//     }
+//
+// Wallet.js polls this endpoint every 5 seconds. POST /game/create applies the
+// lock and creates the Game row in TWO separate writes:
+//
+//     user.lockedBalance += betAmount;  await user.save();   // phase A
+//     await Game.create({ ... });                            // phase B
+//
+// When a poll's user-read landed after phase A but its game-read landed before
+// phase B, it saw lockedBalance=500 with no matching game, computed
+// expectedLocked=0, and wrote that back — ERASING the lock on a live game. The
+// player could then stake the same ₹500 again, or withdraw it.
+//
+// The reconcile is kept (it exists to clear genuinely stale locks) but is now
+// DIRECTION-AWARE:
+//   • The response reports the HIGHER of stored and derived, so a stale read can
+//     only ever under-report spendable money (recoverable) instead of
+//     over-reporting it (an unrecoverable double-spend).
+//   • RAISING a lock is always safe, so it applies immediately — this also
+//     self-heals accounts already corrupted by the old code.
+//   • LOWERING is the dangerous direction and now requires: no game created in
+//     the last 60s, a re-verification read, and a compare-and-set on the exact
+//     value we read. If anything moved underneath, the write is abandoned.
+//
+// MONEY SAFETY: `balance` is never touched here. Only `lockedBalance` moves.
+// ============================================================================
+
+// No lock is released if the player had ANY game activity inside this window.
+// Covers the phase-A/phase-B gap in /game/create, during which a derived lock of
+// zero is simply a lie.
+const LOCK_RELEASE_GRACE_MS = 60 * 1000;
+
+// Derive what lockedBalance SHOULD be from live games + pending withdrawals.
+// Extracted so the lowering path can re-run it as a second opinion.
+async function deriveExpectedLock(userId) {
+  const activeGames = await Game.find({
+    'players.user': userId,
+    status: { $in: ['waiting', 'active'] },
+  }).select('betAmount').lean();
+  const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
+
+  const pendingWithdraws = await Transaction.find({
+    user: userId,
+    type: 'withdraw',
+    status: 'pending',
+  }).select('amount').lean();
+  const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
+
+  return gameLocked + withdrawLocked;
+}
+
 router.get('/balance', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user._id).select('balance lockedBalance bonusBalance username');
+    if (!user) return res.status(404).json({ message: 'User not found' });
 
-    // ✅ Auto-reconcile lockedBalance against active games + pending withdrawals.
-    // Prevents stale "money in game" when no game exists.
-    const activeGames = await Game.find({
-      'players.user': req.user._id,
-      status: { $in: ['waiting', 'active'] },
-    }).select('betAmount');
-    const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
+    const storedLocked   = user.lockedBalance || 0;
+    const expectedLocked = await deriveExpectedLock(req.user._id);
 
-    const pendingWithdraws = await Transaction.find({
-      user: req.user._id,
-      type: 'withdraw',
-      status: 'pending',
-    }).select('amount');
-    const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
+    // Start conservative. Nothing below may lower this without proving it's safe.
+    let effectiveLocked = Math.max(storedLocked, expectedLocked);
 
-    const expectedLocked = gameLocked + withdrawLocked;
+    if (expectedLocked > storedLocked) {
+      // ── RAISE ──────────────────────────────────────────────────────────────
+      // Money is committed to a game or pending withdrawal but isn't locked —
+      // exactly the corruption the old blind overwrite caused, and the state that
+      // lets the same money be spent twice. Raising can never enable a
+      // double-spend, so apply it immediately. The CAS means a concurrent lock
+      // change wins instead of being clobbered; if it fails we still REPORT the
+      // safe higher number and the next poll retries.
+      await User.updateOne(
+        { _id: user._id, lockedBalance: storedLocked },
+        { $set: { lockedBalance: expectedLocked } }
+      );
+      effectiveLocked = expectedLocked;
 
-    // If user's stored lockedBalance is different from the real expected, reconcile
-    if (user.lockedBalance !== expectedLocked) {
-      user.lockedBalance = expectedLocked;
-      await user.save();
+    } else if (expectedLocked < storedLocked) {
+      // ── LOWER (dangerous — heavily guarded) ────────────────────────────────
+      // Releasing a lock frees money to be staked or withdrawn. Only do it when
+      // we can prove nothing is in flight.
+
+      // Guard 1: recent game activity means a create/join may be mid-flight.
+      const recentGame = await Game.findOne({
+        'players.user': req.user._id,
+        createdAt: { $gte: new Date(Date.now() - LOCK_RELEASE_GRACE_MS) },
+      }).select('_id').lean();
+
+      if (!recentGame) {
+        // Guard 2: re-derive. This read lands a full roundtrip later, by which
+        // point any create that was mid-flight has committed its Game row.
+        const reverified = await deriveExpectedLock(req.user._id);
+
+        if (reverified === expectedLocked && reverified < storedLocked) {
+          // Guard 3: compare-and-set on the exact value we read. If anything
+          // changed lockedBalance underneath us this matches nothing and the
+          // release is abandoned rather than overwriting a fresh lock.
+          const result = await User.updateOne(
+            { _id: user._id, lockedBalance: storedLocked },
+            { $set: { lockedBalance: reverified } }
+          );
+          if (result.modifiedCount === 1) {
+            effectiveLocked = reverified;
+            console.log(`🔓 Stale lock released for ${user.username}: ₹${storedLocked} -> ₹${reverified}`);
+          }
+        }
+      }
     }
 
     res.json({
       balance: user.balance,
-      lockedBalance: user.lockedBalance,
+      lockedBalance: effectiveLocked,
       bonusBalance: user.bonusBalance || 0,
       // availableBalance = what they can PLAY with (includes bonus, minus locks)
-      availableBalance: user.balance - user.lockedBalance,
+      availableBalance: Math.max(0, user.balance - effectiveLocked),
       // withdrawableBalance = what they can WITHDRAW (excludes the non-withdrawable bonus)
-      withdrawableBalance: Math.max(0, user.balance - user.lockedBalance - (user.bonusBalance || 0)),
+      withdrawableBalance: Math.max(0, user.balance - effectiveLocked - (user.bonusBalance || 0)),
     });
   } catch (err) {
+    console.error('wallet balance error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -177,6 +267,63 @@ router.post('/withdraw-request', auth, async (req, res) => {
       transaction
     });
   } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ============================================================================
+// ✅ ADMIN REMARK NOTICES
+//
+// When you reject a deposit or withdrawal you write a reason, but the player had
+// no way to see it — the request simply vanished from their pending list with no
+// explanation, so they'd re-submit the same wrong request or message you.
+//
+// These two endpoints back a dismissable card on the Wallet page.
+//
+// SECURITY: both are scoped to req.user._id, so a player can neither READ nor
+// DISMISS another player's remark even if they guess a transaction id.
+// ============================================================================
+
+// GET /api/wallet/notices — unacknowledged rejection remarks for this player.
+router.get('/notices', auth, async (req, res) => {
+  try {
+    const notices = await Transaction.find({
+      user: req.user._id,
+      status: 'rejected',
+      adminRemark: { $nin: [null, ''] },
+      remarkAck: { $ne: true },   // $ne rather than false, so pre-existing rows
+                                  // (written before this field existed) still show
+    })
+      .sort({ createdAt: -1 })
+      .limit(5)                   // a sane cap; nobody needs 20 cards stacked up
+      .select('type amount adminRemark rechargeNote createdAt processedAt')
+      .lean();
+
+    res.json(notices);
+  } catch (err) {
+    console.error('notices error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/wallet/notices/:id/ack — player tapped "OK, got it".
+router.post('/notices/:id/ack', auth, async (req, res) => {
+  try {
+    const result = await Transaction.updateOne(
+      { _id: req.params.id, user: req.user._id },  // ← ownership guard
+      { $set: { remarkAck: true } }
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).json({ message: 'Notice not found' });
+    }
+    res.json({ message: 'Acknowledged' });
+  } catch (err) {
+    // A malformed id throws a CastError — that's a bad request, not a server fault.
+    if (err && err.name === 'CastError') {
+      return res.status(400).json({ message: 'Invalid notice id' });
+    }
+    console.error('notice ack error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
