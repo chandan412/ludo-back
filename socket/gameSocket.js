@@ -9,6 +9,166 @@ const activeRooms = new Map();
 const roomTimers = new Map(); // tracks 2-min auto-abort timers
 const waitingGraceTimers = new Map(); // brief grace window so a refresh doesn't abort a waiting room
 
+// ============================================================================
+// ⏱️ TURN INACTIVITY TIMER — anti-stalling
+//
+// Problem: a player who is losing simply stops taking their turn. The opponent
+// has no recourse except pressing Exit, which FORFEITS their bet — so griefing
+// by doing nothing was actually a winning strategy. This makes the stalling
+// player lose instead.
+//
+// Flow (both windows tunable below):
+//   turn starts ──40s no action──> WARNING broadcast to both players
+//                                  └──150s more, no action──> opponent WINS
+//
+// "Action" means ANY move of the game forward by the current player — rolling
+// the dice OR moving a token. Per-action rather than per-turn is deliberate:
+// rolling and then never moving the token stalls just as effectively, and a
+// per-turn timer would miss it. Sixes granting another roll legitimately extend
+// a turn, and those re-arm the timer normally.
+// ============================================================================
+const TURN_GRACE_MS = 40 * 1000;   // silent window before the warning fires
+const TURN_FINAL_MS = 150 * 1000;  // warned window before the turn is lost
+
+// roomCode -> { graceTimer, finalTimer, userId, token, warned }
+const turnTimers = new Map();
+let turnTokenSeq = 0; // monotonic guard against a stale timer firing after a re-arm
+
+function clearTurnTimer(roomCode, io) {
+  const key = String(roomCode || '').toUpperCase();
+  const t = turnTimers.get(key);
+  if (!t) return;
+  clearTimeout(t.graceTimer);
+  clearTimeout(t.finalTimer);
+  turnTimers.delete(key);
+  // Tell both clients to drop any countdown they're showing.
+  if (io && t.warned) io.to(key).emit('turn-timer-cleared', { roomCode: key });
+}
+
+/**
+ * Arm (or re-arm) the inactivity timer for whoever currently holds the turn.
+ *
+ * @param onlyIfAbsent  When true, does nothing if a timer is already running.
+ *   This is what stops a stalling player from REFRESHING to reset their clock:
+ *   join-room passes true, so a reconnect never buys more time. Genuine actions
+ *   (roll / move / turn pass) pass false and legitimately reset it.
+ *
+ * MONEY SAFETY: arming touches nothing. Only the final expiry settles, and it
+ * does so through the same atomic status flip every other settlement path uses,
+ * so it can never double-settle against a normal win, a forfeit, or a
+ * disconnect timeout — whichever flips 'active' first wins and the rest no-op.
+ */
+function armTurnTimer(io, roomCode, userId, { onlyIfAbsent = false } = {}) {
+  const key = String(roomCode || '').toUpperCase();
+  if (!key || !userId) return;
+
+  if (onlyIfAbsent && turnTimers.has(key)) return;
+
+  clearTurnTimer(key, io);
+
+  const uid = userId.toString();
+  const token = ++turnTokenSeq;
+
+  const graceTimer = setTimeout(async () => {
+    try {
+      const cur = turnTimers.get(key);
+      if (!cur || cur.token !== token) return; // superseded by a newer arm
+
+      const game = await Game.findOne({ roomCode: key, status: 'active' })
+        .populate('players.user', 'username');
+      // Turn already moved on (they acted) or game ended → nothing to warn about.
+      if (!game || !game.currentTurn || game.currentTurn.toString() !== uid) {
+        clearTurnTimer(key, io);
+        return;
+      }
+
+      const stalling = game.players.find(p => p.user._id.toString() === uid);
+      const waiting  = game.players.find(p => p.user._id.toString() !== uid);
+      const deadlineAt = Date.now() + TURN_FINAL_MS;
+
+      cur.warned = true;
+      io.to(key).emit('turn-warning', {
+        roomCode:        key,
+        userId:          uid,
+        username:        stalling?.user?.username || 'Player',
+        opponentUsername: waiting?.user?.username || 'Opponent',
+        seconds:         Math.floor(TURN_FINAL_MS / 1000),
+        deadlineAt,
+      });
+
+      cur.finalTimer = setTimeout(async () => {
+        try {
+          const still = turnTimers.get(key);
+          if (!still || still.token !== token) return;
+
+          // Last check before taking someone's money: has the turn moved on?
+          const check = await Game.findOne({ roomCode: key, status: 'active' });
+          if (!check || !check.currentTurn || check.currentTurn.toString() !== uid) {
+            clearTurnTimer(key, io);
+            return;
+          }
+
+          // ✅ ATOMIC claim — identical guard to the forfeit handler. If a normal
+          // win, a forfeit, or a disconnect timeout already ended this game, the
+          // filter matches nothing and we no-op instead of settling twice.
+          const finished = await Game.findOneAndUpdate(
+            { roomCode: key, status: 'active' },
+            { $set: { status: 'finished', finishedAt: new Date() } },
+            { new: true }
+          ).populate('players.user', 'username');
+          if (!finished) { clearTurnTimer(key, io); return; }
+
+          const loserIdx  = finished.players.findIndex(p => p.user._id.toString() === uid);
+          const winnerIdx = loserIdx === 0 ? 1 : 0;
+          if (loserIdx === -1) { clearTurnTimer(key, io); return; }
+
+          const winnerId = finished.players[winnerIdx].user._id;
+          const loserId  = finished.players[loserIdx].user._id;
+
+          const pot         = finished.betAmount * 2;
+          const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+          const winAmount   = pot - platformFee;
+
+          finished.winner      = winnerId;
+          finished.loser       = loserId;
+          finished.winAmount   = winAmount;
+          finished.platformFee = platformFee;
+          await finished.save();
+
+          try {
+            await settleGame(finished, winnerId, loserId, winAmount, platformFee);
+          } catch (se) {
+            console.error('CRITICAL: settlement failed (turn timeout)', finished._id, se);
+            Game.findByIdAndUpdate(finished._id, { $set: { settlementFailed: true } }).catch(() => {});
+          }
+
+          io.to(key).emit('game-over', {
+            reason:      'turn_timeout',
+            winner:      { id: winnerId.toString(), username: finished.players[winnerIdx].user.username },
+            loser:       { id: loserId.toString(),  username: finished.players[loserIdx].user.username },
+            winAmount,
+            platformFee,
+            pot,
+            message:     `${finished.players[loserIdx].user.username} ran out of time. You win!`,
+          });
+
+          await syncInviteCard(io, key);
+          console.log(`Turn timeout: ${finished.players[loserIdx].user.username} stalled in ${key} — ${finished.players[winnerIdx].user.username} wins ₹${winAmount}`);
+        } catch (e) {
+          console.error('turn final timer error:', e);
+        } finally {
+          turnTimers.delete(key);
+        }
+      }, TURN_FINAL_MS);
+    } catch (e) {
+      console.error('turn grace timer error:', e);
+    }
+  }, TURN_GRACE_MS);
+
+  turnTimers.set(key, { graceTimer, finalTimer: null, userId: uid, token, warned: false });
+}
+
+
 // ============================
 // Per-room lock — serializes game-mutating handlers (roll-dice, move-token)
 // so two events on the same room can never read-modify-save concurrently.
@@ -224,6 +384,9 @@ function startWaitingTimer(io, roomCode) {
         message: 'No opponent joined in 2 minutes. Game aborted. Bet refunded.',
       });
 
+      // ⏱️ Room is dead — stop any inactivity clock.
+      clearTurnTimer(roomCode, io);
+
       // ✅ Flip this game's chat invite card to "expired" for everyone, permanently.
       // The game row is already status:'aborted' above, so syncInviteCard reads
       // that and writes + broadcasts the expired state.
@@ -330,6 +493,8 @@ async function reEvaluateActivePresence(io, roomCode) {
             reason: 'connection_lost',
             message: 'Both players lost connection. Game aborted — bets refunded.',
           });
+          // ⏱️ Game over — stop the inactivity clock.
+          clearTurnTimer(roomCode, io);
           // ✅ Expire the chat invite card — the room no longer exists.
           await syncInviteCard(io, roomCode);
 
@@ -374,6 +539,8 @@ async function reEvaluateActivePresence(io, roomCode) {
           message: 'Opponent did not return. You win!',
         });
 
+        // ⏱️ Game over — stop the inactivity clock.
+        clearTurnTimer(roomCode, io);
         // ✅ Stamp the winner permanently onto this game's chat invite card.
         await syncInviteCard(io, roomCode);
         console.log(`Absence re-arm: room ${roomCode} ${finished.players[loseIdx].user.username} did not return — ${finished.players[winIdx].user.username} wins`);
@@ -715,6 +882,13 @@ module.exports = (io) => {
           await syncInviteCard(io, roomCode);
         }
 
+        // ⏱️ Arm the inactivity clock for whoever holds the turn.
+        // onlyIfAbsent: a refresh re-fires join-room, and resetting here would let
+        // a stalling player refresh forever to dodge the timeout.
+        if (game.status === 'active' && game.currentTurn) {
+          armTurnTimer(io, roomCode, game.currentTurn, { onlyIfAbsent: true });
+        }
+
         // ✅ Re-arm the 60s disconnect/forfeit window from REAL presence. Survives a
         // server restart: if the timer was wiped and the opponent never returns, the
         // player who rejoined here triggers a fresh window instead of hanging forever.
@@ -792,6 +966,9 @@ module.exports = (io) => {
           game.lastDiceRoll = null;
           await game.save();
 
+          // ⏱️ They acted (rolled), and the turn passed — clock moves to the opponent.
+          armTurnTimer(io, roomCode, opponentState.user._id);
+
           // 1) Show the number to BOTH players right away.
           io.to(roomCode).emit('dice-rolled', {
             diceRoll,
@@ -836,6 +1013,11 @@ module.exports = (io) => {
         }
 
         await game.save();
+
+        // ⏱️ Rolling is an action, so the clock resets — but the turn is NOT over:
+        // they still have to move a token. Re-arming for the SAME player is what
+        // catches "rolled the dice then walked away", which a per-turn timer misses.
+        armTurnTimer(io, roomCode, socket.user._id);
 
         io.to(roomCode).emit('dice-rolled', {
           diceRoll,
@@ -949,6 +1131,9 @@ module.exports = (io) => {
             pot,
           });
 
+          // ⏱️ Game is over — stop the inactivity clock.
+          clearTurnTimer(roomCode, io);
+
           // ✅ Stamp the winner permanently onto this game's chat invite card.
           await syncInviteCard(io, roomCode);
           return;
@@ -966,6 +1151,10 @@ module.exports = (io) => {
         }
 
         await game.save();
+
+        // ⏱️ A token moved — reset the clock for whoever holds the turn now. On an
+        // extra turn that is the same player again; otherwise it's the opponent.
+        armTurnTimer(io, roomCode, game.currentTurn);
 
         io.to(roomCode).emit('token-moved', {
           ...moveData,
@@ -1063,6 +1252,9 @@ module.exports = (io) => {
           platformFee,
           pot,
         });
+
+        // ⏱️ Game over — stop the inactivity clock.
+        clearTurnTimer(roomCode, io);
 
         // ✅ Stamp the winner permanently onto this game's chat invite card.
         await syncInviteCard(io, roomCode);
@@ -1189,6 +1381,8 @@ module.exports = (io) => {
                 message: 'Room creator left. Game aborted. Bet refunded.',
               });
 
+              // ⏱️ Room is dead — stop any inactivity clock.
+              clearTurnTimer(roomForGrace, io);
               // ✅ Expire this game's chat invite card too, permanently.
               await syncInviteCard(io, roomForGrace);
             } catch (e) {
@@ -1275,6 +1469,8 @@ module.exports = (io) => {
                 reason: 'connection_lost',
                 message: 'Both players lost connection. Game aborted — bets refunded.',
               });
+              // ⏱️ Game over — stop the inactivity clock.
+              clearTurnTimer(socket.currentRoom, io);
               // ✅ Expire the chat invite card — the room no longer exists.
               await syncInviteCard(io, socket.currentRoom);
 
@@ -1315,6 +1511,8 @@ module.exports = (io) => {
             message: `${socket.user.username} disconnected. You win!`,
           });
 
+          // ⏱️ Game over — stop the inactivity clock.
+          clearTurnTimer(socket.currentRoom, io);
           // ✅ Stamp the winner permanently onto this game's chat invite card.
           await syncInviteCard(io, socket.currentRoom);
         }, 60000);
@@ -1368,6 +1566,12 @@ module.exports = (io) => {
           socket.currentRoom = roomCode;
           socket.emit('game-state', sanitizeGame(game, socket.user._id));
           socket.to(roomCode).emit('player-reconnected', { username: socket.user.username });
+
+          // ⏱️ Arm the inactivity clock if none is running (e.g. after a restart).
+          // onlyIfAbsent so reconnecting can't be used to reset a running clock.
+          if (game.status === 'active' && game.currentTurn) {
+            armTurnTimer(io, roomCode, game.currentTurn, { onlyIfAbsent: true });
+          }
 
           // ✅ Re-arm the 60s disconnect/forfeit window from REAL presence (survives restarts).
           if (game.status === 'active') reEvaluateActivePresence(io, roomCode);
@@ -1437,6 +1641,9 @@ module.exports = (io) => {
             gameId: aborted._id,
           });
         }
+
+        // ⏱️ Game is dead — stop the inactivity clock.
+        clearTurnTimer(aborted.roomCode, io);
 
         io.to(aborted.roomCode).emit('game-aborted', {
           reason: 'server_restart',
