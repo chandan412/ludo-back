@@ -114,21 +114,53 @@ router.post('/create', auth, async (req, res) => {
       return res.status(400).json({ message: 'You already have an active game' });
 
     // ── Open a new waiting room ───────────────────────────────────────────────
-    // Lock the bet (only ever touch lockedBalance — never balance).
-    user.lockedBalance += betAmount;
-    await user.save();
+    // ⚠️ ORDER MATTERS. This used to be:
+    //
+    //     user.lockedBalance += betAmount; await user.save();   // lock first
+    //     const game = await Game.create({ ... });              // then create
+    //
+    // If Game.create threw, the stake stayed locked with no game attached — the
+    // player's money was stranded. That is not hypothetical: roomCode is a random
+    // 6-character string with a UNIQUE index, so a collision raises E11000 and
+    // takes exactly that path.
+    //
+    // Now the game is created FIRST, the stake is locked with a conditional $inc
+    // that cannot overdraw, and a failed lock deletes the room again.
 
-    const roomCode = generateRoomCode();
-    const game = await Game.create({
-      roomCode,
-      betAmount,
-      createdBy: req.user._id,
-      players: [{
-        user: req.user._id,
-        color: 'red',
-        tokens: freshTokens()
-      }]
-    });
+    // Retry on the (rare) room-code collision instead of 500-ing.
+    let game = null;
+    for (let attempt = 0; attempt < 5 && !game; attempt++) {
+      try {
+        game = await Game.create({
+          roomCode: generateRoomCode(),
+          betAmount,
+          createdBy: req.user._id,
+          players: [{ user: req.user._id, color: 'red', tokens: freshTokens() }],
+        });
+      } catch (e) {
+        if (e && e.code === 11000) continue; // code already taken — draw another
+        throw e;
+      }
+    }
+    if (!game) return res.status(500).json({ message: 'Could not allocate a room code, please retry' });
+
+    // Lock the bet — only ever touch lockedBalance, never balance. The balance
+    // condition is re-evaluated by MongoDB at write time, so this can't overdraw
+    // even if something else committed money since the check above.
+    const lockRes = await User.updateOne(
+      {
+        _id: req.user._id,
+        $expr: { $gte: [{ $subtract: ['$balance', '$lockedBalance'] }, betAmount] },
+      },
+      { $inc: { lockedBalance: betAmount } }
+    );
+
+    if (lockRes.modifiedCount !== 1) {
+      // Couldn't lock — remove the room so it can't be joined against an unpaid stake.
+      await Game.deleteOne({ _id: game._id, status: 'waiting' })
+        .catch(e => console.error('create rollback failed:', e.message));
+      return res.status(400).json({ message: `Insufficient balance. Available: ${available}` });
+    }
 
     await game.populate('createdBy', 'username');
     res.status(201).json({
@@ -137,17 +169,43 @@ router.post('/create', auth, async (req, res) => {
       game
     });
   } catch (err) {
+    console.error('create error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
 // POST /api/game/join/:roomCode
+//
+// ⚠️ THIS ROUTE USED TO LET THREE PLAYERS INTO A TWO-PLAYER GAME.
+//
+// The old flow was a textbook read-then-write race:
+//
+//     const game = await Game.findOne({ roomCode, status: 'waiting' });  // step 1
+//     ... existingGame lookup, user lookup, creator lookup, user.save() ...
+//     game.players.push({ ... });                                        // step 5
+//     game.status = 'active';
+//     await game.save();
+//
+// The `status: 'waiting'` filter is evaluated at step 1, but status only flips to
+// 'active' at step 5 — THREE database roundtrips later. Every joiner whose read
+// landed inside that window saw "waiting" and proceeded. Worse, nothing anywhere
+// checked players.length, so the room had no size cap at all.
+//
+// It also leaked locked balance: the joiner's stake was locked BEFORE the game
+// save, so a joiner who lost the race had money locked against no game.
+//
+// The fix inverts the order and lets the DATABASE arbitrate:
+//   1. Read-only eligibility checks (cheap, no side effects).
+//   2. ATOMIC claim — one findOneAndUpdate whose filter includes both
+//      status:'waiting' AND players:{$size:1}. Exactly one joiner can match;
+//      everyone else gets null and a clean "already started" response.
+//   3. Only then lock the stake, with a CONDITIONAL $inc that can't overdraw.
+//   4. If the lock fails, roll the claim back so the room reopens.
 router.post('/join/:roomCode', auth, async (req, res) => {
+  const roomCode = req.params.roomCode.toUpperCase();
   try {
-    const game = await Game.findOne({
-      roomCode: req.params.roomCode.toUpperCase(),
-      status: 'waiting'
-    });
+    // ── 1. Read-only eligibility checks ──────────────────────────────────────
+    const game = await Game.findOne({ roomCode, status: 'waiting' });
     if (!game)
       return res.status(404).json({ message: 'Game not found or already started' });
 
@@ -190,27 +248,72 @@ router.post('/join/:roomCode', auth, async (req, res) => {
       }
     }
 
-    user.lockedBalance += game.betAmount;
-    await user.save();
+    // ── 2. ATOMIC CLAIM — this is the seat, and there is exactly one ─────────
+    // The filter is the entire guarantee:
+    //   status: 'waiting'          → the room hasn't started
+    //   players: { $size: 1 }      → the room holds ONLY the creator (the cap)
+    //   'players.user': { $ne: me } → can't take a second seat in one room
+    // MongoDB applies the filter and the update as a single atomic operation, so
+    // concurrent joiners cannot all match. The winner gets the document; the
+    // losers get null.
+    const claimed = await Game.findOneAndUpdate(
+      {
+        roomCode,
+        status: 'waiting',
+        players: { $size: 1 },
+        'players.user': { $ne: req.user._id },
+      },
+      {
+        $push: {
+          players: { user: req.user._id, color: 'blue', tokens: freshTokens() },
+        },
+        $set: {
+          status: 'active',
+          currentTurn: game.players[0].user,
+          startedAt: new Date(),
+        },
+      },
+      { new: true }
+    );
 
-    game.players.push({
-      user: req.user._id,
-      color: 'blue',
-      tokens: [
-        { position: -1, isHome: true, isFinished: false },
-        { position: -1, isHome: true, isFinished: false },
-        { position: -1, isHome: true, isFinished: false },
-        { position: -1, isHome: true, isFinished: false }
-      ]
-    });
-    game.status = 'active';
-    game.currentTurn = game.players[0].user;
-    game.startedAt = new Date();
-    await game.save();
+    if (!claimed) {
+      // Someone else took the seat between our checks and this write — which is
+      // exactly the case that used to produce a third player.
+      return res.status(409).json({ message: 'Game is already full or has started' });
+    }
 
-    await game.populate('players.user', 'username');
-    res.json({ message: 'Joined game! Starting now.', game });
+    // ── 3. Lock the stake, atomically and without overdrawing ────────────────
+    // Conditional $inc: the balance condition is re-evaluated by MongoDB at write
+    // time, so a stake can never be locked against money that has since been
+    // committed elsewhere. MONEY SAFETY: only lockedBalance moves — `balance` is
+    // never touched when a stake is locked.
+    const lockRes = await User.updateOne(
+      {
+        _id: req.user._id,
+        $expr: { $gte: [{ $subtract: ['$balance', '$lockedBalance'] }, game.betAmount] },
+      },
+      { $inc: { lockedBalance: game.betAmount } }
+    );
+
+    if (lockRes.modifiedCount !== 1) {
+      // ── 4. ROLLBACK ────────────────────────────────────────────────────────
+      // Couldn't lock, so undo the claim and reopen the room. Without this the
+      // game would sit 'active' with a player who never paid in.
+      await Game.updateOne(
+        { _id: claimed._id, status: 'active' },
+        {
+          $pull: { players: { user: req.user._id } },
+          $set: { status: 'waiting', currentTurn: null, startedAt: null },
+        }
+      ).catch(e => console.error('join rollback failed:', e.message));
+
+      return res.status(400).json({ message: 'Insufficient balance to join this game' });
+    }
+
+    await claimed.populate('players.user', 'username');
+    res.json({ message: 'Joined game! Starting now.', game: claimed });
   } catch (err) {
+    console.error('join error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
