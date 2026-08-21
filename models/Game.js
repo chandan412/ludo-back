@@ -49,6 +49,20 @@ const gameSchema = new mongoose.Schema({
   players: {
     type: [playerSchema],
     default: [],
+    // ✅ HARD CAP — defence in depth against the "3 players in one game" bug.
+    //
+    // The real fix is the atomic claim in routes/game.js (a findOneAndUpdate
+    // whose filter includes players:{$size:1}). This validator is the backstop:
+    // if any future code path ever pushes a third player through a full document
+    // save, it fails loudly instead of silently corrupting a live game.
+    //
+    // NOTE: validators run on save()/create(), NOT on findOneAndUpdate unless
+    // runValidators is set — which is precisely why the atomic filter, not this,
+    // has to be the primary guard.
+    validate: {
+      validator: function (v) { return !v || v.length <= 2; },
+      message: props => `A game can hold at most 2 players (got ${props.value.length})`,
+    },
   },
   currentTurn: {
     type: mongoose.Schema.Types.ObjectId,
@@ -99,7 +113,24 @@ const gameSchema = new mongoose.Schema({
 });
 
 // Index for fast lookups
-gameSchema.index({ roomCode: 1 });
+//
+// ⚠️ REMOVED: gameSchema.index({ roomCode: 1 })
+//
+// `roomCode` already declares `unique: true` in the field definition above, which
+// makes Mongoose build a UNIQUE index named `roomCode_1`. This line asked for a
+// NON-unique index with the same auto-generated name, so MongoDB rejects one of
+// them with IndexKeySpecsConflict:
+//
+//   "An existing index has the same name as the requested index...
+//    Requested: { key: { roomCode: 1 } }, existing: { unique: true, ... }"
+//
+// Because the app never awaits Game.init(), that error surfaced only on the
+// connection's error channel and was easy to miss — but it means index creation
+// was partially failing on every boot. Worse, if the NON-unique index won the
+// race on the live database, roomCode was never actually unique, and two games
+// could share a room code.
+//
+// The unique index from the field definition is kept and is the one we want.
 gameSchema.index({ 'players.user': 1, status: 1 });
 gameSchema.index({ createdBy: 1, status: 1 });
 gameSchema.index({ status: 1, updatedAt: 1 }); // orphan sweep query
