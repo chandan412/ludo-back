@@ -1,28 +1,11 @@
 const express = require('express');
 const mongoose = require('mongoose');
+
 const router = express.Router();
 
 const Transaction = require('../models/Transaction');
 const BankPayment = require('../models/BankPayment');
-
-// ============================================================================
-// PAYMENT AUTOMATION
-//
-// IMPORTANT:
-// This route does NOT modify User.balance.
-// It does NOT modify lockedBalance.
-// It does NOT modify bonusBalance.
-//
-// Its job is only:
-//   1. Receive/store bank SMS information.
-//   2. Find an existing pending recharge.
-//   3. Compare amount + UTR.
-//   4. Check Auto Verify ON/OFF.
-//   5. Check maximum auto-approval amount.
-//   6. Return the existing transaction ID so the existing admin approval
-//      mechanism can be used.
-//
-// ============================================================================
+const { adminAuth } = require('../middleware/auth');
 
 const settingsSchema = new mongoose.Schema(
   {
@@ -31,10 +14,12 @@ const settingsSchema = new mongoose.Schema(
       unique: true,
       required: true
     },
+
     autoVerify: {
       type: Boolean,
       default: false
     },
+
     maxAutoAmount: {
       type: Number,
       default: 5000,
@@ -48,14 +33,18 @@ const settingsSchema = new mongoose.Schema(
 
 const PaymentAutomationSettings =
   mongoose.models.PaymentAutomationSettings ||
-  mongoose.model('PaymentAutomationSettings', settingsSchema);
+  mongoose.model(
+    'PaymentAutomationSettings',
+    settingsSchema
+  );
 
-// ---------------------------------------------------------------------------
-// Secret authentication for n8n
-// ---------------------------------------------------------------------------
+// ============================================================
+// n8n authentication
+// ============================================================
 
 function automationSecret(req, res, next) {
-  const configuredSecret = process.env.PAYMENT_AUTOMATION_SECRET;
+  const configuredSecret =
+    process.env.PAYMENT_AUTOMATION_SECRET;
 
   if (!configuredSecret) {
     return res.status(503).json({
@@ -66,7 +55,10 @@ function automationSecret(req, res, next) {
   const suppliedSecret =
     req.headers['x-payment-automation-secret'];
 
-  if (!suppliedSecret || suppliedSecret !== configuredSecret) {
+  if (
+    !suppliedSecret ||
+    suppliedSecret !== configuredSecret
+  ) {
     return res.status(401).json({
       message: 'Unauthorized'
     });
@@ -75,36 +67,33 @@ function automationSecret(req, res, next) {
   next();
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================
 // Helpers
-// ---------------------------------------------------------------------------
+// ============================================================
 
 function normalizeUtr(value) {
   if (!value) return '';
 
   return String(value)
     .trim()
-    .replace(/\s+/g, '');
+    .replace(/\s+/g, '')
+    .toUpperCase();
 }
 
-/**
- * Your current recharge system stores the player's payment reference
- * inside Transaction.rechargeNote.
+/*
+ * Your existing recharge system stores the player's
+ * submitted payment reference in Transaction.rechargeNote.
  *
- * We intentionally DO NOT add another UTR field to Transaction.js here.
- *
- * This helper extracts a likely UTR/reference from that existing field.
+ * We do NOT add a UTR field to Transaction.js.
  */
-function extractUtrFromRechargeNote(note) {
+function extractUtr(note) {
   if (!note) return '';
 
   const text = String(note).trim();
 
-  // Common labels:
   // UTR: 123456789012
   // UTR 123456789012
   // Ref: 123456789012
-  // Reference: 123456789012
   const labelled = text.match(
     /(?:UTR|REF(?:ERENCE)?|TRANSACTION(?:\s*ID)?|TXN(?:\s*ID)?)\s*[:#-]?\s*([A-Z0-9]{6,30})/i
   );
@@ -113,453 +102,576 @@ function extractUtrFromRechargeNote(note) {
     return normalizeUtr(labelled[1]);
   }
 
-  // If the entire payment note is just the UTR/reference.
+  // If paymentNote is simply the UTR
   if (/^[A-Z0-9]{6,30}$/i.test(text)) {
     return normalizeUtr(text);
+  }
+
+  // Fallback: find a long numeric reference inside the note.
+  const numeric = text.match(/\b\d{8,30}\b/);
+
+  if (numeric) {
+    return normalizeUtr(numeric[0]);
   }
 
   return '';
 }
 
-// ---------------------------------------------------------------------------
-// GET automation settings
-// ---------------------------------------------------------------------------
+// ============================================================
+// ADMIN PANEL — GET SETTINGS
+// ============================================================
 
-router.get('/settings', automationSecret, async (req, res) => {
-  try {
-    let settings = await PaymentAutomationSettings.findOne({
-      key: 'default'
-    });
-
-    if (!settings) {
-      settings = await PaymentAutomationSettings.create({
-        key: 'default',
-        autoVerify: false,
-        maxAutoAmount: 5000
-      });
-    }
-
-    res.json({
-      autoVerify: settings.autoVerify,
-      maxAutoAmount: settings.maxAutoAmount
-    });
-  } catch (err) {
-    console.error('Payment automation settings error:', err);
-    res.status(500).json({
-      message: 'Server error'
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// SAVE automation settings
-//
-// This endpoint is intended to be called by your authenticated AdminPanel.
-// It is deliberately separate from the bank-SMS endpoint.
-// ---------------------------------------------------------------------------
-
-router.put('/settings', automationSecret, async (req, res) => {
-  try {
-    const autoVerify =
-      req.body.autoVerify === true ||
-      req.body.autoVerify === 'true';
-
-    const maxAutoAmount = Number(req.body.maxAutoAmount);
-
-    if (!Number.isFinite(maxAutoAmount) || maxAutoAmount < 0) {
-      return res.status(400).json({
-        message: 'maxAutoAmount must be a valid number >= 0'
-      });
-    }
-
-    const settings =
-      await PaymentAutomationSettings.findOneAndUpdate(
-        { key: 'default' },
-        {
-          $set: {
-            autoVerify,
-            maxAutoAmount
-          }
-        },
-        {
-          upsert: true,
-          new: true,
-          setDefaultsOnInsert: true
-        }
-      );
-
-    res.json({
-      message: 'Payment automation settings saved',
-      autoVerify: settings.autoVerify,
-      maxAutoAmount: settings.maxAutoAmount
-    });
-  } catch (err) {
-    console.error('Save payment automation settings error:', err);
-    res.status(500).json({
-      message: 'Server error'
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// RECEIVE BANK SMS
-//
-// Called by n8n.
-//
-// Expected body:
-// {
-//   amount: 500,
-//   utr: "392186998096",
-//   bankAccount: "XX794",
-//   direction: "credit",
-//   smsText: "...",
-//   smsAt: "2026-08-21T..."
-//
-// IMPORTANT:
-// DEBIT ALWAYS WINS.
-// Even if the SMS contains the word "credited" somewhere else,
-// direction=debit will never be treated as received money.
-// ---------------------------------------------------------------------------
-
-router.post('/bank-sms', automationSecret, async (req, res) => {
-  try {
-    const {
-      amount,
-      utr,
-      bankAccount,
-      direction,
-      smsText,
-      smsAt
-    } = req.body;
-
-    const normalizedUtr = normalizeUtr(utr);
-    const parsedAmount = Number(amount);
-
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      return res.status(400).json({
-        message: 'Invalid amount'
-      });
-    }
-
-    if (!normalizedUtr) {
-      return res.status(400).json({
-        message: 'UTR is required'
-      });
-    }
-
-    const normalizedDirection =
-      String(direction || '').toLowerCase();
-
-    // Debit must always win.
-    if (normalizedDirection === 'debit') {
-      const existing = await BankPayment.findOne({
-        utr: normalizedUtr
-      });
-
-      if (existing) {
-        return res.json({
-          accepted: false,
-          reason: 'duplicate_utr'
-        });
-      }
-
-      await BankPayment.create({
-        amount: parsedAmount,
-        utr: normalizedUtr,
-        bankAccount: bankAccount || '',
-        direction: 'debit',
-        smsText: smsText || '',
-        smsAt: smsAt ? new Date(smsAt) : new Date(),
-        status: 'ignored'
-      });
-
-      return res.json({
-        accepted: false,
-        reason: 'debit_sms_ignored'
-      });
-    }
-
-    if (normalizedDirection !== 'credit') {
-      return res.status(400).json({
-        message: 'direction must be credit or debit'
-      });
-    }
-
-    // Unique UTR in BankPayment gives us first-arrival protection.
-    let bankPayment;
-
+router.get(
+  '/settings',
+  adminAuth,
+  async (req, res) => {
     try {
-      bankPayment = await BankPayment.create({
-        amount: parsedAmount,
-        utr: normalizedUtr,
-        bankAccount: bankAccount || '',
-        direction: 'credit',
-        smsText: smsText || '',
-        smsAt: smsAt ? new Date(smsAt) : new Date(),
-        status: 'pending'
-      });
-    } catch (err) {
-      if (err && err.code === 11000) {
-        const existing = await BankPayment.findOne({
-          utr: normalizedUtr
+      let settings =
+        await PaymentAutomationSettings.findOne({
+          key: 'default'
         });
 
-        return res.json({
-          accepted: true,
-          duplicate: true,
-          reason: 'utr_already_received',
-          bankPaymentId: existing?._id || null
-        });
+      if (!settings) {
+        settings =
+          await PaymentAutomationSettings.create({
+            key: 'default',
+            autoVerify: false,
+            maxAutoAmount: 5000
+          });
       }
 
-      throw err;
-    }
-
-    res.status(201).json({
-      accepted: true,
-      duplicate: false,
-      bankPaymentId: bankPayment._id,
-      amount: bankPayment.amount,
-      utr: bankPayment.utr
-    });
-  } catch (err) {
-    console.error('Bank SMS processing error:', err);
-
-    res.status(500).json({
-      message: 'Server error'
-    });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// MATCH BANK PAYMENT AGAINST EXISTING RECHARGE
-//
-// This endpoint does NOT credit money.
-//
-// It searches the EXISTING Transaction collection for a pending recharge.
-//
-// Your current recharge system stores the submitted UTR/reference in
-// Transaction.rechargeNote, so we compare against that existing value.
-//
-// ---------------------------------------------------------------------------
-
-router.post('/match', automationSecret, async (req, res) => {
-  try {
-    const {
-      amount,
-      utr,
-      bankPaymentId
-    } = req.body;
-
-    const parsedAmount = Number(amount);
-    const normalizedUtr = normalizeUtr(utr);
-
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      return res.status(400).json({
-        message: 'Invalid amount'
-      });
-    }
-
-    if (!normalizedUtr) {
-      return res.status(400).json({
-        message: 'UTR is required'
-      });
-    }
-
-    // -----------------------------------------------------------------------
-    // Load automation settings
-    // -----------------------------------------------------------------------
-
-    let settings = await PaymentAutomationSettings.findOne({
-      key: 'default'
-    });
-
-    if (!settings) {
-      settings = await PaymentAutomationSettings.create({
-        key: 'default',
-        autoVerify: false,
-        maxAutoAmount: 5000
-      });
-    }
-
-    // -----------------------------------------------------------------------
-    // Find pending recharge by amount first.
-    //
-    // We deliberately use the existing Transaction collection.
-    // -----------------------------------------------------------------------
-
-    const candidates = await Transaction.find({
-      type: 'recharge',
-      status: 'pending',
-      amount: parsedAmount
-    })
-      .sort({ createdAt: 1 })
-      .limit(50);
-
-    let matchedTransaction = null;
-
-    for (const tx of candidates) {
-      const transactionUtr =
-        extractUtrFromRechargeNote(tx.rechargeNote);
-
-      if (
-        transactionUtr &&
-        transactionUtr === normalizedUtr
-      ) {
-        matchedTransaction = tx;
-        break;
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // No matching player recharge.
-    // -----------------------------------------------------------------------
-
-    if (!matchedTransaction) {
-      return res.json({
-        matched: false,
-        decision: 'NO_MATCH',
+      res.json({
         autoVerify: settings.autoVerify,
         maxAutoAmount: settings.maxAutoAmount
       });
+    } catch (err) {
+      console.error(
+        'Payment automation settings error:',
+        err
+      );
+
+      res.status(500).json({
+        message: 'Server error'
+      });
     }
+  }
+);
 
-    // -----------------------------------------------------------------------
-    // Three-minute rule.
-    //
-    // Bank SMS and player recharge can arrive in either order.
-    //
-    // We compare the two timestamps and allow a maximum 3-minute difference.
-    // -----------------------------------------------------------------------
+// ============================================================
+// ADMIN PANEL — SAVE SETTINGS
+// ============================================================
 
-    let bankTime = new Date();
+router.put(
+  '/settings',
+  adminAuth,
+  async (req, res) => {
+    try {
+      const autoVerify =
+        req.body.autoVerify === true ||
+        req.body.autoVerify === 'true';
 
-    if (bankPaymentId) {
-      const bankPayment = await BankPayment.findById(bankPaymentId);
+      const maxAutoAmount =
+        Number(req.body.maxAutoAmount);
 
-      if (bankPayment && bankPayment.direction === 'credit') {
-        bankTime = bankPayment.smsAt || bankPayment.createdAt;
+      if (
+        !Number.isFinite(maxAutoAmount) ||
+        maxAutoAmount < 0
+      ) {
+        return res.status(400).json({
+          message:
+            'Maximum amount must be a valid number'
+        });
       }
-    }
 
-    const transactionTime = matchedTransaction.createdAt;
+      const settings =
+        await PaymentAutomationSettings.findOneAndUpdate(
+          { key: 'default' },
+          {
+            $set: {
+              autoVerify,
+              maxAutoAmount
+            }
+          },
+          {
+            upsert: true,
+            new: true,
+            setDefaultsOnInsert: true
+          }
+        );
 
-    const differenceMs = Math.abs(
-      bankTime.getTime() - transactionTime.getTime()
-    );
-
-    const withinThreeMinutes =
-      differenceMs <= 3 * 60 * 1000;
-
-    if (!withinThreeMinutes) {
-      return res.json({
-        matched: true,
-        decision: 'MANUAL',
-        reason: 'timestamp_outside_three_minute_window',
-        transactionId: matchedTransaction._id,
-        userId: matchedTransaction.user,
-        amount: matchedTransaction.amount,
-        utr: normalizedUtr
-      });
-    }
-
-    // -----------------------------------------------------------------------
-    // Auto Verify OFF → leave it for existing admin system.
-    // -----------------------------------------------------------------------
-
-    if (!settings.autoVerify) {
-      return res.json({
-        matched: true,
-        decision: 'MANUAL',
-        reason: 'auto_verify_disabled',
-        transactionId: matchedTransaction._id,
-        userId: matchedTransaction.user,
-        amount: matchedTransaction.amount,
-        utr: normalizedUtr
-      });
-    }
-
-    // -----------------------------------------------------------------------
-    // Amount exceeds admin's configured automatic limit.
-    // -----------------------------------------------------------------------
-
-    if (parsedAmount > settings.maxAutoAmount) {
-      return res.json({
-        matched: true,
-        decision: 'MANUAL',
-        reason: 'amount_exceeds_auto_limit',
-        transactionId: matchedTransaction._id,
-        userId: matchedTransaction.user,
-        amount: matchedTransaction.amount,
-        utr: normalizedUtr,
+      res.json({
+        autoVerify: settings.autoVerify,
         maxAutoAmount: settings.maxAutoAmount
       });
+    } catch (err) {
+      console.error(
+        'Save automation settings error:',
+        err
+      );
+
+      res.status(500).json({
+        message: 'Server error'
+      });
     }
-
-    // -----------------------------------------------------------------------
-    // Everything matched.
-    //
-    // IMPORTANT:
-    // We STILL DO NOT TOUCH THE USER BALANCE HERE.
-    //
-    // The response gives n8n the existing transactionId and userId.
-    // The final approval must go through your existing admin approval
-    // mechanism.
-    // -----------------------------------------------------------------------
-
-    return res.json({
-      matched: true,
-      decision: 'APPROVE',
-      transactionId: matchedTransaction._id,
-      userId: matchedTransaction.user,
-      amount: matchedTransaction.amount,
-      utr: normalizedUtr
-    });
-  } catch (err) {
-    console.error('Payment match error:', err);
-
-    res.status(500).json({
-      message: 'Server error'
-    });
   }
-});
+);
 
-// ---------------------------------------------------------------------------
-// EXPIRE OLD BANK PAYMENT RECORDS
+// ============================================================
+// n8n — RECEIVE BANK SMS
+// ============================================================
+
+router.post(
+  '/bank-sms',
+  automationSecret,
+  async (req, res) => {
+    try {
+      const {
+        amount,
+        utr,
+        bankAccount,
+        direction,
+        smsText,
+        smsAt
+      } = req.body;
+
+      const parsedAmount = Number(amount);
+      const normalizedUtr = normalizeUtr(utr);
+
+      if (
+        !Number.isFinite(parsedAmount) ||
+        parsedAmount <= 0
+      ) {
+        return res.status(400).json({
+          message: 'Invalid amount'
+        });
+      }
+
+      if (!normalizedUtr) {
+        return res.status(400).json({
+          message: 'UTR is required'
+        });
+      }
+
+      const normalizedDirection =
+        String(direction || '').toLowerCase();
+
+      // IMPORTANT:
+      // Debit always wins.
+      if (normalizedDirection === 'debit') {
+        try {
+          await BankPayment.create({
+            amount: parsedAmount,
+            utr: normalizedUtr,
+            bankAccount: bankAccount || '',
+            direction: 'debit',
+            smsText: smsText || '',
+            smsAt: smsAt
+              ? new Date(smsAt)
+              : new Date(),
+            status: 'ignored'
+          });
+        } catch (err) {
+          if (err?.code !== 11000) {
+            throw err;
+          }
+        }
+
+        return res.json({
+          accepted: false,
+          reason: 'debit_sms_ignored'
+        });
+      }
+
+      if (normalizedDirection !== 'credit') {
+        return res.status(400).json({
+          message:
+            'direction must be credit or debit'
+        });
+      }
+
+      let bankPayment;
+
+      try {
+        bankPayment =
+          await BankPayment.create({
+            amount: parsedAmount,
+            utr: normalizedUtr,
+            bankAccount: bankAccount || '',
+            direction: 'credit',
+            smsText: smsText || '',
+            smsAt: smsAt
+              ? new Date(smsAt)
+              : new Date(),
+            status: 'pending'
+          });
+      } catch (err) {
+        if (err?.code === 11000) {
+          const existing =
+            await BankPayment.findOne({
+              utr: normalizedUtr
+            });
+
+          return res.json({
+            accepted: true,
+            duplicate: true,
+            bankPaymentId:
+              existing?._id || null
+          });
+        }
+
+        throw err;
+      }
+
+      res.status(201).json({
+        accepted: true,
+        duplicate: false,
+        bankPaymentId: bankPayment._id,
+        amount: bankPayment.amount,
+        utr: bankPayment.utr
+      });
+    } catch (err) {
+      console.error(
+        'Bank SMS processing error:',
+        err
+      );
+
+      res.status(500).json({
+        message: 'Server error'
+      });
+    }
+  }
+);
+
+// ============================================================
+// n8n — GET UNPROCESSED CREDIT SMS
+// ============================================================
+
+router.get(
+  '/pending-bank-payments',
+  automationSecret,
+  async (req, res) => {
+    try {
+      const payments =
+        await BankPayment.find({
+          direction: 'credit',
+          status: 'pending'
+        })
+          .sort({ createdAt: 1 })
+          .limit(50);
+
+      res.json(payments);
+    } catch (err) {
+      console.error(
+        'Pending bank payments error:',
+        err
+      );
+
+      res.status(500).json({
+        message: 'Server error'
+      });
+    }
+  }
+);
+
+// ============================================================
+// n8n — MATCH BANK PAYMENT TO EXISTING RECHARGE
 //
-// This does NOT reject the player's recharge.
-// It only marks an unmatched bank event as expired.
-// ---------------------------------------------------------------------------
+// THIS DOES NOT CREDIT BALANCE.
+//
+// It only returns:
+// APPROVE
+// MANUAL
+// NO_MATCH
+//
+// The actual credit remains your existing admin
+// /api/admin/add-balance endpoint.
+// ============================================================
 
-router.post('/expire-bank-payments', automationSecret, async (req, res) => {
-  try {
-    const cutoff = new Date(
-      Date.now() - 3 * 60 * 1000
-    );
+router.post(
+  '/match',
+  automationSecret,
+  async (req, res) => {
+    try {
+      const {
+        amount,
+        utr,
+        bankPaymentId
+      } = req.body;
 
-    const result = await BankPayment.updateMany(
-      {
-        direction: 'credit',
-        status: 'pending',
-        createdAt: { $lt: cutoff }
-      },
-      {
-        $set: {
-          status: 'expired'
+      const parsedAmount = Number(amount);
+      const normalizedUtr = normalizeUtr(utr);
+
+      if (
+        !Number.isFinite(parsedAmount) ||
+        parsedAmount <= 0
+      ) {
+        return res.status(400).json({
+          message: 'Invalid amount'
+        });
+      }
+
+      if (!normalizedUtr) {
+        return res.status(400).json({
+          message: 'UTR is required'
+        });
+      }
+
+      // --------------------------------------------------------
+      // Settings
+      // --------------------------------------------------------
+
+      let settings =
+        await PaymentAutomationSettings.findOne({
+          key: 'default'
+        });
+
+      if (!settings) {
+        settings =
+          await PaymentAutomationSettings.create({
+            key: 'default',
+            autoVerify: false,
+            maxAutoAmount: 5000
+          });
+      }
+
+      // --------------------------------------------------------
+      // Find existing pending recharge
+      // --------------------------------------------------------
+
+      const candidates =
+        await Transaction.find({
+          type: 'recharge',
+          status: 'pending',
+          amount: parsedAmount
+        })
+          .sort({ createdAt: 1 })
+          .limit(50);
+
+      let matchedTransaction = null;
+
+      for (const tx of candidates) {
+        const txUtr =
+          extractUtr(tx.rechargeNote);
+
+        if (
+          txUtr &&
+          txUtr === normalizedUtr
+        ) {
+          matchedTransaction = tx;
+          break;
         }
       }
-    );
 
-    res.json({
-      expired: result.modifiedCount || 0
-    });
-  } catch (err) {
-    console.error('Expire bank payments error:', err);
+      // --------------------------------------------------------
+      // No recharge yet.
+      //
+      // This is allowed because bank SMS can arrive before
+      // the player submits the recharge request.
+      // --------------------------------------------------------
 
-    res.status(500).json({
-      message: 'Server error'
-    });
+      if (!matchedTransaction) {
+        return res.json({
+          matched: false,
+          decision: 'NO_MATCH'
+        });
+      }
+
+      // --------------------------------------------------------
+      // Determine bank timestamp
+      // --------------------------------------------------------
+
+      let bankTime = new Date();
+
+      if (bankPaymentId) {
+        const bankPayment =
+          await BankPayment.findById(
+            bankPaymentId
+          );
+
+        if (bankPayment) {
+          bankTime =
+            bankPayment.smsAt ||
+            bankPayment.createdAt;
+        }
+      }
+
+      // --------------------------------------------------------
+      // Three-minute window
+      // --------------------------------------------------------
+
+      const differenceMs =
+        Math.abs(
+          bankTime.getTime() -
+          matchedTransaction.createdAt.getTime()
+        );
+
+      const withinThreeMinutes =
+        differenceMs <= 180000;
+
+      if (!withinThreeMinutes) {
+        await BankPayment.findOneAndUpdate(
+          {
+            _id: bankPaymentId,
+            status: 'pending'
+          },
+          {
+            $set: {
+              status: 'manual',
+              matchedTransaction:
+                matchedTransaction._id,
+              matchedAt: new Date()
+            }
+          }
+        );
+
+        return res.json({
+          matched: true,
+          decision: 'MANUAL',
+          reason:
+            'outside_three_minute_window',
+          transactionId:
+            matchedTransaction._id,
+          userId:
+            matchedTransaction.user,
+          amount:
+            matchedTransaction.amount,
+          utr: normalizedUtr
+        });
+      }
+
+      // --------------------------------------------------------
+      // Auto verification OFF
+      // --------------------------------------------------------
+
+      if (!settings.autoVerify) {
+        return res.json({
+          matched: true,
+          decision: 'MANUAL',
+          reason: 'auto_verify_disabled',
+          transactionId:
+            matchedTransaction._id,
+          userId:
+            matchedTransaction.user,
+          amount:
+            matchedTransaction.amount,
+          utr: normalizedUtr
+        });
+      }
+
+      // --------------------------------------------------------
+      // Above configured limit
+      // --------------------------------------------------------
+
+      if (
+        parsedAmount >
+        settings.maxAutoAmount
+      ) {
+        return res.json({
+          matched: true,
+          decision: 'MANUAL',
+          reason: 'amount_exceeds_limit',
+          transactionId:
+            matchedTransaction._id,
+          userId:
+            matchedTransaction.user,
+          amount:
+            matchedTransaction.amount,
+          utr: normalizedUtr,
+          maxAutoAmount:
+            settings.maxAutoAmount
+        });
+      }
+
+      // --------------------------------------------------------
+      // MATCH + AUTO ENABLED + UNDER LIMIT
+      //
+      // DO NOT CREDIT BALANCE HERE.
+      // --------------------------------------------------------
+
+      await BankPayment.findOneAndUpdate(
+        {
+          _id: bankPaymentId,
+          status: 'pending'
+        },
+        {
+          $set: {
+            status: 'matched',
+            matchedTransaction:
+              matchedTransaction._id,
+            matchedAt: new Date()
+          }
+        }
+      );
+
+      return res.json({
+        matched: true,
+        decision: 'APPROVE',
+        transactionId:
+          matchedTransaction._id,
+        userId:
+          matchedTransaction.user,
+        amount:
+          matchedTransaction.amount,
+        utr: normalizedUtr
+      });
+    } catch (err) {
+      console.error(
+        'Payment matching error:',
+        err
+      );
+
+      res.status(500).json({
+        message: 'Server error'
+      });
+    }
   }
-});
+);
+
+// ============================================================
+// Expire old unmatched bank records
+// ============================================================
+
+router.post(
+  '/expire-bank-payments',
+  automationSecret,
+  async (req, res) => {
+    try {
+      const cutoff =
+        new Date(
+          Date.now() - 180000
+        );
+
+      const result =
+        await BankPayment.updateMany(
+          {
+            direction: 'credit',
+            status: 'pending',
+            createdAt: {
+              $lt: cutoff
+            }
+          },
+          {
+            $set: {
+              status: 'expired'
+            }
+          }
+        );
+
+      res.json({
+        expired:
+          result.modifiedCount || 0
+      });
+    } catch (err) {
+      console.error(
+        'Expire bank payments error:',
+        err
+      );
+
+      res.status(500).json({
+        message: 'Server error'
+      });
+    }
+  }
+);
 
 module.exports = router;
