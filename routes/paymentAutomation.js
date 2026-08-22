@@ -7,6 +7,10 @@ const Transaction = require('../models/Transaction');
 const BankPayment = require('../models/BankPayment');
 const { adminAuth } = require('../middleware/auth');
 
+// ============================================================
+// PAYMENT AUTOMATION SETTINGS
+// ============================================================
+
 const settingsSchema = new mongoose.Schema(
   {
     key: {
@@ -218,10 +222,17 @@ router.put(
 
 // ============================================================
 // n8n — RECEIVE BANK SMS
+//
+// Accepts BOTH:
+//   POST /bank-sms
+//   POST /sms
+//
+// This allows the existing n8n URL to work without changing
+// the n8n workflow.
 // ============================================================
 
 router.post(
-  '/bank-sms',
+  ['/bank-sms', '/sms'],
   automationSecret,
   async (req, res) => {
     try {
