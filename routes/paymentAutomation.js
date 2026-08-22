@@ -7,10 +7,6 @@ const Transaction = require('../models/Transaction');
 const BankPayment = require('../models/BankPayment');
 const { adminAuth } = require('../middleware/auth');
 
-// ============================================================
-// PAYMENT AUTOMATION SETTINGS
-// ============================================================
-
 const settingsSchema = new mongoose.Schema(
   {
     key: {
@@ -42,10 +38,6 @@ const PaymentAutomationSettings =
     settingsSchema
   );
 
-// ============================================================
-// n8n AUTHENTICATION
-// ============================================================
-
 function automationSecret(req, res, next) {
   const configuredSecret =
     process.env.PAYMENT_AUTOMATION_SECRET;
@@ -71,10 +63,6 @@ function automationSecret(req, res, next) {
   next();
 }
 
-// ============================================================
-// HELPERS
-// ============================================================
-
 function normalizeUtr(value) {
   if (!value) return '';
 
@@ -84,19 +72,11 @@ function normalizeUtr(value) {
     .toUpperCase();
 }
 
-/*
- * Player's UTR is stored in Transaction.rechargeNote.
- */
 function extractUtr(note) {
   if (!note) return '';
 
   const text = String(note).trim();
 
-  // UTR: 123456789012
-  // UTR 123456789012
-  // Ref: 123456789012
-  // Transaction ID: 123456789012
-  // TXN ID: 123456789012
   const labelled = text.match(
     /(?:UTR|REF(?:ERENCE)?|TRANSACTION(?:\s*ID)?|TXN(?:\s*ID)?)\s*[:#-]?\s*([A-Z0-9]{6,30})/i
   );
@@ -105,12 +85,10 @@ function extractUtr(note) {
     return normalizeUtr(labelled[1]);
   }
 
-  // Recharge note itself may simply be the UTR.
   if (/^[A-Z0-9]{6,30}$/i.test(text)) {
     return normalizeUtr(text);
   }
 
-  // Fallback for a long numeric reference.
   const numeric = text.match(/\b\d{8,30}\b/);
 
   if (numeric) {
@@ -119,10 +97,6 @@ function extractUtr(note) {
 
   return '';
 }
-
-// ============================================================
-// REJECT PLAYER RECHARGE
-// ============================================================
 
 async function rejectRecharge(transaction, reason) {
   if (!transaction) return null;
@@ -146,14 +120,6 @@ async function rejectRecharge(transaction, reason) {
     }
   );
 }
-
-// ============================================================
-// FIND SUCCESSFULLY USED UTR
-//
-// Only an APPROVED recharge consumes a UTR.
-//
-// A rejected recharge does NOT consume the UTR.
-// ============================================================
 
 async function findSuccessfulRechargeByUtr(utr) {
   const normalizedUtr = normalizeUtr(utr);
@@ -188,10 +154,6 @@ async function findSuccessfulRechargeByUtr(utr) {
   return null;
 }
 
-// ============================================================
-// GET PAYMENT AUTOMATION SETTINGS
-// ============================================================
-
 async function getSettings() {
   let settings =
     await PaymentAutomationSettings.findOne({
@@ -210,10 +172,6 @@ async function getSettings() {
   return settings;
 }
 
-// ============================================================
-// FIND PENDING RECHARGES
-// ============================================================
-
 async function getPendingRecharges() {
   return Transaction.find({
     type: 'recharge',
@@ -225,9 +183,9 @@ async function getPendingRecharges() {
     .limit(200);
 }
 
-// ============================================================
-// ADMIN PANEL — GET SETTINGS
-// ============================================================
+/* ============================================================
+   ADMIN SETTINGS
+   ============================================================ */
 
 router.get(
   '/settings',
@@ -255,10 +213,6 @@ router.get(
     }
   }
 );
-
-// ============================================================
-// ADMIN PANEL — SAVE SETTINGS
-// ============================================================
 
 router.put(
   '/settings',
@@ -319,17 +273,9 @@ router.put(
   }
 );
 
-// ============================================================
-// n8n — RECEIVE BANK SMS
-//
-// POST /bank-sms
-// POST /sms
-//
-// Duplicate UTR is NOT rejected here.
-//
-// If the UTR already exists, return the existing BankPayment.
-// The /match endpoint decides whether that UTR is still usable.
-// ============================================================
+/* ============================================================
+   RECEIVE BANK SMS
+   ============================================================ */
 
 router.post(
   ['/bank-sms', '/sms'],
@@ -369,10 +315,6 @@ router.post(
       const normalizedDirection =
         String(direction || '').toLowerCase();
 
-      // ========================================================
-      // DEBIT SMS
-      // ========================================================
-
       if (
         normalizedDirection === 'debit'
       ) {
@@ -401,10 +343,6 @@ router.post(
         });
       }
 
-      // ========================================================
-      // ONLY CREDIT SMS CAN BE MATCHED
-      // ========================================================
-
       if (
         normalizedDirection !== 'credit'
       ) {
@@ -431,15 +369,6 @@ router.post(
             status: 'pending'
           });
       } catch (err) {
-
-        // ======================================================
-        // DUPLICATE BANK UTR
-        //
-        // Do NOT reject.
-        //
-        // It may belong to a previously rejected recharge.
-        // ======================================================
-
         if (err?.code === 11000) {
           const existing =
             await BankPayment.findOne({
@@ -486,9 +415,9 @@ router.post(
   }
 );
 
-// ============================================================
-// n8n — GET UNPROCESSED CREDIT SMS
-// ============================================================
+/* ============================================================
+   GET PENDING BANK PAYMENTS
+   ============================================================ */
 
 router.get(
   '/pending-bank-payments',
@@ -520,23 +449,22 @@ router.get(
   }
 );
 
-// ============================================================
-// n8n — MATCH BANK PAYMENT TO RECHARGE
-//
-// IMPORTANT:
-//
-// req.body.utr = BANK SMS UTR.
-//
-// Player's UTR comes from Transaction.rechargeNote.
-//
-// These are deliberately treated as two different values.
-//
-// UTR mismatch does NOT immediately reject.
-// It returns WAITING.
-//
-// The final 3-minute rejection is handled by:
-// POST /expire-pending-recharges
-// ============================================================
+/* ============================================================
+   MATCH BANK PAYMENT TO PLAYER RECHARGE
+
+   IMPORTANT:
+
+   Bank SMS can arrive BEFORE player request.
+
+   Bank SMS can arrive AFTER player request.
+
+   smsAt is stored for audit only.
+
+   smsAt is NEVER compared with Transaction.createdAt.
+
+   Player's 1-minute expiry is handled separately by:
+   /expire-pending-recharges
+   ============================================================ */
 
 router.post(
   '/match',
@@ -570,10 +498,6 @@ router.post(
         });
       }
 
-      // ========================================================
-      // LOAD THE ACTUAL BANK PAYMENT
-      // ========================================================
-
       let bankPayment = null;
 
       if (bankPaymentId) {
@@ -597,14 +521,12 @@ router.post(
           decision: 'WAITING',
           reason:
             'bank_payment_not_found',
-          amount: bankSmsAmount,
-          utr: bankSmsUtr
+          amount:
+            bankSmsAmount,
+          utr:
+            bankSmsUtr
         });
       }
-
-      // ========================================================
-      // USE BANK PAYMENT AS SOURCE OF TRUTH
-      // ========================================================
 
       const actualBankAmount =
         Number(bankPayment.amount);
@@ -624,13 +546,9 @@ router.post(
         });
       }
 
-      // ========================================================
-      // HAS THIS BANK UTR ALREADY BEEN SUCCESSFULLY USED?
-      //
-      // IMPORTANT:
-      //
-      // A rejected transaction does NOT count.
-      // ========================================================
+      /* ========================================================
+         CHECK IF UTR WAS ALREADY APPROVED
+         ======================================================== */
 
       const successfulRecharge =
         await findSuccessfulRechargeByUtr(
@@ -638,13 +556,6 @@ router.post(
         );
 
       if (successfulRecharge) {
-
-        /*
-         * Find a CURRENT pending player request using the
-         * same UTR.
-         *
-         * Do not reject unrelated pending requests.
-         */
 
         const pendingRecharges =
           await getPendingRecharges();
@@ -696,11 +607,6 @@ router.post(
           });
         }
 
-        /*
-         * No pending transaction using the duplicate UTR.
-         * Do not touch another player's request.
-         */
-
         return res.json({
           matched: false,
           decision: 'NO_MATCH',
@@ -715,18 +621,12 @@ router.post(
         });
       }
 
-      // ========================================================
-      // FIND PENDING PLAYER REQUESTS
-      // ========================================================
+      /* ========================================================
+         FIND PENDING PLAYER REQUESTS
+         ======================================================== */
 
       const pendingRecharges =
         await getPendingRecharges();
-
-      // ========================================================
-      // EXACT UTR MATCH
-      //
-      // Compare BANK UTR with PLAYER UTR.
-      // ========================================================
 
       let exactUtrTransaction = null;
 
@@ -748,22 +648,15 @@ router.post(
         }
       }
 
-      // ========================================================
-      // EXACT UTR FOUND
-      // ========================================================
+      /* ========================================================
+         EXACT UTR FOUND
+         ======================================================== */
 
       if (exactUtrTransaction) {
 
-        // ======================================================
-        // SAME UTR BUT WRONG AMOUNT
-        //
-        // This is certain because the actual bank amount is known.
-        //
-        // Reject the player's request.
-        //
-        // The UTR remains reusable because this transaction
-        // was rejected, not approved.
-        // ======================================================
+        /* ======================================================
+           SAME UTR + WRONG AMOUNT
+           ====================================================== */
 
         if (
           Number(
@@ -796,75 +689,18 @@ router.post(
           });
         }
 
-        // ======================================================
-        // SAME UTR + SAME AMOUNT
-        // ======================================================
+        /* ======================================================
+           SAME UTR + SAME AMOUNT
+
+           NO SMS TIME COMPARISON.
+
+           This works when SMS arrived:
+           - before the player request
+           - after the player request
+        ====================================================== */
 
         const settings =
           await getSettings();
-
-        // ======================================================
-        // THREE-MINUTE WINDOW
-        // ======================================================
-
-        const bankTime =
-          bankPayment.smsAt ||
-          bankPayment.createdAt;
-
-        const rechargeTime =
-          exactUtrTransaction.createdAt;
-
-        const differenceMs =
-          Math.abs(
-            bankTime.getTime() -
-            rechargeTime.getTime()
-          );
-
-        const withinThreeMinutes =
-          differenceMs <= 60000;
-
-        if (!withinThreeMinutes) {
-
-          await BankPayment.findOneAndUpdate(
-            {
-              _id: bankPayment._id,
-              status: {
-                $in: [
-                  'pending',
-                  'matched'
-                ]
-              }
-            },
-            {
-              $set: {
-                status: 'manual',
-                matchedTransaction:
-                  exactUtrTransaction._id,
-                matchedAt:
-                  new Date()
-              }
-            }
-          );
-
-          return res.json({
-            matched: true,
-            decision: 'MANUAL',
-            reason:
-              'outside_three_minute_window',
-            transactionId:
-              exactUtrTransaction._id,
-            userId:
-              exactUtrTransaction.user,
-            amount:
-              exactUtrTransaction.amount,
-            utr:
-              actualBankUtr
-          });
-        }
-
-        // ======================================================
-        // AUTO VERIFY OFF
-        // ======================================================
 
         if (!settings.autoVerify) {
           return res.json({
@@ -882,10 +718,6 @@ router.post(
               actualBankUtr
           });
         }
-
-        // ======================================================
-        // ABOVE AUTO APPROVAL LIMIT
-        // ======================================================
 
         if (
           actualBankAmount >
@@ -908,12 +740,6 @@ router.post(
               settings.maxAutoAmount
           });
         }
-
-        // ======================================================
-        // MATCHED AND ELIGIBLE FOR EXISTING APPROVAL LOGIC
-        //
-        // DO NOT CREDIT BALANCE HERE.
-        // ======================================================
 
         await BankPayment.findOneAndUpdate(
           {
@@ -950,18 +776,13 @@ router.post(
         });
       }
 
-      // ========================================================
-      // NO EXACT UTR MATCH
-      //
-      // IMPORTANT:
-      //
-      // DO NOT REJECT.
-      //
-      // The bank SMS may be delayed or the correct SMS may
-      // arrive shortly.
-      //
-      // Keep all pending player requests untouched.
-      // ========================================================
+      /* ========================================================
+         NO UTR MATCH
+
+         DO NOT REJECT IMMEDIATELY.
+
+         Player remains pending until 1-minute expiry.
+         ======================================================== */
 
       return res.json({
         matched: false,
@@ -987,23 +808,24 @@ router.post(
   }
 );
 
-// ============================================================
-// n8n — FINAL 3-MINUTE CHECK
-//
-// This endpoint should be called periodically by n8n.
-//
-// It checks pending player recharge requests that are older
-// than 3 minutes.
-//
-// If the player's UTR has a matching bank payment:
-//   - same amount → MANUAL
-//   - wrong amount → REJECT
-//
-// If no matching bank payment exists:
-//   - REJECT after 3 minutes
-//
-// This is the endpoint that performs the final timeout rejection.
-// ============================================================
+/* ============================================================
+   PLAYER RECHARGE EXPIRY — 1 MINUTE
+
+   The 1-minute clock starts at:
+
+   Transaction.createdAt
+
+   It does NOT start at:
+
+   BankPayment.smsAt
+
+   SMS can therefore arrive before the player request.
+
+   After 1 minute:
+   - no bank payment -> REJECT
+   - bank payment + wrong amount -> REJECT
+   - bank payment + same amount -> MANUAL
+   ============================================================ */
 
 router.post(
   '/expire-pending-recharges',
@@ -1012,7 +834,7 @@ router.post(
     try {
       const cutoff =
         new Date(
-          Date.now() - 180000
+          Date.now() - 60000
         );
 
       const pendingRecharges =
@@ -1037,25 +859,19 @@ router.post(
         of pendingRecharges
       ) {
 
-        // ------------------------------------------------------
-        // PLAYER UTR
-        // ------------------------------------------------------
-
         const playerUtr =
           extractUtr(
             transaction.rechargeNote
           );
 
-        // ------------------------------------------------------
-        // NO PLAYER UTR
-        // ------------------------------------------------------
+        /* No player UTR */
 
         if (!playerUtr) {
 
           const rejectedTx =
             await rejectRecharge(
               transaction,
-              'We could not verify your payment within 3 minutes because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
+              'We could not verify your payment within 1 minute because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
             );
 
           if (rejectedTx) {
@@ -1067,9 +883,7 @@ router.post(
           continue;
         }
 
-        // ------------------------------------------------------
-        // HAS PLAYER UTR ALREADY BEEN SUCCESSFULLY USED?
-        // ------------------------------------------------------
+        /* Already successfully used UTR */
 
         const successfulRecharge =
           await findSuccessfulRechargeByUtr(
@@ -1093,9 +907,7 @@ router.post(
           continue;
         }
 
-        // ------------------------------------------------------
-        // FIND BANK PAYMENT USING PLAYER UTR
-        // ------------------------------------------------------
+        /* Find bank payment */
 
         const bankPayment =
           await BankPayment.findOne({
@@ -1103,21 +915,14 @@ router.post(
             direction: 'credit'
           });
 
-        // ------------------------------------------------------
-        // NO BANK PAYMENT FOR PLAYER UTR
-        //
-        // Three minutes have passed.
-        //
-        // Now it is safe to reject because the correct payment
-        // was not found within the allowed verification window.
-        // ------------------------------------------------------
+        /* No bank payment */
 
         if (!bankPayment) {
 
           const rejectedTx =
             await rejectRecharge(
               transaction,
-              'We could not verify your payment within 3 minutes. Please submit a new recharge request with the correct UTR.'
+              'We could not verify your payment within 1 minute. Please submit a new recharge request with the correct UTR.'
             );
 
           if (rejectedTx) {
@@ -1129,9 +934,7 @@ router.post(
           continue;
         }
 
-        // ------------------------------------------------------
-        // BANK PAYMENT FOUND — CHECK AMOUNT
-        // ------------------------------------------------------
+        /* Bank payment found — amount check */
 
         const bankAmount =
           Number(bankPayment.amount);
@@ -1156,14 +959,7 @@ router.post(
           continue;
         }
 
-        // ------------------------------------------------------
-        // SAME UTR + SAME AMOUNT FOUND AFTER 3 MINUTES
-        //
-        // Payment is valid, but it is outside the automatic
-        // approval window.
-        //
-        // Send to MANUAL rather than rejecting the payment.
-        // ------------------------------------------------------
+        /* Same UTR + same amount after 1 minute -> MANUAL */
 
         await BankPayment.findOneAndUpdate(
           {
@@ -1205,9 +1001,13 @@ router.post(
   }
 );
 
-// ============================================================
-// EXPIRE OLD UNMATCHED BANK PAYMENTS
-// ============================================================
+/* ============================================================
+   BANK PAYMENT CLEANUP
+
+   This is separate from the player's 1-minute window.
+
+   Keep this at 3 minutes.
+   ============================================================ */
 
 router.post(
   '/expire-bank-payments',
