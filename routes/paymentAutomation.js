@@ -821,7 +821,7 @@ router.post(
           );
 
         const withinThreeMinutes =
-          differenceMs <= 180000;
+          differenceMs <= 60000;
 
         if (!withinThreeMinutes) {
 
