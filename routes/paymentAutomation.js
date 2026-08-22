@@ -5,6 +5,7 @@ const router = express.Router();
 
 const Transaction = require('../models/Transaction');
 const BankPayment = require('../models/BankPayment');
+const User = require('../models/User');
 const { adminAuth } = require('../middleware/auth');
 
 const settingsSchema = new mongoose.Schema(
@@ -121,8 +122,142 @@ async function rejectRecharge(transaction, reason) {
   );
 }
 
+async function approveRecharge(transaction, bankPayment) {
+  if (!transaction || !bankPayment) {
+    return {
+      ok: false,
+      reason: 'missing_transaction_or_bank_payment'
+    };
+  }
+
+  // Claim the pending transaction first.
+  // This prevents the same recharge from being credited twice.
+  const claimed = await Transaction.findOneAndUpdate(
+    {
+      _id: transaction._id,
+      type: 'recharge',
+      status: 'pending'
+    },
+    {
+      $set: {
+        status: 'approved',
+        processedAt: new Date()
+      }
+    },
+    {
+      new: true
+    }
+  );
+
+  if (!claimed) {
+    return {
+      ok: false,
+      alreadyProcessed: true,
+      transaction: await Transaction.findById(
+        transaction._id
+      )
+    };
+  }
+
+  try {
+    const user =
+      await User.findById(claimed.user);
+
+    if (!user) {
+      await Transaction.findOneAndUpdate(
+        {
+          _id: claimed._id,
+          status: 'approved'
+        },
+        {
+          $set: {
+            status: 'pending',
+            processedAt: null
+          }
+        }
+      );
+
+      throw new Error(
+        'Player not found while approving recharge'
+      );
+    }
+
+    const amount =
+      Number(claimed.amount);
+
+    const balanceBefore =
+      Number(user.balance || 0);
+
+    const balanceAfter =
+      balanceBefore + amount;
+
+    user.balance =
+      balanceAfter;
+
+    await user.save();
+
+    claimed.balanceBefore =
+      balanceBefore;
+
+    claimed.balanceAfter =
+      balanceAfter;
+
+    claimed.processedAt =
+      new Date();
+
+    await claimed.save();
+
+    await BankPayment.findOneAndUpdate(
+      {
+        _id: bankPayment._id,
+        status: {
+          $in: [
+            'pending',
+            'matched'
+          ]
+        }
+      },
+      {
+        $set: {
+          status: 'matched',
+          matchedTransaction:
+            claimed._id,
+          matchedAt:
+            new Date()
+        }
+      }
+    );
+
+    return {
+      ok: true,
+      transaction: claimed,
+      balanceBefore,
+      balanceAfter
+    };
+
+  } catch (error) {
+
+    // Roll back transaction status if approval fails.
+    await Transaction.findOneAndUpdate(
+      {
+        _id: claimed._id,
+        status: 'approved'
+      },
+      {
+        $set: {
+          status: 'pending',
+          processedAt: null
+        }
+      }
+    );
+
+    throw error;
+  }
+}
+
 async function findSuccessfulRechargeByUtr(utr) {
-  const normalizedUtr = normalizeUtr(utr);
+  const normalizedUtr =
+    normalizeUtr(utr);
 
   if (!normalizedUtr) {
     return null;
@@ -139,9 +274,13 @@ async function findSuccessfulRechargeByUtr(utr) {
       })
       .limit(500);
 
-  for (const tx of approvedTransactions) {
+  for (
+    const tx of approvedTransactions
+  ) {
     const txUtr =
-      extractUtr(tx.rechargeNote);
+      extractUtr(
+        tx.rechargeNote
+      );
 
     if (
       txUtr &&
@@ -201,6 +340,7 @@ router.get(
         maxAutoAmount:
           settings.maxAutoAmount
       });
+
     } catch (err) {
       console.error(
         'Payment automation settings error:',
@@ -260,6 +400,7 @@ router.put(
         maxAutoAmount:
           settings.maxAutoAmount
       });
+
     } catch (err) {
       console.error(
         'Save automation settings error:',
@@ -313,38 +454,52 @@ router.post(
       }
 
       const normalizedDirection =
-        String(direction || '').toLowerCase();
+        String(
+          direction || ''
+        ).toLowerCase();
 
       if (
         normalizedDirection === 'debit'
       ) {
         try {
           await BankPayment.create({
-            amount: parsedAmount,
-            utr: normalizedUtr,
+            amount:
+              parsedAmount,
+            utr:
+              normalizedUtr,
             bankAccount:
               bankAccount || '',
-            direction: 'debit',
-            smsText: smsText || '',
-            smsAt: smsAt
-              ? new Date(smsAt)
-              : new Date(),
-            status: 'ignored'
+            direction:
+              'debit',
+            smsText:
+              smsText || '',
+            smsAt:
+              smsAt
+                ? new Date(smsAt)
+                : new Date(),
+            status:
+              'ignored'
           });
+
         } catch (err) {
-          if (err?.code !== 11000) {
+
+          if (
+            err?.code !== 11000
+          ) {
             throw err;
           }
         }
 
         return res.json({
           accepted: false,
-          reason: 'debit_sms_ignored'
+          reason:
+            'debit_sms_ignored'
         });
       }
 
       if (
-        normalizedDirection !== 'credit'
+        normalizedDirection !==
+        'credit'
       ) {
         return res.status(400).json({
           message:
@@ -355,31 +510,45 @@ router.post(
       let bankPayment;
 
       try {
+
         bankPayment =
           await BankPayment.create({
-            amount: parsedAmount,
-            utr: normalizedUtr,
+            amount:
+              parsedAmount,
+            utr:
+              normalizedUtr,
             bankAccount:
               bankAccount || '',
-            direction: 'credit',
-            smsText: smsText || '',
-            smsAt: smsAt
-              ? new Date(smsAt)
-              : new Date(),
-            status: 'pending'
+            direction:
+              'credit',
+            smsText:
+              smsText || '',
+            smsAt:
+              smsAt
+                ? new Date(smsAt)
+                : new Date(),
+            status:
+              'pending'
           });
+
       } catch (err) {
-        if (err?.code === 11000) {
+
+        if (
+          err?.code === 11000
+        ) {
+
           const existing =
             await BankPayment.findOne({
-              utr: normalizedUtr
+              utr:
+                normalizedUtr
             });
 
           return res.json({
             accepted: true,
             duplicate: true,
             bankPaymentId:
-              existing?._id || null,
+              existing?._id ||
+              null,
             amount:
               existing?.amount ??
               parsedAmount,
@@ -403,6 +572,7 @@ router.post(
       });
 
     } catch (err) {
+
       console.error(
         'Bank SMS processing error:',
         err
@@ -424,19 +594,25 @@ router.get(
   automationSecret,
   async (req, res) => {
     try {
+
       const payments =
         await BankPayment.find({
-          direction: 'credit',
-          status: 'pending'
+          direction:
+            'credit',
+          status:
+            'pending'
         })
           .sort({
             createdAt: 1
           })
           .limit(50);
 
-      res.json(payments);
+      res.json(
+        payments
+      );
 
     } catch (err) {
+
       console.error(
         'Pending bank payments error:',
         err
@@ -471,6 +647,7 @@ router.post(
   automationSecret,
   async (req, res) => {
     try {
+
       const {
         amount,
         utr,
@@ -484,23 +661,29 @@ router.post(
         normalizeUtr(utr);
 
       if (
-        !Number.isFinite(bankSmsAmount) ||
+        !Number.isFinite(
+          bankSmsAmount
+        ) ||
         bankSmsAmount <= 0
       ) {
         return res.status(400).json({
-          message: 'Invalid amount'
+          message:
+            'Invalid amount'
         });
       }
 
       if (!bankSmsUtr) {
         return res.status(400).json({
-          message: 'UTR is required'
+          message:
+            'UTR is required'
         });
       }
 
-      let bankPayment = null;
+      let bankPayment =
+        null;
 
       if (bankPaymentId) {
+
         bankPayment =
           await BankPayment.findById(
             bankPaymentId
@@ -508,17 +691,22 @@ router.post(
       }
 
       if (!bankPayment) {
+
         bankPayment =
           await BankPayment.findOne({
-            utr: bankSmsUtr,
-            direction: 'credit'
+            utr:
+              bankSmsUtr,
+            direction:
+              'credit'
           });
       }
 
       if (!bankPayment) {
+
         return res.json({
           matched: false,
-          decision: 'WAITING',
+          decision:
+            'WAITING',
           reason:
             'bank_payment_not_found',
           amount:
@@ -529,7 +717,9 @@ router.post(
       }
 
       const actualBankAmount =
-        Number(bankPayment.amount);
+        Number(
+          bankPayment.amount
+        );
 
       const actualBankUtr =
         normalizeUtr(
@@ -560,11 +750,13 @@ router.post(
         const pendingRecharges =
           await getPendingRecharges();
 
-        let duplicateTransaction = null;
+        let duplicateTransaction =
+          null;
 
         for (
           const tx of pendingRecharges
         ) {
+
           const playerUtr =
             extractUtr(
               tx.rechargeNote
@@ -572,15 +764,19 @@ router.post(
 
           if (
             playerUtr &&
-            playerUtr === actualBankUtr
+            playerUtr ===
+              actualBankUtr
           ) {
             duplicateTransaction =
               tx;
+
             break;
           }
         }
 
-        if (duplicateTransaction) {
+        if (
+          duplicateTransaction
+        ) {
 
           const rejected =
             await rejectRecharge(
@@ -590,7 +786,8 @@ router.post(
 
           return res.json({
             matched: false,
-            decision: 'REJECTED',
+            decision:
+              'REJECTED',
             reason:
               'utr_already_used',
             transactionId:
@@ -609,7 +806,8 @@ router.post(
 
         return res.json({
           matched: false,
-          decision: 'NO_MATCH',
+          decision:
+            'NO_MATCH',
           reason:
             'utr_already_used',
           amount:
@@ -628,11 +826,13 @@ router.post(
       const pendingRecharges =
         await getPendingRecharges();
 
-      let exactUtrTransaction = null;
+      let exactUtrTransaction =
+        null;
 
       for (
         const tx of pendingRecharges
       ) {
+
         const playerUtr =
           extractUtr(
             tx.rechargeNote
@@ -640,10 +840,12 @@ router.post(
 
         if (
           playerUtr &&
-          playerUtr === actualBankUtr
+          playerUtr ===
+            actualBankUtr
         ) {
           exactUtrTransaction =
             tx;
+
           break;
         }
       }
@@ -652,7 +854,9 @@ router.post(
          EXACT UTR FOUND
          ======================================================== */
 
-      if (exactUtrTransaction) {
+      if (
+        exactUtrTransaction
+      ) {
 
         /* ======================================================
            SAME UTR + WRONG AMOUNT
@@ -661,7 +865,8 @@ router.post(
         if (
           Number(
             exactUtrTransaction.amount
-          ) !== actualBankAmount
+          ) !==
+          actualBankAmount
         ) {
 
           const rejected =
@@ -672,7 +877,8 @@ router.post(
 
           return res.json({
             matched: false,
-            decision: 'REJECTED',
+            decision:
+              'REJECTED',
             reason:
               'amount_mismatch',
             transactionId:
@@ -702,10 +908,13 @@ router.post(
         const settings =
           await getSettings();
 
-        if (!settings.autoVerify) {
+        if (
+          !settings.autoVerify
+        ) {
           return res.json({
             matched: true,
-            decision: 'MANUAL',
+            decision:
+              'MANUAL',
             reason:
               'auto_verify_disabled',
             transactionId:
@@ -725,7 +934,8 @@ router.post(
         ) {
           return res.json({
             matched: true,
-            decision: 'MANUAL',
+            decision:
+              'MANUAL',
             reason:
               'amount_exceeds_limit',
             transactionId:
@@ -741,38 +951,67 @@ router.post(
           });
         }
 
-        await BankPayment.findOneAndUpdate(
-          {
-            _id: bankPayment._id,
-            status: {
-              $in: [
-                'pending',
-                'matched'
-              ]
-            }
-          },
-          {
-            $set: {
-              status: 'matched',
-              matchedTransaction:
-                exactUtrTransaction._id,
-              matchedAt:
-                new Date()
-            }
-          }
-        );
+        // Actually approve the recharge and credit the player's
+        // balance. The transaction changes from pending -> approved,
+        // so it automatically disappears from the Pending list.
+
+        const approval =
+          await approveRecharge(
+            exactUtrTransaction,
+            bankPayment
+          );
+
+        if (
+          approval.alreadyProcessed
+        ) {
+          return res.json({
+            matched: true,
+            decision:
+              'ALREADY_PROCESSED',
+            reason:
+              'recharge_already_processed',
+            transactionId:
+              exactUtrTransaction._id,
+            userId:
+              exactUtrTransaction.user,
+            amount:
+              exactUtrTransaction.amount,
+            utr:
+              actualBankUtr
+          });
+        }
+
+        if (!approval.ok) {
+          return res.status(500).json({
+            matched: false,
+            decision:
+              'ERROR',
+            reason:
+              approval.reason ||
+              'approval_failed',
+            transactionId:
+              exactUtrTransaction._id,
+            utr:
+              actualBankUtr
+          });
+        }
 
         return res.json({
           matched: true,
-          decision: 'APPROVE',
+          decision:
+            'APPROVE',
           transactionId:
-            exactUtrTransaction._id,
+            approval.transaction._id,
           userId:
-            exactUtrTransaction.user,
+            approval.transaction.user,
           amount:
-            exactUtrTransaction.amount,
+            approval.transaction.amount,
           utr:
-            actualBankUtr
+            actualBankUtr,
+          balanceBefore:
+            approval.balanceBefore,
+          balanceAfter:
+            approval.balanceAfter
         });
       }
 
@@ -786,7 +1025,8 @@ router.post(
 
       return res.json({
         matched: false,
-        decision: 'WAITING',
+        decision:
+          'WAITING',
         reason:
           'utr_mismatch_or_pending_bank_sms',
         amount:
@@ -796,13 +1036,15 @@ router.post(
       });
 
     } catch (err) {
+
       console.error(
         'Payment matching error:',
         err
       );
 
       return res.status(500).json({
-        message: 'Server error'
+        message:
+          'Server error'
       });
     }
   }
@@ -832,17 +1074,22 @@ router.post(
   automationSecret,
   async (req, res) => {
     try {
+
       const cutoff =
         new Date(
-          Date.now() - 60000
+          Date.now() -
+          60000
         );
 
       const pendingRecharges =
         await Transaction.find({
-          type: 'recharge',
-          status: 'pending',
+          type:
+            'recharge',
+          status:
+            'pending',
           createdAt: {
-            $lt: cutoff
+            $lt:
+              cutoff
           }
         })
           .sort({
@@ -890,7 +1137,9 @@ router.post(
             playerUtr
           );
 
-        if (successfulRecharge) {
+        if (
+          successfulRecharge
+        ) {
 
           const rejectedTx =
             await rejectRecharge(
@@ -911,8 +1160,10 @@ router.post(
 
         const bankPayment =
           await BankPayment.findOne({
-            utr: playerUtr,
-            direction: 'credit'
+            utr:
+              playerUtr,
+            direction:
+              'credit'
           });
 
         /* No bank payment */
@@ -937,11 +1188,15 @@ router.post(
         /* Bank payment found — amount check */
 
         const bankAmount =
-          Number(bankPayment.amount);
+          Number(
+            bankPayment.amount
+          );
 
         if (
           bankAmount !==
-          Number(transaction.amount)
+          Number(
+            transaction.amount
+          )
         ) {
 
           const rejectedTx =
@@ -963,11 +1218,13 @@ router.post(
 
         await BankPayment.findOneAndUpdate(
           {
-            _id: bankPayment._id
+            _id:
+              bankPayment._id
           },
           {
             $set: {
-              status: 'manual',
+              status:
+                'manual',
               matchedTransaction:
                 transaction._id,
               matchedAt:
@@ -989,13 +1246,15 @@ router.post(
       });
 
     } catch (err) {
+
       console.error(
         'Expire pending recharge error:',
         err
       );
 
       return res.status(500).json({
-        message: 'Server error'
+        message:
+          'Server error'
       });
     }
   }
@@ -1014,40 +1273,49 @@ router.post(
   automationSecret,
   async (req, res) => {
     try {
+
       const cutoff =
         new Date(
-          Date.now() - 180000
+          Date.now() -
+          180000
         );
 
       const result =
         await BankPayment.updateMany(
           {
-            direction: 'credit',
-            status: 'pending',
+            direction:
+              'credit',
+            status:
+              'pending',
             createdAt: {
-              $lt: cutoff
+              $lt:
+                cutoff
             }
           },
           {
             $set: {
-              status: 'expired'
+              status:
+                'expired'
             }
           }
         );
 
       return res.json({
         expired:
-          result.modifiedCount || 0
+          result.modifiedCount ||
+          0
       });
 
     } catch (err) {
+
       console.error(
         'Expire bank payments error:',
         err
       );
 
       return res.status(500).json({
-        message: 'Server error'
+        message:
+          'Server error'
       });
     }
   }
