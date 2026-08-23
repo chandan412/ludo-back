@@ -17,8 +17,8 @@
    No new npm packages needed.
    ============================================================ */
 
-const RECHARGE_SWEEP_MS = 30 * 1000;   // player 1-minute expiry: check twice a minute
-const BANK_SWEEP_MS = 60 * 1000;       // bank payment cleanup runs at 3 minutes, so
+const RECHARGE_SWEEP_MS = 180 * 1000;   // player 1-minute expiry: check twice a minute
+const BANK_SWEEP_MS = 120 * 1000;       // bank payment cleanup runs at 3 minutes, so
                                        // once a minute is plenty
 
 let rechargeTimer = null;
