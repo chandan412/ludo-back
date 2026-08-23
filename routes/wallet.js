@@ -30,6 +30,49 @@ function notifyAdmins(req, payload) {
 }
 
 // ============================================================================
+// ✅ UTR EXTRACTION — must stay identical to extractUtr() in
+// routes/paymentAutomation.js.
+//
+// The payment automation matches a player's recharge to a bank SMS by pulling
+// the UTR out of rechargeNote with this exact logic. If the two copies ever
+// diverge, a note that passes validation at submission time can silently fail
+// to match at approval time, and the player gets auto-rejected after a minute
+// with no way to tell what went wrong.
+//
+// If you change one, change both.
+// ============================================================================
+function extractUtr(note) {
+  if (!note) return '';
+
+  const text = String(note).trim();
+
+  const labelled = text.match(
+    /(?:UTR|REF(?:ERENCE)?|TRANSACTION(?:\s*ID)?|TXN(?:\s*ID)?)\s*[:#-]?\s*([A-Z0-9]{6,30})/i
+  );
+
+  if (labelled) {
+    return labelled[1].trim().toUpperCase();
+  }
+
+  if (/^[A-Z0-9]{6,30}$/i.test(text)) {
+    return text.toUpperCase();
+  }
+
+  const numeric = text.match(/\b\d{8,30}\b/);
+
+  if (numeric) {
+    return numeric[0];
+  }
+
+  return '';
+}
+
+// Indian bank UTR / UPI reference numbers are at least 9 characters.
+// Anything shorter is almost certainly the player typing the wrong thing
+// (an amount, a phone number fragment, a date).
+const MIN_UTR_LENGTH = 9;
+
+// ============================================================================
 // ⚠️ CRITICAL FIX — the lockedBalance reconcile was a DOUBLE-SPEND vector.
 //
 // The previous version did a blind read-modify-write:
@@ -178,11 +221,43 @@ router.get('/transactions', auth, async (req, res) => {
   }
 });
 
+// ============================================================================
+// ✅ RECHARGE REQUEST — UTR IS NOW MANDATORY
+//
+// The payment automation matches a recharge to a bank SMS purely on the UTR
+// found in rechargeNote. A request without one can NEVER be matched: it sits
+// pending until /expire-pending-recharges rejects it a minute later, and the
+// player is left confused.
+//
+// The old default of 'Payment via QR' contained no UTR at all, so every request
+// that relied on it was guaranteed to fail. It has been removed — the note the
+// player actually types is stored instead.
+//
+// NOTE FOR THE FRONTEND: the recharge form must now present the UTR field as
+// REQUIRED. If it is still optional, players will hit a 400 they cannot resolve
+// from the form.
+// ============================================================================
 router.post('/recharge-request', auth, async (req, res) => {
   try {
     const { amount, paymentNote } = req.body;
     if (!amount || amount < 10)
       return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
+
+    const note = String(paymentNote || '').trim();
+
+    if (!note) {
+      return res.status(400).json({
+        message: 'Please enter the UTR / reference number from your payment.'
+      });
+    }
+
+    const utr = extractUtr(note);
+
+    if (!utr || utr.length < MIN_UTR_LENGTH) {
+      return res.status(400).json({
+        message: 'Enter a valid UTR / reference number (at least 9 characters). You will find it in your UPI app under the payment details.'
+      });
+    }
 
     // ✅ One pending deposit at a time — mirror of the withdrawal guard below.
     // A player can't stack multiple deposit requests; they must wait for the
@@ -191,6 +266,25 @@ router.post('/recharge-request', auth, async (req, res) => {
     if (pending)
       return res.status(400).json({ message: 'You already have a pending deposit request. Please wait for it to be processed.' });
 
+    // Reject an already-used UTR at submission time rather than letting the
+    // matcher discover it a minute later. Better error message, and it stops
+    // the pending slot being wasted.
+    //
+    // PERFORMANCE: this is an unindexed regex scan over recharge transactions.
+    // Acceptable at current volume; when the table grows, store the extracted
+    // UTR as its own indexed field on Transaction and query that instead.
+    const alreadyUsed = await Transaction.findOne({
+      type: 'recharge',
+      status: 'approved',
+      rechargeNote: { $regex: utr, $options: 'i' }
+    }).select('_id').lean();
+
+    if (alreadyUsed) {
+      return res.status(400).json({
+        message: 'This UTR has already been used for a previous recharge. Please enter the reference number of your new payment.'
+      });
+    }
+
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'recharge',
@@ -198,7 +292,7 @@ router.post('/recharge-request', auth, async (req, res) => {
       balanceBefore: req.user.balance,
       balanceAfter: req.user.balance,
       status: 'pending',
-      rechargeNote: paymentNote || 'Payment via QR'
+      rechargeNote: note
     });
 
     // ✅ Push to any admin with the panel open — no polling required.
@@ -217,6 +311,7 @@ router.post('/recharge-request', auth, async (req, res) => {
       transaction
     });
   } catch (err) {
+    console.error('recharge request error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
