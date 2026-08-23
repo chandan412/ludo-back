@@ -1178,10 +1178,252 @@ router.post(
    SMS can therefore arrive before the player request.
 
    After 1 minute:
-   - no bank payment -> REJECT
-   - bank payment + wrong amount -> REJECT
-   - bank payment + same amount -> MANUAL
+   - no bank payment                -> REJECT
+   - bank payment + wrong amount    -> REJECT
+   - bank payment + same amount     -> APPROVE (if autoVerify
+                                       is on and the amount is
+                                       within maxAutoAmount),
+                                       otherwise MANUAL
+
+   WHY APPROVAL HAPPENS HERE TOO
+   -----------------------------
+   /match runs exactly once, at the moment the bank SMS lands.
+   When the SMS arrives BEFORE the player has submitted their
+   request, /match finds no pending recharge and returns
+   WAITING — and nothing ever calls it again.
+
+   Without an approval path in this sweep, every
+   SMS-before-request payment would sit waiting for a human
+   even with autoVerify switched on. This closes that gap.
+
+   The logic is written as a plain function so it can be
+   called directly by the in-process scheduler as well as over
+   HTTP. See jobs/paymentScheduler.js.
    ============================================================ */
+
+async function expirePendingRecharges() {
+
+  const cutoff =
+    new Date(
+      Date.now() -
+      60000
+    );
+
+  const pendingRecharges =
+    await Transaction.find({
+      type:
+        'recharge',
+      status:
+        'pending',
+      createdAt: {
+        $lt:
+          cutoff
+      }
+    })
+      .sort({
+        createdAt: 1
+      })
+      .limit(100);
+
+  let approved = 0;
+  let rejected = 0;
+  let manual = 0;
+  let skipped = 0;
+
+  for (
+    const transaction
+    of pendingRecharges
+  ) {
+
+    const playerUtr =
+      extractUtr(
+        transaction.rechargeNote
+      );
+
+    /* No player UTR */
+
+    if (!playerUtr) {
+
+      const rejectedTx =
+        await rejectRecharge(
+          transaction,
+          'We could not verify your payment within 1 minute because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
+        );
+
+      if (rejectedTx) {
+        rejected++;
+      } else {
+        skipped++;
+      }
+
+      continue;
+    }
+
+    /* Already successfully used UTR */
+
+    const successfulRecharge =
+      await findSuccessfulRechargeByUtr(
+        playerUtr
+      );
+
+    if (
+      successfulRecharge
+    ) {
+
+      const rejectedTx =
+        await rejectRecharge(
+          transaction,
+          'This UTR has already been used for another successful recharge. Please submit a new recharge request with a valid UTR.'
+        );
+
+      if (rejectedTx) {
+        rejected++;
+      } else {
+        skipped++;
+      }
+
+      continue;
+    }
+
+    /* Find bank payment — ignored rows must not count */
+
+    const bankPayment =
+      await BankPayment.findOne({
+        utr:
+          playerUtr,
+        direction:
+          'credit',
+        status: {
+          $ne: 'ignored'
+        }
+      });
+
+    /* No bank payment */
+
+    if (!bankPayment) {
+
+      const rejectedTx =
+        await rejectRecharge(
+          transaction,
+          'We could not verify your payment within 1 minute. Please submit a new recharge request with the correct UTR.'
+        );
+
+      if (rejectedTx) {
+        rejected++;
+      } else {
+        skipped++;
+      }
+
+      continue;
+    }
+
+    /* Bank payment found — amount check */
+
+    const bankAmount =
+      Number(
+        bankPayment.amount
+      );
+
+    if (
+      bankAmount !==
+      Number(
+        transaction.amount
+      )
+    ) {
+
+      const rejectedTx =
+        await rejectRecharge(
+          transaction,
+          `Wrong payment amount. Your UTR belongs to a ₹${bankAmount} payment, but your recharge request was for ₹${transaction.amount}. Please submit a new recharge request with the correct amount.`
+        );
+
+      if (rejectedTx) {
+        rejected++;
+      } else {
+        skipped++;
+      }
+
+      continue;
+    }
+
+    /* ========================================================
+       SAME UTR + SAME AMOUNT
+
+       This is a verified payment. Credit it if automatic
+       verification is enabled and the amount is within the
+       configured ceiling; otherwise hand it to an admin.
+       ======================================================== */
+
+    const settings =
+      await getSettings();
+
+    if (
+      settings.autoVerify &&
+      bankAmount <= settings.maxAutoAmount
+    ) {
+
+      try {
+
+        const approval =
+          await approveRecharge(
+            transaction,
+            bankPayment
+          );
+
+        if (approval.ok) {
+          approved++;
+          continue;
+        }
+
+        if (approval.alreadyProcessed) {
+          skipped++;
+          continue;
+        }
+
+      } catch (err) {
+
+        // Approval failing must not stop the sweep. Fall
+        // through to MANUAL so an admin sees it rather than
+        // the payment silently vanishing.
+        console.error(
+          'Auto-approve at expiry failed:',
+          err.message
+        );
+      }
+    }
+
+    /* Not auto-approved — flag for manual review */
+
+    await BankPayment.findOneAndUpdate(
+      {
+        _id:
+          bankPayment._id
+      },
+      {
+        $set: {
+          status:
+            'manual',
+          matchedTransaction:
+            transaction._id,
+          matchedAt:
+            new Date()
+        }
+      }
+    );
+
+    manual++;
+  }
+
+  return {
+    success: true,
+    checked:
+      pendingRecharges.length,
+    approved,
+    rejected,
+    manual,
+    skipped
+  };
+}
 
 router.post(
   '/expire-pending-recharges',
@@ -1189,178 +1431,10 @@ router.post(
   async (req, res) => {
     try {
 
-      const cutoff =
-        new Date(
-          Date.now() -
-          60000
-        );
+      const result =
+        await expirePendingRecharges();
 
-      const pendingRecharges =
-        await Transaction.find({
-          type:
-            'recharge',
-          status:
-            'pending',
-          createdAt: {
-            $lt:
-              cutoff
-          }
-        })
-          .sort({
-            createdAt: 1
-          })
-          .limit(100);
-
-      let rejected = 0;
-      let manual = 0;
-      let skipped = 0;
-
-      for (
-        const transaction
-        of pendingRecharges
-      ) {
-
-        const playerUtr =
-          extractUtr(
-            transaction.rechargeNote
-          );
-
-        /* No player UTR */
-
-        if (!playerUtr) {
-
-          const rejectedTx =
-            await rejectRecharge(
-              transaction,
-              'We could not verify your payment within 1 minute because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
-            );
-
-          if (rejectedTx) {
-            rejected++;
-          } else {
-            skipped++;
-          }
-
-          continue;
-        }
-
-        /* Already successfully used UTR */
-
-        const successfulRecharge =
-          await findSuccessfulRechargeByUtr(
-            playerUtr
-          );
-
-        if (
-          successfulRecharge
-        ) {
-
-          const rejectedTx =
-            await rejectRecharge(
-              transaction,
-              'This UTR has already been used for another successful recharge. Please submit a new recharge request with a valid UTR.'
-            );
-
-          if (rejectedTx) {
-            rejected++;
-          } else {
-            skipped++;
-          }
-
-          continue;
-        }
-
-        /* Find bank payment — ignored rows must not count */
-
-        const bankPayment =
-          await BankPayment.findOne({
-            utr:
-              playerUtr,
-            direction:
-              'credit',
-            status: {
-              $ne: 'ignored'
-            }
-          });
-
-        /* No bank payment */
-
-        if (!bankPayment) {
-
-          const rejectedTx =
-            await rejectRecharge(
-              transaction,
-              'We could not verify your payment within 1 minute. Please submit a new recharge request with the correct UTR.'
-            );
-
-          if (rejectedTx) {
-            rejected++;
-          } else {
-            skipped++;
-          }
-
-          continue;
-        }
-
-        /* Bank payment found — amount check */
-
-        const bankAmount =
-          Number(
-            bankPayment.amount
-          );
-
-        if (
-          bankAmount !==
-          Number(
-            transaction.amount
-          )
-        ) {
-
-          const rejectedTx =
-            await rejectRecharge(
-              transaction,
-              `Wrong payment amount. Your UTR belongs to a ₹${bankAmount} payment, but your recharge request was for ₹${transaction.amount}. Please submit a new recharge request with the correct amount.`
-            );
-
-          if (rejectedTx) {
-            rejected++;
-          } else {
-            skipped++;
-          }
-
-          continue;
-        }
-
-        /* Same UTR + same amount after 1 minute -> MANUAL */
-
-        await BankPayment.findOneAndUpdate(
-          {
-            _id:
-              bankPayment._id
-          },
-          {
-            $set: {
-              status:
-                'manual',
-              matchedTransaction:
-                transaction._id,
-              matchedAt:
-                new Date()
-            }
-          }
-        );
-
-        manual++;
-      }
-
-      return res.json({
-        success: true,
-        checked:
-          pendingRecharges.length,
-        rejected,
-        manual,
-        skipped
-      });
+      return res.json(result);
 
     } catch (err) {
 
@@ -1385,43 +1459,51 @@ router.post(
    Keep this at 3 minutes.
    ============================================================ */
 
+async function expireBankPayments() {
+
+  const cutoff =
+    new Date(
+      Date.now() -
+      180000
+    );
+
+  const result =
+    await BankPayment.updateMany(
+      {
+        direction:
+          'credit',
+        status:
+          'pending',
+        createdAt: {
+          $lt:
+            cutoff
+        }
+      },
+      {
+        $set: {
+          status:
+            'expired'
+        }
+      }
+    );
+
+  return {
+    expired:
+      result.modifiedCount ||
+      0
+  };
+}
+
 router.post(
   '/expire-bank-payments',
   automationSecret,
   async (req, res) => {
     try {
 
-      const cutoff =
-        new Date(
-          Date.now() -
-          180000
-        );
-
       const result =
-        await BankPayment.updateMany(
-          {
-            direction:
-              'credit',
-            status:
-              'pending',
-            createdAt: {
-              $lt:
-                cutoff
-            }
-          },
-          {
-            $set: {
-              status:
-                'expired'
-            }
-          }
-        );
+        await expireBankPayments();
 
-      return res.json({
-        expired:
-          result.modifiedCount ||
-          0
-      });
+      return res.json(result);
 
     } catch (err) {
 
@@ -1438,4 +1520,18 @@ router.post(
   }
 );
 
+/* ============================================================
+   EXPORTS
+
+   The router is the default export so
+   app.use('/api/payment-automation', require(...)) keeps
+   working unchanged.
+
+   The two sweep functions are attached to it so the in-process
+   scheduler can call them directly, with no HTTP hop and no
+   secret header to misconfigure.
+   ============================================================ */
+
 module.exports = router;
+module.exports.expirePendingRecharges = expirePendingRecharges;
+module.exports.expireBankPayments = expireBankPayments;
