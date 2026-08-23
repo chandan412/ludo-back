@@ -1206,7 +1206,7 @@ async function expirePendingRecharges() {
   const cutoff =
     new Date(
       Date.now() -
-      60000
+      180000
     );
 
   const pendingRecharges =
@@ -1464,7 +1464,7 @@ async function expireBankPayments() {
   const cutoff =
     new Date(
       Date.now() -
-      180000
+      300000
     );
 
   const result =
