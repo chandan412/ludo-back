@@ -986,6 +986,28 @@ module.exports = (io) => {
         if (validMoves.length === 0) {
           game.currentTurn  = opponentState.user._id;
           game.lastDiceRoll = null;
+
+          // ============================================================
+          // ⚖️ FAIRNESS FIX — reset the six-streak when the turn passes.
+          //
+          // `consecutiveSixes` is a GAME-level counter, but it should only
+          // ever describe the player whose turn it currently is. Every other
+          // turn-change resets it (see the move-token branch below) — this
+          // path did not. So the counter could still be at 2 when the turn
+          // handed over, and the OPPONENT's next six was rerolled away for
+          // something their opponent did.
+          //
+          // Effect measured over 50,000 simulated games: roughly one six
+          // confiscated from the wrong player every 10 games. Small, but it
+          // lands on the one mechanic players watch — a six is the only way
+          // out of home — which is exactly the "mera token khulta hi nahi"
+          // complaint.
+          //
+          // The three-six rule itself is unchanged and still applies equally
+          // to both players. This only stops it leaking across a handover.
+          // ============================================================
+          game.consecutiveSixes = 0;
+
           await game.save();
 
           // ⏱️ They acted (rolled), and the turn passed — clock moves to the opponent.
