@@ -64,6 +64,40 @@ function automationSecret(req, res, next) {
   next();
 }
 
+/* ============================================================
+   BANK ACCOUNT ALLOWLIST
+
+   Only credit SMS for accounts listed in
+   ALLOWED_BANK_ACCOUNTS are eligible for matching.
+
+   Example env value:
+   ALLOWED_BANK_ACCOUNTS=XX794,XX1234
+
+   Leave the env var empty to allow every account
+   (single-account setups).
+   ============================================================ */
+
+function getAllowedBankAccounts() {
+  return String(
+    process.env.ALLOWED_BANK_ACCOUNTS || ''
+  )
+    .split(',')
+    .map(value => value.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function isAllowedBankAccount(bankAccount) {
+  const allowed = getAllowedBankAccounts();
+
+  if (allowed.length === 0) {
+    return true;
+  }
+
+  return allowed.includes(
+    String(bankAccount || '').trim().toUpperCase()
+  );
+}
+
 function normalizeUtr(value) {
   if (!value) return '';
 
@@ -207,26 +241,25 @@ async function approveRecharge(transaction, bankPayment) {
 
     await claimed.save();
 
-    await BankPayment.findOneAndUpdate(
-      {
-        _id: bankPayment._id,
-        status: {
-          $in: [
-            'pending',
-            'matched'
-          ]
-        }
-      },
-      {
-        $set: {
-          status: 'matched',
-          matchedTransaction:
-            claimed._id,
-          matchedAt:
-            new Date()
-        }
-      }
-    );
+    /* ========================================================
+       DELETE THE BANK PAYMENT ONCE CREDITED
+
+       The unique index on BankPayment.utr is what stops the
+       same bank SMS being processed twice. Once the recharge
+       has actually been credited, that row has done its job.
+
+       Deleting it releases the UTR from the unique index so a
+       recycled reference number from another bank cannot be
+       rejected as a false duplicate.
+
+       Replay protection after this point comes from
+       findSuccessfulRechargeByUtr, which scans approved
+       recharges.
+       ======================================================== */
+
+    await BankPayment.deleteOne({
+      _id: bankPayment._id
+    });
 
     return {
       ok: true,
@@ -263,6 +296,10 @@ async function findSuccessfulRechargeByUtr(utr) {
     return null;
   }
 
+  // Lookback raised from 500 to 5000. Because approved bank
+  // payments are now deleted, this scan is the only guard
+  // against a previously credited UTR being replayed, so the
+  // window needs to cover far more history.
   const approvedTransactions =
     await Transaction.find({
       type: 'recharge',
@@ -272,7 +309,7 @@ async function findSuccessfulRechargeByUtr(utr) {
         processedAt: -1,
         createdAt: -1
       })
-      .limit(500);
+      .limit(5000);
 
   for (
     const tx of approvedTransactions
@@ -338,7 +375,9 @@ router.get(
         autoVerify:
           settings.autoVerify,
         maxAutoAmount:
-          settings.maxAutoAmount
+          settings.maxAutoAmount,
+        allowedBankAccounts:
+          getAllowedBankAccounts()
       });
 
     } catch (err) {
@@ -504,6 +543,56 @@ router.post(
         return res.status(400).json({
           message:
             'direction must be credit or debit'
+        });
+      }
+
+      /* ========================================================
+         ACCOUNT ALLOWLIST
+
+         A credit into an account that is not on the allowlist
+         is recorded for audit but marked 'ignored', so it can
+         never be matched to a player recharge.
+
+         Without this, once a second bank account forwards SMS,
+         a payment into ANY of those accounts could be claimed
+         as a recharge.
+         ======================================================== */
+
+      if (!isAllowedBankAccount(bankAccount)) {
+
+        try {
+          await BankPayment.create({
+            amount:
+              parsedAmount,
+            utr:
+              normalizedUtr,
+            bankAccount:
+              bankAccount || '',
+            direction:
+              'credit',
+            smsText:
+              smsText || '',
+            smsAt:
+              smsAt
+                ? new Date(smsAt)
+                : new Date(),
+            status:
+              'ignored'
+          });
+
+        } catch (err) {
+
+          if (
+            err?.code !== 11000
+          ) {
+            throw err;
+          }
+        }
+
+        return res.json({
+          accepted: false,
+          reason:
+            'account_not_allowlisted'
         });
       }
 
@@ -713,6 +802,30 @@ router.post(
             bankSmsAmount,
           utr:
             bankSmsUtr
+        });
+      }
+
+      /* ========================================================
+         NEVER MATCH AN IGNORED BANK PAYMENT
+
+         Rows marked 'ignored' are debits or credits into
+         accounts that are not on the allowlist. They exist for
+         audit only and must never be credited to a player.
+         ======================================================== */
+
+      if (
+        bankPayment.status === 'ignored'
+      ) {
+        return res.json({
+          matched: false,
+          decision:
+            'NO_MATCH',
+          reason:
+            'bank_payment_ignored',
+          amount:
+            Number(bankPayment.amount),
+          utr:
+            normalizeUtr(bankPayment.utr)
         });
       }
 
@@ -954,6 +1067,7 @@ router.post(
         // Actually approve the recharge and credit the player's
         // balance. The transaction changes from pending -> approved,
         // so it automatically disappears from the Pending list.
+        // The BankPayment row is deleted inside approveRecharge.
 
         const approval =
           await approveRecharge(
@@ -1156,14 +1270,17 @@ router.post(
           continue;
         }
 
-        /* Find bank payment */
+        /* Find bank payment — ignored rows must not count */
 
         const bankPayment =
           await BankPayment.findOne({
             utr:
               playerUtr,
             direction:
-              'credit'
+              'credit',
+            status: {
+              $ne: 'ignored'
+            }
           });
 
         /* No bank payment */
