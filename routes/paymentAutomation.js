@@ -454,6 +454,40 @@ router.put(
 );
 
 /* ============================================================
+   SAFE MATCH WRAPPER
+
+   Recording the bank payment is the critical step: once that
+   row exists, the expiry sweep can always match it later.
+
+   So a failure inside the matcher must never turn a
+   successfully recorded payment into a 500. The error is
+   logged and reported in the response instead.
+   ============================================================ */
+
+async function runMatch(input) {
+  try {
+
+    const result =
+      await matchBankPayment(input);
+
+    return result.payload;
+
+  } catch (err) {
+
+    console.error(
+      'Inline match failed (payment still recorded):',
+      err.message
+    );
+
+    return {
+      matched: false,
+      decision: 'ERROR',
+      reason: 'match_failed'
+    };
+  }
+}
+
+/* ============================================================
    RECEIVE BANK SMS
    ============================================================ */
 
@@ -632,6 +666,23 @@ router.post(
                 normalizedUtr
             });
 
+          // The SMS is a repeat, but the player may have
+          // submitted their request since the first one arrived.
+          // Re-running the match is safe: approveRecharge claims
+          // the transaction atomically, and an already-credited
+          // UTR is caught by findSuccessfulRechargeByUtr.
+          const dupMatch =
+            await runMatch({
+              amount:
+                existing?.amount ??
+                parsedAmount,
+              utr:
+                normalizedUtr,
+              bankPaymentId:
+                existing?._id ||
+                null
+            });
+
           return res.json({
             accepted: true,
             duplicate: true,
@@ -642,12 +693,34 @@ router.post(
               existing?.amount ??
               parsedAmount,
             utr:
-              normalizedUtr
+              normalizedUtr,
+            match:
+              dupMatch
           });
         }
 
         throw err;
       }
+
+      /* ========================================================
+         MATCH IMMEDIATELY
+
+         Previously an external workflow made a second HTTP call
+         to /match after this one returned. That hop is gone:
+         the match runs in-process, so the phone gets the final
+         decision in a single request and there is no third-party
+         service sitting in the payment path.
+         ======================================================== */
+
+      const matchResult =
+        await runMatch({
+          amount:
+            bankPayment.amount,
+          utr:
+            bankPayment.utr,
+          bankPaymentId:
+            bankPayment._id
+        });
 
       return res.status(201).json({
         accepted: true,
@@ -657,7 +730,9 @@ router.post(
         amount:
           bankPayment.amount,
         utr:
-          bankPayment.utr
+          bankPayment.utr,
+        match:
+          matchResult
       });
 
     } catch (err) {
@@ -727,21 +802,43 @@ router.get(
 
    smsAt is NEVER compared with Transaction.createdAt.
 
-   Player's 1-minute expiry is handled separately by:
+   Player's 3-minute expiry is handled separately by:
    /expire-pending-recharges
    ============================================================ */
 
-router.post(
-  '/match',
-  automationSecret,
-  async (req, res) => {
-    try {
+/* ============================================================
+   MATCH BANK PAYMENT TO PLAYER RECHARGE
+
+   Bank SMS can arrive BEFORE the player request.
+   Bank SMS can arrive AFTER the player request.
+
+   smsAt is stored for audit only.
+   smsAt is NEVER compared with Transaction.createdAt.
+
+   The player's expiry window is handled separately by
+   expirePendingRecharges().
+
+   Written as a plain function so /sms can call it directly the
+   moment a credit is recorded. There is no second HTTP hop and
+   no external workflow engine in the payment path.
+   ============================================================ */
+
+function ok(payload) {
+  return { httpStatus: 200, payload };
+}
+
+function fail(httpStatus, payload) {
+  return { httpStatus, payload };
+}
+
+async function matchBankPayment(input) {
+
 
       const {
         amount,
         utr,
         bankPaymentId
-      } = req.body;
+      } = input || {};
 
       const bankSmsAmount =
         Number(amount);
@@ -755,14 +852,14 @@ router.post(
         ) ||
         bankSmsAmount <= 0
       ) {
-        return res.status(400).json({
+        return fail(400, {
           message:
             'Invalid amount'
         });
       }
 
       if (!bankSmsUtr) {
-        return res.status(400).json({
+        return fail(400, {
           message:
             'UTR is required'
         });
@@ -792,7 +889,7 @@ router.post(
 
       if (!bankPayment) {
 
-        return res.json({
+        return ok({
           matched: false,
           decision:
             'WAITING',
@@ -816,7 +913,7 @@ router.post(
       if (
         bankPayment.status === 'ignored'
       ) {
-        return res.json({
+        return ok({
           matched: false,
           decision:
             'NO_MATCH',
@@ -843,7 +940,7 @@ router.post(
         actualBankUtr !==
         bankSmsUtr
       ) {
-        return res.status(400).json({
+        return fail(400, {
           message:
             'Bank payment UTR does not match supplied bank UTR'
         });
@@ -897,7 +994,7 @@ router.post(
               'This UTR has already been used for another successful recharge. Please submit a new recharge request with a valid UTR.'
             );
 
-          return res.json({
+          return ok({
             matched: false,
             decision:
               'REJECTED',
@@ -917,7 +1014,7 @@ router.post(
           });
         }
 
-        return res.json({
+        return ok({
           matched: false,
           decision:
             'NO_MATCH',
@@ -988,7 +1085,7 @@ router.post(
               `Wrong payment amount. Your UTR belongs to a ₹${actualBankAmount} payment, but your recharge request was for ₹${exactUtrTransaction.amount}. Please submit a new recharge request with the correct amount.`
             );
 
-          return res.json({
+          return ok({
             matched: false,
             decision:
               'REJECTED',
@@ -1024,7 +1121,7 @@ router.post(
         if (
           !settings.autoVerify
         ) {
-          return res.json({
+          return ok({
             matched: true,
             decision:
               'MANUAL',
@@ -1045,7 +1142,7 @@ router.post(
           actualBankAmount >
           settings.maxAutoAmount
         ) {
-          return res.json({
+          return ok({
             matched: true,
             decision:
               'MANUAL',
@@ -1078,7 +1175,7 @@ router.post(
         if (
           approval.alreadyProcessed
         ) {
-          return res.json({
+          return ok({
             matched: true,
             decision:
               'ALREADY_PROCESSED',
@@ -1096,7 +1193,7 @@ router.post(
         }
 
         if (!approval.ok) {
-          return res.status(500).json({
+          return fail(500, {
             matched: false,
             decision:
               'ERROR',
@@ -1110,7 +1207,7 @@ router.post(
           });
         }
 
-        return res.json({
+        return ok({
           matched: true,
           decision:
             'APPROVE',
@@ -1134,10 +1231,10 @@ router.post(
 
          DO NOT REJECT IMMEDIATELY.
 
-         Player remains pending until 1-minute expiry.
+         Player remains pending until the 3-minute expiry.
          ======================================================== */
 
-      return res.json({
+      return ok({
         matched: false,
         decision:
           'WAITING',
@@ -1148,6 +1245,21 @@ router.post(
         bankUtr:
           actualBankUtr
       });
+
+}
+
+router.post(
+  '/match',
+  automationSecret,
+  async (req, res) => {
+    try {
+
+      const result =
+        await matchBankPayment(req.body);
+
+      return res
+        .status(result.httpStatus)
+        .json(result.payload);
 
     } catch (err) {
 
@@ -1165,9 +1277,9 @@ router.post(
 );
 
 /* ============================================================
-   PLAYER RECHARGE EXPIRY — 1 MINUTE
+   PLAYER RECHARGE EXPIRY — 3 MINUTES
 
-   The 1-minute clock starts at:
+   The 3-minute clock starts at:
 
    Transaction.createdAt
 
@@ -1177,7 +1289,7 @@ router.post(
 
    SMS can therefore arrive before the player request.
 
-   After 1 minute:
+   After 3 minutes:
    - no bank payment                -> REJECT
    - bank payment + wrong amount    -> REJECT
    - bank payment + same amount     -> APPROVE (if autoVerify
@@ -1203,6 +1315,8 @@ router.post(
 
 async function expirePendingRecharges() {
 
+  // 3 minutes. The player has this long for their bank SMS to
+  // arrive and match before the request is rejected.
   const cutoff =
     new Date(
       Date.now() -
@@ -1247,7 +1361,7 @@ async function expirePendingRecharges() {
       const rejectedTx =
         await rejectRecharge(
           transaction,
-          'We could not verify your payment within 1 minute because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
+          'We could not verify your payment within 3 minutes because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
         );
 
       if (rejectedTx) {
@@ -1305,7 +1419,7 @@ async function expirePendingRecharges() {
       const rejectedTx =
         await rejectRecharge(
           transaction,
-          'We could not verify your payment within 1 minute. Please submit a new recharge request with the correct UTR.'
+          'We could not verify your payment within 3 minutes. Please submit a new recharge request with the correct UTR.'
         );
 
       if (rejectedTx) {
@@ -1454,13 +1568,16 @@ router.post(
 /* ============================================================
    BANK PAYMENT CLEANUP
 
-   This is separate from the player's 1-minute window.
-
-   Keep this at 3 minutes.
+   This is separate from the player's 3-minute window and must
+   always be LONGER than it.
    ============================================================ */
 
 async function expireBankPayments() {
 
+  // 5 minutes. MUST stay longer than the recharge window above.
+  // If the two matched, a recharge reaching its expiry check at
+  // the same moment its bank payment was marked expired would be
+  // a race: the player could be rejected despite having paid.
   const cutoff =
     new Date(
       Date.now() -
@@ -1535,3 +1652,4 @@ router.post(
 module.exports = router;
 module.exports.expirePendingRecharges = expirePendingRecharges;
 module.exports.expireBankPayments = expireBankPayments;
+module.exports.matchBankPayment = matchBankPayment;
