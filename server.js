@@ -13,6 +13,10 @@ const settingsRoutes = require('./routes/settings');
 const chatRoutes = require('./routes/chat');
 const paymentAutomationRoutes = require('./routes/paymentAutomation');
 
+// In-process expiry sweeps. Replaces the n8n schedule trigger,
+// which cost ~1,440 executions a day against a 1,000/month plan.
+const { startPaymentSchedulers } = require('./jobs/paymentScheduler');
+
 const gameSocket = require('./socket/gameSocket');
 
 const app = express();
@@ -413,6 +417,19 @@ const connectDB =
       );
 
       await releaseOrphanedWaitingGames();
+
+      // ================================================================
+      // PAYMENT EXPIRY SCHEDULERS
+      //
+      // Started only after the database is up, so the first tick
+      // can never fire against a dead connection.
+      //
+      // startPaymentSchedulers() guards against being called
+      // twice, so a reconnect-driven retry of connectDB will not
+      // create duplicate timers.
+      // ================================================================
+
+      startPaymentSchedulers();
 
       // ================================================================
       // Grandfather existing users into phone verification
