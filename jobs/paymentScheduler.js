@@ -51,18 +51,19 @@ async function runRechargeSweep() {
   rechargeRunning = true;
 
   try {
-    const { expirePendingRecharges } = require('../routes/paymentAutomation');
-    const result = await expirePendingRecharges();
+    const { sweepPendingRecharges } = require('../routes/paymentAutomation');
+    const result = await sweepPendingRecharges();
 
     if (
       result &&
-      (result.rejected || result.approved || result.manual)
+      (result.rejected || result.approved || result.manual || result.awaitingManual)
     ) {
       console.log(
         `Recharge sweep: checked ${result.checked}, ` +
         `approved ${result.approved || 0}, ` +
         `rejected ${result.rejected}, ` +
-        `manual ${result.manual}`
+        `manual ${result.manual}, ` +
+        `awaitingManual ${result.awaitingManual || 0}`
       );
     }
 
