@@ -1288,9 +1288,9 @@ router.post(
 );
 
 /* ============================================================
-   PLAYER RECHARGE EXPIRY — 3 MINUTES
+   PLAYER RECHARGE REVIEW — 5 MINUTES
 
-   The 3-minute clock starts at:
+   The 5-minute clock starts at:
 
    Transaction.createdAt
 
@@ -1298,15 +1298,37 @@ router.post(
 
    BankPayment.smsAt
 
-   SMS can therefore arrive before the player request.
+   SMS can therefore arrive before the player request, and often
+   arrives after it -- sometimes 10-15 minutes after, depending
+   on the bank.
 
-   After 3 minutes:
-   - no bank payment                -> REJECT
-   - bank payment + wrong amount    -> REJECT
+   After 5 minutes:
+   - no bank payment                -> LEFT PENDING for manual
+                                       admin review (NOT rejected
+                                       -- see below)
+   - bank payment + wrong amount    -> REJECT (not a timing
+                                       issue -- the mismatch is
+                                       already known)
    - bank payment + same amount     -> APPROVE (if autoVerify
                                        is on and the amount is
                                        within maxAutoAmount),
                                        otherwise MANUAL
+
+   WHY "NO BANK PAYMENT" NO LONGER REJECTS
+   ----------------------------------------
+   Bank SMS delivery is not reliable to a fixed timer -- it can
+   take anywhere from a few seconds to 10-15 minutes. Rejecting
+   at a fixed cutoff meant genuine payments were being told
+   "failed" while the money was still on its way, forcing the
+   player to resubmit a request for money that had already
+   arrived.
+
+   Instead, a transaction with no matching bank payment yet is
+   simply left as 'pending'. It already shows up in the existing
+   admin pending-requests queue, so an admin can approve it by
+   hand if the SMS never turns up. If the SMS does arrive later,
+   /sms matches it against this same still-pending transaction
+   and completes it automatically -- no admin action needed.
 
    WHY APPROVAL HAPPENS HERE TOO
    -----------------------------
@@ -1326,12 +1348,18 @@ router.post(
 
 async function expirePendingRecharges() {
 
-  // 3 minutes. The player has this long for their bank SMS to
-  // arrive and match before the request is rejected.
+  // 5 minutes. Below this, the player waits for automation.
+  // Past this, the request is left pending for manual review --
+  // it is NOT rejected, because the SMS may still be delayed
+  // rather than missing. Some banks take 10-15 minutes on a slow
+  // day. If the SMS lands after this point, /sms still finds this
+  // transaction (it is still 'pending') and matches it normally --
+  // so a late arrival still auto-completes without an admin
+  // having to do anything.
   const cutoff =
     new Date(
       Date.now() -
-      180000
+      300000
     );
 
   const pendingRecharges =
@@ -1353,6 +1381,7 @@ async function expirePendingRecharges() {
   let approved = 0;
   let rejected = 0;
   let manual = 0;
+  let awaitingManual = 0;
   let skipped = 0;
 
   for (
@@ -1372,7 +1401,7 @@ async function expirePendingRecharges() {
       const rejectedTx =
         await rejectRecharge(
           transaction,
-          'We could not verify your payment within 3 minutes because no valid UTR/payment reference was submitted. Please submit a new recharge request with the correct UTR.'
+          'No valid UTR / payment reference was submitted with this request. Please submit a new recharge request with the correct UTR.'
         );
 
       if (rejectedTx) {
@@ -1423,22 +1452,23 @@ async function expirePendingRecharges() {
         }
       });
 
-    /* No bank payment */
+    /* ========================================================
+       NO BANK PAYMENT YET -- LEAVE PENDING, DO NOT REJECT
+
+       The SMS may simply be delayed. Rejecting here would tell
+       a player their genuine payment failed, when the money may
+       land minutes later.
+
+       The transaction is left exactly as it is: status
+       'pending'. It already appears in the admin's pending-
+       requests queue for manual approval. If the SMS arrives
+       later, /sms will find this same still-pending transaction
+       by UTR and match it automatically -- an admin only needs
+       to act if the SMS never arrives at all.
+       ======================================================== */
 
     if (!bankPayment) {
-
-      const rejectedTx =
-        await rejectRecharge(
-          transaction,
-          'We could not verify your payment within 3 minutes. Please submit a new recharge request with the correct UTR.'
-        );
-
-      if (rejectedTx) {
-        rejected++;
-      } else {
-        skipped++;
-      }
-
+      awaitingManual++;
       continue;
     }
 
@@ -1546,6 +1576,7 @@ async function expirePendingRecharges() {
     approved,
     rejected,
     manual,
+    awaitingManual,
     skipped
   };
 }
