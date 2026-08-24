@@ -751,6 +751,17 @@ router.post(
 
 /* ============================================================
    GET PENDING BANK PAYMENTS
+
+   Money that arrived but has not yet been claimed by a player.
+
+   These rows are kept indefinitely. A credit is real money in
+   the account, so it stays available to match whenever the
+   player gets around to submitting their request — minutes or
+   days later. There is no expiry sweep for bank payments.
+
+   A row leaves this list in exactly two ways: it is matched and
+   credited (approveRecharge deletes it), or an admin disposes
+   of it manually.
    ============================================================ */
 
 router.get(
@@ -1565,77 +1576,6 @@ router.post(
   }
 );
 
-/* ============================================================
-   BANK PAYMENT CLEANUP
-
-   This is separate from the player's 3-minute window and must
-   always be LONGER than it.
-   ============================================================ */
-
-async function expireBankPayments() {
-
-  // 5 minutes. MUST stay longer than the recharge window above.
-  // If the two matched, a recharge reaching its expiry check at
-  // the same moment its bank payment was marked expired would be
-  // a race: the player could be rejected despite having paid.
-  const cutoff =
-    new Date(
-      Date.now() -
-      300000
-    );
-
-  const result =
-    await BankPayment.updateMany(
-      {
-        direction:
-          'credit',
-        status:
-          'pending',
-        createdAt: {
-          $lt:
-            cutoff
-        }
-      },
-      {
-        $set: {
-          status:
-            'expired'
-        }
-      }
-    );
-
-  return {
-    expired:
-      result.modifiedCount ||
-      0
-  };
-}
-
-router.post(
-  '/expire-bank-payments',
-  automationSecret,
-  async (req, res) => {
-    try {
-
-      const result =
-        await expireBankPayments();
-
-      return res.json(result);
-
-    } catch (err) {
-
-      console.error(
-        'Expire bank payments error:',
-        err
-      );
-
-      return res.status(500).json({
-        message:
-          'Server error'
-      });
-    }
-  }
-);
 
 /* ============================================================
    EXPORTS
@@ -1644,12 +1584,12 @@ router.post(
    app.use('/api/payment-automation', require(...)) keeps
    working unchanged.
 
-   The two sweep functions are attached to it so the in-process
-   scheduler can call them directly, with no HTTP hop and no
-   secret header to misconfigure.
+   expirePendingRecharges and matchBankPayment are attached to
+   it so the scheduler and the /sms route can call them
+   directly, with no HTTP hop and no secret header to
+   misconfigure.
    ============================================================ */
 
 module.exports = router;
 module.exports.expirePendingRecharges = expirePendingRecharges;
-module.exports.expireBankPayments = expireBankPayments;
 module.exports.matchBankPayment = matchBankPayment;
