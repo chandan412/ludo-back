@@ -6,22 +6,12 @@ const Game = require('../models/Game');
 const { auth } = require('../middleware/auth');
 
 // ============================================================================
-// ✅ notifyAdmins — fire-and-forget push to the admin panel.
-//
-// Replaces admin-side polling entirely. The panel previously only showed new
-// deposit/withdrawal requests after a manual page refresh; polling for them
-// would have meant a permanent background query load (the counters endpoint
-// alone costs 9 DB queries per call). This emits ONLY at the moment a request is
-// actually created, so idle cost is zero.
-//
-// Never throws. A socket problem must not turn a player's successful deposit
-// request into a 500 — the row is already committed by the time this runs, and
-// the panel has a slow safety refresh that would pick it up regardless.
+// notifyAdmins — fire-and-forget push to the admin panel.
 // ============================================================================
 function notifyAdmins(req, payload) {
   try {
     const io = req.app.get('io');
-    if (!io) return; // server.js not wired yet, or running in a test harness
+    if (!io) return;
     const room = req.app.get('ADMIN_ROOM') || 'admin-room';
     io.to(room).emit('admin-pending-update', { ...payload, at: Date.now() });
   } catch (e) {
@@ -30,16 +20,7 @@ function notifyAdmins(req, payload) {
 }
 
 // ============================================================================
-// ✅ UTR EXTRACTION — must stay identical to extractUtr() in
-// routes/paymentAutomation.js.
-//
-// The payment automation matches a player's recharge to a bank SMS by pulling
-// the UTR out of rechargeNote with this exact logic. If the two copies ever
-// diverge, a note that passes validation at submission time can silently fail
-// to match at approval time, and the player gets auto-rejected after a minute
-// with no way to tell what went wrong.
-//
-// If you change one, change both.
+// UTR EXTRACTION
 // ============================================================================
 function extractUtr(note) {
   if (!note) return '';
@@ -67,122 +48,110 @@ function extractUtr(note) {
   return '';
 }
 
-// Indian bank UTR / UPI reference numbers are at least 9 characters.
-// Anything shorter is almost certainly the player typing the wrong thing
-// (an amount, a phone number fragment, a date).
 const MIN_UTR_LENGTH = 9;
 
 // ============================================================================
-// ⚠️ CRITICAL FIX — the lockedBalance reconcile was a DOUBLE-SPEND vector.
-//
-// The previous version did a blind read-modify-write:
-//
-//     if (user.lockedBalance !== expectedLocked) {
-//       user.lockedBalance = expectedLocked;   // ← overwrite from a stale snapshot
-//       await user.save();
-//     }
-//
-// Wallet.js polls this endpoint every 5 seconds. POST /game/create applies the
-// lock and creates the Game row in TWO separate writes:
-//
-//     user.lockedBalance += betAmount;  await user.save();   // phase A
-//     await Game.create({ ... });                            // phase B
-//
-// When a poll's user-read landed after phase A but its game-read landed before
-// phase B, it saw lockedBalance=500 with no matching game, computed
-// expectedLocked=0, and wrote that back — ERASING the lock on a live game. The
-// player could then stake the same ₹500 again, or withdraw it.
-//
-// The reconcile is kept (it exists to clear genuinely stale locks) but is now
-// DIRECTION-AWARE:
-//   • The response reports the HIGHER of stored and derived, so a stale read can
-//     only ever under-report spendable money (recoverable) instead of
-//     over-reporting it (an unrecoverable double-spend).
-//   • RAISING a lock is always safe, so it applies immediately — this also
-//     self-heals accounts already corrupted by the old code.
-//   • LOWERING is the dangerous direction and now requires: no game created in
-//     the last 60s, a re-verification read, and a compare-and-set on the exact
-//     value we read. If anything moved underneath, the write is abandoned.
-//
-// MONEY SAFETY: `balance` is never touched here. Only `lockedBalance` moves.
+// LOCK RELEASE GRACE
 // ============================================================================
-
-// No lock is released if the player had ANY game activity inside this window.
-// Covers the phase-A/phase-B gap in /game/create, during which a derived lock of
-// zero is simply a lie.
 const LOCK_RELEASE_GRACE_MS = 60 * 1000;
 
-// Derive what lockedBalance SHOULD be from live games + pending withdrawals.
-// Extracted so the lowering path can re-run it as a second opinion.
+// ============================================================================
+// DERIVE EXPECTED LOCK
+// ============================================================================
 async function deriveExpectedLock(userId) {
   const activeGames = await Game.find({
     'players.user': userId,
     status: { $in: ['waiting', 'active'] },
   }).select('betAmount').lean();
-  const gameLocked = activeGames.reduce((sum, g) => sum + (g.betAmount || 0), 0);
+
+  const gameLocked = activeGames.reduce(
+    (sum, g) => sum + (g.betAmount || 0),
+    0
+  );
 
   const pendingWithdraws = await Transaction.find({
     user: userId,
     type: 'withdraw',
     status: 'pending',
   }).select('amount').lean();
-  const withdrawLocked = pendingWithdraws.reduce((sum, t) => sum + (t.amount || 0), 0);
+
+  const withdrawLocked = pendingWithdraws.reduce(
+    (sum, t) => sum + (t.amount || 0),
+    0
+  );
 
   return gameLocked + withdrawLocked;
 }
 
+// ============================================================================
+// GET WALLET BALANCE
+// ============================================================================
 router.get('/balance', auth, async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('balance lockedBalance bonusBalance username');
-    if (!user) return res.status(404).json({ message: 'User not found' });
+    const user = await User.findById(req.user._id).select(
+      'balance lockedBalance bonusBalance username'
+    );
 
-    const storedLocked   = user.lockedBalance || 0;
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const storedLocked = user.lockedBalance || 0;
     const expectedLocked = await deriveExpectedLock(req.user._id);
 
-    // Start conservative. Nothing below may lower this without proving it's safe.
     let effectiveLocked = Math.max(storedLocked, expectedLocked);
 
     if (expectedLocked > storedLocked) {
-      // ── RAISE ──────────────────────────────────────────────────────────────
-      // Money is committed to a game or pending withdrawal but isn't locked —
-      // exactly the corruption the old blind overwrite caused, and the state that
-      // lets the same money be spent twice. Raising can never enable a
-      // double-spend, so apply it immediately. The CAS means a concurrent lock
-      // change wins instead of being clobbered; if it fails we still REPORT the
-      // safe higher number and the next poll retries.
       await User.updateOne(
-        { _id: user._id, lockedBalance: storedLocked },
-        { $set: { lockedBalance: expectedLocked } }
+        {
+          _id: user._id,
+          lockedBalance: storedLocked
+        },
+        {
+          $set: {
+            lockedBalance: expectedLocked
+          }
+        }
       );
+
       effectiveLocked = expectedLocked;
 
     } else if (expectedLocked < storedLocked) {
-      // ── LOWER (dangerous — heavily guarded) ────────────────────────────────
-      // Releasing a lock frees money to be staked or withdrawn. Only do it when
-      // we can prove nothing is in flight.
 
-      // Guard 1: recent game activity means a create/join may be mid-flight.
       const recentGame = await Game.findOne({
         'players.user': req.user._id,
-        createdAt: { $gte: new Date(Date.now() - LOCK_RELEASE_GRACE_MS) },
+        createdAt: {
+          $gte: new Date(Date.now() - LOCK_RELEASE_GRACE_MS)
+        },
       }).select('_id').lean();
 
       if (!recentGame) {
-        // Guard 2: re-derive. This read lands a full roundtrip later, by which
-        // point any create that was mid-flight has committed its Game row.
+
         const reverified = await deriveExpectedLock(req.user._id);
 
-        if (reverified === expectedLocked && reverified < storedLocked) {
-          // Guard 3: compare-and-set on the exact value we read. If anything
-          // changed lockedBalance underneath us this matches nothing and the
-          // release is abandoned rather than overwriting a fresh lock.
+        if (
+          reverified === expectedLocked &&
+          reverified < storedLocked
+        ) {
+
           const result = await User.updateOne(
-            { _id: user._id, lockedBalance: storedLocked },
-            { $set: { lockedBalance: reverified } }
+            {
+              _id: user._id,
+              lockedBalance: storedLocked
+            },
+            {
+              $set: {
+                lockedBalance: reverified
+              }
+            }
           );
+
           if (result.modifiedCount === 1) {
             effectiveLocked = reverified;
-            console.log(`🔓 Stale lock released for ${user.username}: ₹${storedLocked} -> ₹${reverified}`);
+
+            console.log(
+              `Stale lock released for ${user.username}: ₹${storedLocked} -> ₹${reverified}`
+            );
           }
         }
       }
@@ -192,56 +161,72 @@ router.get('/balance', auth, async (req, res) => {
       balance: user.balance,
       lockedBalance: effectiveLocked,
       bonusBalance: user.bonusBalance || 0,
-      // availableBalance = what they can PLAY with (includes bonus, minus locks)
-      availableBalance: Math.max(0, user.balance - effectiveLocked),
-      // withdrawableBalance = what they can WITHDRAW (excludes the non-withdrawable bonus)
-      withdrawableBalance: Math.max(0, user.balance - effectiveLocked - (user.bonusBalance || 0)),
+
+      availableBalance: Math.max(
+        0,
+        user.balance - effectiveLocked
+      ),
+
+      withdrawableBalance: Math.max(
+        0,
+        user.balance -
+          effectiveLocked -
+          (user.bonusBalance || 0)
+      ),
     });
+
   } catch (err) {
     console.error('wallet balance error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
+// ============================================================================
+// GET TRANSACTIONS
+// ============================================================================
 router.get('/transactions', auth, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
-    const transactions = await Transaction.find({ user: req.user._id })
+
+    const transactions = await Transaction.find({
+      user: req.user._id
+    })
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
       .populate('processedBy', 'username')
       .populate('gameId', 'roomCode betAmount');
-    const total = await Transaction.countDocuments({ user: req.user._id });
-    res.json({ transactions, total, page, pages: Math.ceil(total / limit) });
+
+    const total = await Transaction.countDocuments({
+      user: req.user._id
+    });
+
+    res.json({
+      transactions,
+      total,
+      page,
+      pages: Math.ceil(total / limit)
+    });
+
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
 });
 
 // ============================================================================
-// ✅ RECHARGE REQUEST — UTR IS NOW MANDATORY
-//
-// The payment automation matches a recharge to a bank SMS purely on the UTR
-// found in rechargeNote. A request without one can NEVER be matched: it sits
-// pending until /expire-pending-recharges rejects it a minute later, and the
-// player is left confused.
-//
-// The old default of 'Payment via QR' contained no UTR at all, so every request
-// that relied on it was guaranteed to fail. It has been removed — the note the
-// player actually types is stored instead.
-//
-// NOTE FOR THE FRONTEND: the recharge form must now present the UTR field as
-// REQUIRED. If it is still optional, players will hit a 400 they cannot resolve
-// from the form.
+// RECHARGE REQUEST
 // ============================================================================
 router.post('/recharge-request', auth, async (req, res) => {
   try {
     const { amount, paymentNote } = req.body;
-    if (!amount || amount < 10)
-      return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
+
+    if (!amount || amount < 10) {
+      return res.status(400).json({
+        message: 'Minimum recharge amount is ₹10'
+      });
+    }
 
     const note = String(paymentNote || '').trim();
 
@@ -255,51 +240,21 @@ router.post('/recharge-request', auth, async (req, res) => {
 
     if (!utr || utr.length < MIN_UTR_LENGTH) {
       return res.status(400).json({
-        message: 'Enter a valid UTR / reference number (at least 9 characters). You will find it in your UPI app under the payment details.'
-      });
-    }
-
-    // ✅ One pending deposit at a time — mirror of the withdrawal guard below.
-    // A player can't stack multiple deposit requests; they must wait for the
-    // current one to be approved/rejected first.
-    const pending = await Transaction.findOne({ user: req.user._id, type: 'recharge', status: 'pending' });
-    if (pending)
-      return res.status(400).json({ message: 'You already have a pending deposit request. Please wait for it to be processed.' });
-
-    // Reject an already-used UTR at submission time rather than letting the
-    // matcher discover it a minute later. Better error message, and it stops
-    // the pending slot being wasted.
-    //
-    // PERFORMANCE: this is an unindexed regex scan over recharge transactions.
-    // Acceptable at current volume; when the table grows, store the extracted
-    // UTR as its own indexed field on Transaction and query that instead.
-    const alreadyUsed = await Transaction.findOne({
-      type: 'recharge',
-      status: 'approved',
-      rechargeNote: { $regex: utr, $options: 'i' }
-    }).select('_id').lean();
-
-    if (alreadyUsed) {
-      return res.status(400).json({
-        message: 'This UTR has already been used for a previous recharge. Please enter the reference number of your new payment.'
+        message:
+          'Enter a valid UTR / reference number (at least 9 characters). You will find it in your UPI app under the payment details.'
       });
     }
 
     const transaction = await Transaction.create({
       user: req.user._id,
-      type: 'recharge',
+      type: 'deposit',
       amount,
-      balanceBefore: req.user.balance,
-      balanceAfter: req.user.balance,
+      balanceBefore: 0,
+      balanceAfter: 0,
       status: 'pending',
       rechargeNote: note
     });
 
-    // ✅ Push to any admin with the panel open — no polling required.
-    // Deliberately a tiny signal, not the transaction itself: the panel refetches
-    // the pending list (one indexed query) so it always renders authoritative,
-    // fully-populated data rather than trusting a socket payload.
-    // Wrapped so a socket failure can never fail the player's request.
     notifyAdmins(req, {
       kind: 'recharge',
       username: req.user.username,
@@ -307,37 +262,161 @@ router.post('/recharge-request', auth, async (req, res) => {
     });
 
     res.status(201).json({
-      message: 'Recharge request submitted. Admin will add balance after verifying payment.',
+      message:
+        'Recharge request submitted. Admin will add balance after verifying payment.',
       transaction
     });
+
   } catch (err) {
     console.error('recharge request error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
+// ============================================================================
+// WITHDRAWAL REQUEST
+//
+// RULE:
+// Maximum 2 withdrawal requests in any rolling 6-hour window.
+//
+// COUNTED:
+//   - pending
+//   - approved
+//
+// NOT COUNTED:
+//   - rejected
+//   - other statuses
+//
+// Example:
+//
+// 10:00 -> Withdrawal #1
+// 12:00 -> Withdrawal #2
+// 13:00 -> BLOCKED
+// 16:01 -> Withdrawal allowed again
+//
+// The restriction is enforced on the backend so it cannot be bypassed
+// by directly calling the API from the frontend.
+// ============================================================================
 router.post('/withdraw-request', auth, async (req, res) => {
   try {
     const { amount, bankDetails } = req.body;
-    const { accountHolderName, accountNumber, ifscCode, bankName, upiId } = bankDetails || {};
-    if (!amount || amount < 100)
-      return res.status(400).json({ message: 'Minimum withdrawal amount is ₹100' });
-    const user = await User.findById(req.user._id);
-    // ✅ Bonus is NON-withdrawable. Withdrawable money = real balance minus locks minus the
-    // bonus marker. If they try to withdraw into the bonus portion, tell them clearly.
-    const bonus = user.bonusBalance || 0;
-    const available = Math.max(0, user.balance - user.lockedBalance - bonus);
-    if (amount > available) {
-      const msg = bonus > 0
-        ? `You can't withdraw your referral bonus (₹${bonus}). Bonus can only be used to play. Withdrawable: ₹${available}`
-        : `Insufficient balance. Available: ₹${available}`;
-      return res.status(400).json({ message: msg });
+
+    const {
+      accountHolderName,
+      accountNumber,
+      ifscCode,
+      bankName,
+      upiId
+    } = bankDetails || {};
+
+    // ------------------------------------------------------------------------
+    // BASIC AMOUNT VALIDATION
+    // ------------------------------------------------------------------------
+    if (!amount || amount < 100) {
+      return res.status(400).json({
+        message: 'Minimum withdrawal amount is ₹100'
+      });
     }
-    if (!upiId && (!accountNumber || !ifscCode || !accountHolderName))
-      return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
-    const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
-    if (pending) return res.status(400).json({ message: 'You already have a pending withdrawal request' });
-    // ✅ Create transaction first, then lock balance (safer if either fails)
+
+    const user = await User.findById(req.user._id);
+
+    if (!user) {
+      return res.status(404).json({
+        message: 'User not found'
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // WITHDRAWAL LIMIT
+    //
+    // Maximum 2 withdrawals during the last 6 hours.
+    //
+    // IMPORTANT:
+    // pending + approved are counted.
+    // rejected withdrawals are ignored.
+    // ------------------------------------------------------------------------
+    const sixHoursAgo = new Date(
+      Date.now() - 6 * 60 * 60 * 1000
+    );
+
+    const withdrawalCount = await Transaction.countDocuments({
+      user: req.user._id,
+      type: 'withdraw',
+      createdAt: {
+        $gte: sixHoursAgo
+      },
+      status: {
+        $in: ['pending', 'approved']
+      }
+    });
+
+    if (withdrawalCount >= 2) {
+      return res.status(400).json({
+        message:
+          'Withdrawal limit reached. You can withdraw only 2 times in 6 hours. Please try again later.'
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // BONUS IS NON-WITHDRAWABLE
+    // ------------------------------------------------------------------------
+    const bonus = user.bonusBalance || 0;
+
+    const available = Math.max(
+      0,
+      user.balance -
+        user.lockedBalance -
+        bonus
+    );
+
+    if (amount > available) {
+      const msg =
+        bonus > 0
+          ? `You can't withdraw your referral bonus (₹${bonus}). Bonus can only be used to play. Withdrawable: ₹${available}`
+          : `Insufficient balance. Available: ₹${available}`;
+
+      return res.status(400).json({
+        message: msg
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // BANK / UPI VALIDATION
+    // ------------------------------------------------------------------------
+    if (
+      !upiId &&
+      (!accountNumber ||
+        !ifscCode ||
+        !accountHolderName)
+    ) {
+      return res.status(400).json({
+        message:
+          'Provide UPI ID or full bank account details'
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // EXISTING PENDING WITHDRAWAL
+    //
+    // Keep this existing restriction.
+    // A player cannot have another pending withdrawal.
+    // ------------------------------------------------------------------------
+    const pending = await Transaction.findOne({
+      user: req.user._id,
+      type: 'withdraw',
+      status: 'pending'
+    });
+
+    if (pending) {
+      return res.status(400).json({
+        message:
+          'You already have a pending withdrawal request'
+      });
+    }
+
+    // ------------------------------------------------------------------------
+    // CREATE WITHDRAWAL TRANSACTION
+    // ------------------------------------------------------------------------
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'withdraw',
@@ -345,93 +424,139 @@ router.post('/withdraw-request', auth, async (req, res) => {
       balanceBefore: user.balance,
       balanceAfter: user.balance,
       status: 'pending',
-      bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
+
+      bankDetails: {
+        accountHolderName,
+        accountNumber,
+        ifscCode,
+        bankName,
+        upiId
+      }
     });
+
+    // ------------------------------------------------------------------------
+    // LOCK WITHDRAWAL AMOUNT
+    // ------------------------------------------------------------------------
     user.lockedBalance += amount;
+
     await user.save();
 
-    // ✅ Push to any admin with the panel open — no polling required.
+    // ------------------------------------------------------------------------
+    // NOTIFY ADMINS
+    // ------------------------------------------------------------------------
     notifyAdmins(req, {
       kind: 'withdraw',
       username: req.user.username,
       amount,
     });
 
+    // ------------------------------------------------------------------------
+    // RESPONSE
+    // ------------------------------------------------------------------------
     res.status(201).json({
-      message: 'Withdrawal request submitted. Admin will process within 24 hours.',
+      message:
+        'Withdrawal request submitted. Admin will process within 24 hours.',
       transaction
     });
+
   } catch (err) {
-    res.status(500).json({ message: 'Server error' });
+    console.error('withdraw request error:', err);
+
+    res.status(500).json({
+      message: 'Server error'
+    });
   }
 });
 
 // ============================================================================
-// ✅ ADMIN REMARK NOTICES
-//
-// When you reject a deposit or withdrawal you write a reason, but the player had
-// no way to see it — the request simply vanished from their pending list with no
-// explanation, so they'd re-submit the same wrong request or message you.
-//
-// These two endpoints back a dismissable card on the Wallet page.
-//
-// SECURITY: both are scoped to req.user._id, so a player can neither READ nor
-// DISMISS another player's remark even if they guess a transaction id.
+// ADMIN REMARK NOTICES
 // ============================================================================
 
-// GET /api/wallet/notices — unacknowledged rejection remarks for this player.
 router.get('/notices', auth, async (req, res) => {
   try {
     const notices = await Transaction.find({
       user: req.user._id,
       status: 'rejected',
       adminRemark: { $nin: [null, ''] },
-      remarkAck: { $ne: true },   // $ne rather than false, so pre-existing rows
-                                  // (written before this field existed) still show
+      remarkAck: { $ne: true }
     })
       .sort({ createdAt: -1 })
-      .limit(5)                   // a sane cap; nobody needs 20 cards stacked up
-      .select('type amount adminRemark rechargeNote createdAt processedAt')
+      .limit(5)
+      .select(
+        'type amount adminRemark rechargeNote createdAt processedAt'
+      )
       .lean();
 
     res.json(notices);
+
   } catch (err) {
     console.error('notices error:', err);
-    res.status(500).json({ message: 'Server error' });
+
+    res.status(500).json({
+      message: 'Server error'
+    });
   }
 });
 
-// POST /api/wallet/notices/:id/ack — player tapped "OK, got it".
+// ============================================================================
+// ACKNOWLEDGE NOTICE
+// ============================================================================
 router.post('/notices/:id/ack', auth, async (req, res) => {
   try {
     const result = await Transaction.updateOne(
-      { _id: req.params.id, user: req.user._id },  // ← ownership guard
-      { $set: { remarkAck: true } }
+      {
+        _id: req.params.id,
+        user: req.user._id
+      },
+      {
+        $set: {
+          remarkAck: true
+        }
+      }
     );
 
     if (!result.matchedCount) {
-      return res.status(404).json({ message: 'Notice not found' });
+      return res.status(404).json({
+        message: 'Notice not found'
+      });
     }
-    res.json({ message: 'Acknowledged' });
+
+    res.json({
+      message: 'Acknowledged'
+    });
+
   } catch (err) {
-    // A malformed id throws a CastError — that's a bad request, not a server fault.
+
     if (err && err.name === 'CastError') {
-      return res.status(400).json({ message: 'Invalid notice id' });
+      return res.status(400).json({
+        message: 'Invalid notice id'
+      });
     }
+
     console.error('notice ack error:', err);
-    res.status(500).json({ message: 'Server error' });
+
+    res.status(500).json({
+      message: 'Server error'
+    });
   }
 });
 
+// ============================================================================
+// PENDING REQUESTS
+// ============================================================================
 router.get('/pending-requests', auth, async (req, res) => {
   try {
     const requests = await Transaction.find({
       user: req.user._id,
       status: 'pending'
     }).sort({ createdAt: -1 });
+
     res.json(requests);
+
   } catch (err) {
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({
+      message: 'Server error'
+    });
   }
 });
 
