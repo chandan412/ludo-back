@@ -827,7 +827,7 @@ router.get(
    smsAt is NEVER compared with Transaction.createdAt.
 
    The player's expiry window is handled separately by
-   expirePendingRecharges().
+   sweepPendingRecharges().
 
    Written as a plain function so /sms can call it directly the
    moment a credit is recorded. There is no second HTTP hop and
@@ -1288,78 +1288,77 @@ router.post(
 );
 
 /* ============================================================
-   PLAYER RECHARGE REVIEW — 5 MINUTES
+   RECHARGE SWEEP
 
-   The 5-minute clock starts at:
+   Runs on a timer (every 30s -- see jobs/paymentScheduler.js)
+   AND is what /sms calls inline the moment a bank credit lands.
 
-   Transaction.createdAt
+   THIS IS THE ONLY PLACE THE APPROVAL DECISION IS MADE.
+   Both entry points below end up calling matchBankPayment() --
+   there is no second copy of the amount-check / autoVerify /
+   approve logic living in this sweep. That used to be true only
+   in principle; earlier versions of this sweep re-implemented
+   the same checks by hand, which is exactly the kind of thing
+   that quietly drifts out of sync over time.
 
-   It does NOT start at:
+   WHY IT CHECKS EVERY PENDING RECHARGE, NOT JUST OLD ONES
+   ---------------------------------------------------------
+   The previous version only looked at a recharge once it had
+   been pending for 5+ minutes. That meant even a PERFECT match
+   -- bank SMS already sitting there, amount correct, autoVerify
+   on -- still wasn't credited until the full 5 minutes had
+   passed, because nothing re-checked it in between.
 
-   BankPayment.smsAt
+   Now every pending recharge is checked on every tick. A match
+   that already exists is caught and approved on the very next
+   tick (worst case ~30s), regardless of how old the request is.
+   The REVIEW_WINDOW_MS below is no longer "how long before we
+   look" -- it is purely "how long to wait before handing an
+   unmatched request to an admin instead of continuing to wait
+   for a delayed SMS."
 
-   SMS can therefore arrive before the player request, and often
-   arrives after it -- sometimes 10-15 minutes after, depending
-   on the bank.
+   WHAT HAPPENS ON EACH TICK, PER PENDING RECHARGE
+   --------------------------------------------------
+   - No UTR on the request at all: left alone until the review
+     window passes, then rejected. (In practice this should be
+     rare -- wallet.js now requires a UTR at submission time.
+     This is a safety net for anything created before that
+     validation existed.)
+   - The UTR was already used on a different, already-approved
+     recharge: rejected immediately, any age. Waiting cannot fix
+     a UTR that has already been spent.
+   - No matching BankPayment yet: left pending. Checked again
+     next tick. Only once the review window passes does it get
+     flagged for manual review (still left as 'pending' -- it
+     already shows up in the existing admin queue) rather than
+     rejected outright, since the SMS may simply be delayed
+     rather than missing.
+   - A matching BankPayment exists: matchBankPayment() decides.
+     APPROVE credits the player immediately. REJECTED (wrong
+     amount, or the UTR turns out to already be used) rejects
+     immediately, any age -- these are not timing issues. MANUAL
+     (autoVerify off, or over the auto-approve ceiling) flags the
+     BankPayment for the admin queue and waits for a human.
 
-   After 5 minutes:
-   - no bank payment                -> LEFT PENDING for manual
-                                       admin review (NOT rejected
-                                       -- see below)
-   - bank payment + wrong amount    -> REJECT (not a timing
-                                       issue -- the mismatch is
-                                       already known)
-   - bank payment + same amount     -> APPROVE (if autoVerify
-                                       is on and the amount is
-                                       within maxAutoAmount),
-                                       otherwise MANUAL
-
-   WHY "NO BANK PAYMENT" NO LONGER REJECTS
-   ----------------------------------------
-   Bank SMS delivery is not reliable to a fixed timer -- it can
-   take anywhere from a few seconds to 10-15 minutes. Rejecting
-   at a fixed cutoff meant genuine payments were being told
-   "failed" while the money was still on its way, forcing the
-   player to resubmit a request for money that had already
-   arrived.
-
-   Instead, a transaction with no matching bank payment yet is
-   simply left as 'pending'. It already shows up in the existing
-   admin pending-requests queue, so an admin can approve it by
-   hand if the SMS never turns up. If the SMS does arrive later,
-   /sms matches it against this same still-pending transaction
-   and completes it automatically -- no admin action needed.
-
-   WHY APPROVAL HAPPENS HERE TOO
-   -----------------------------
-   /match runs exactly once, at the moment the bank SMS lands.
-   When the SMS arrives BEFORE the player has submitted their
-   request, /match finds no pending recharge and returns
-   WAITING — and nothing ever calls it again.
-
-   Without an approval path in this sweep, every
-   SMS-before-request payment would sit waiting for a human
-   even with autoVerify switched on. This closes that gap.
-
-   The logic is written as a plain function so it can be
-   called directly by the in-process scheduler as well as over
-   HTTP. See jobs/paymentScheduler.js.
+   A NOTE ON QUERY VOLUME
+   -----------------------
+   Every tick now does real work for every pending recharge, and
+   matchBankPayment() itself queries recent approved recharges
+   and the full pending list. At the volumes this system was
+   built for (a handful of pending recharges at once) that is
+   nothing. If pending recharges ever number in the hundreds at
+   once, this deserves a second look -- but that is a real scale
+   problem to solve then, not a reason to complicate this now.
    ============================================================ */
 
-async function expirePendingRecharges() {
+const REVIEW_WINDOW_MS = 300000; // 5 minutes
 
-  // 5 minutes. Below this, the player waits for automation.
-  // Past this, the request is left pending for manual review --
-  // it is NOT rejected, because the SMS may still be delayed
-  // rather than missing. Some banks take 10-15 minutes on a slow
-  // day. If the SMS lands after this point, /sms still finds this
-  // transaction (it is still 'pending') and matches it normally --
-  // so a late arrival still auto-completes without an admin
-  // having to do anything.
+async function sweepPendingRecharges() {
+
   const cutoff =
     new Date(
       Date.now() -
-      300000
+      REVIEW_WINDOW_MS
     );
 
   const pendingRecharges =
@@ -1367,11 +1366,7 @@ async function expirePendingRecharges() {
       type:
         'recharge',
       status:
-        'pending',
-      createdAt: {
-        $lt:
-          cutoff
-      }
+        'pending'
     })
       .sort({
         createdAt: 1
@@ -1389,40 +1384,51 @@ async function expirePendingRecharges() {
     of pendingRecharges
   ) {
 
+    const isPastReviewWindow =
+      transaction.createdAt < cutoff;
+
     const playerUtr =
       extractUtr(
         transaction.rechargeNote
       );
 
-    /* No player UTR */
+    /* No UTR at all -- safety net; wallet.js should prevent this
+       at submission time now. Give it the review window before
+       giving up, in case this is a race on a very fresh row. */
 
     if (!playerUtr) {
 
-      const rejectedTx =
-        await rejectRecharge(
-          transaction,
-          'No valid UTR / payment reference was submitted with this request. Please submit a new recharge request with the correct UTR.'
-        );
+      if (isPastReviewWindow) {
 
-      if (rejectedTx) {
-        rejected++;
-      } else {
-        skipped++;
+        const rejectedTx =
+          await rejectRecharge(
+            transaction,
+            'No valid UTR / payment reference was submitted with this request. Please submit a new recharge request with the correct UTR.'
+          );
+
+        if (rejectedTx) {
+          rejected++;
+        } else {
+          skipped++;
+        }
       }
 
       continue;
     }
 
-    /* Already successfully used UTR */
+    /* This UTR was already used on a different, already-approved
+       recharge. Not a timing problem -- reject immediately,
+       regardless of age. This also catches a resubmission of a
+       UTR whose BankPayment row was already deleted by a prior
+       approval (approveRecharge deletes it on success), which is
+       exactly the case the lookup below can no longer see. */
 
     const successfulRecharge =
       await findSuccessfulRechargeByUtr(
         playerUtr
       );
 
-    if (
-      successfulRecharge
-    ) {
+    if (successfulRecharge) {
 
       const rejectedTx =
         await rejectRecharge(
@@ -1439,7 +1445,7 @@ async function expirePendingRecharges() {
       continue;
     }
 
-    /* Find bank payment — ignored rows must not count */
+    /* Find a live bank payment -- ignored rows must not count */
 
     const bankPayment =
       await BankPayment.findOne({
@@ -1452,121 +1458,100 @@ async function expirePendingRecharges() {
         }
       });
 
-    /* ========================================================
-       NO BANK PAYMENT YET -- LEAVE PENDING, DO NOT REJECT
-
-       The SMS may simply be delayed. Rejecting here would tell
-       a player their genuine payment failed, when the money may
-       land minutes later.
-
-       The transaction is left exactly as it is: status
-       'pending'. It already appears in the admin's pending-
-       requests queue for manual approval. If the SMS arrives
-       later, /sms will find this same still-pending transaction
-       by UTR and match it automatically -- an admin only needs
-       to act if the SMS never arrives at all.
-       ======================================================== */
-
     if (!bankPayment) {
-      awaitingManual++;
+
+      if (isPastReviewWindow) {
+        awaitingManual++;
+      }
+
+      // Not past the window yet: leave pending, try again next
+      // tick. If the SMS lands after the window has passed, this
+      // stays 'pending' -- /sms will still find and match it.
+
       continue;
     }
 
-    /* Bank payment found — amount check */
+    /* A bank payment exists. matchBankPayment is the single
+       source of truth for what happens next -- same function
+       /sms and /match both call. */
 
-    const bankAmount =
-      Number(
-        bankPayment.amount
+    let matchResult;
+
+    try {
+
+      matchResult =
+        await matchBankPayment({
+          amount:
+            bankPayment.amount,
+          utr:
+            bankPayment.utr,
+          bankPaymentId:
+            bankPayment._id
+        });
+
+    } catch (err) {
+
+      console.error(
+        'Sweep match failed for transaction',
+        transaction._id,
+        err.message
       );
 
-    if (
-      bankAmount !==
-      Number(
-        transaction.amount
-      )
-    ) {
-
-      const rejectedTx =
-        await rejectRecharge(
-          transaction,
-          `Wrong payment amount. Your UTR belongs to a ₹${bankAmount} payment, but your recharge request was for ₹${transaction.amount}. Please submit a new recharge request with the correct amount.`
-        );
-
-      if (rejectedTx) {
-        rejected++;
-      } else {
-        skipped++;
-      }
-
+      skipped++;
       continue;
     }
 
-    /* ========================================================
-       SAME UTR + SAME AMOUNT
+    const decision =
+      matchResult?.payload?.decision;
 
-       This is a verified payment. Credit it if automatic
-       verification is enabled and the amount is within the
-       configured ceiling; otherwise hand it to an admin.
-       ======================================================== */
+    if (decision === 'APPROVE') {
+      approved++;
 
-    const settings =
-      await getSettings();
+    } else if (decision === 'REJECTED') {
+      rejected++;
 
-    if (
-      settings.autoVerify &&
-      bankAmount <= settings.maxAutoAmount
+    } else if (
+      decision === 'MANUAL' ||
+      decision === 'ALREADY_PROCESSED'
     ) {
 
-      try {
+      // Flag the bank payment for the admin queue, but only
+      // write once -- this branch can be reached again on every
+      // future tick until an admin acts, and there is no reason
+      // to keep rewriting the same status.
 
-        const approval =
-          await approveRecharge(
-            transaction,
-            bankPayment
-          );
+      if (bankPayment.status !== 'manual') {
 
-        if (approval.ok) {
-          approved++;
-          continue;
-        }
-
-        if (approval.alreadyProcessed) {
-          skipped++;
-          continue;
-        }
-
-      } catch (err) {
-
-        // Approval failing must not stop the sweep. Fall
-        // through to MANUAL so an admin sees it rather than
-        // the payment silently vanishing.
-        console.error(
-          'Auto-approve at expiry failed:',
-          err.message
+        await BankPayment.findOneAndUpdate(
+          {
+            _id:
+              bankPayment._id
+          },
+          {
+            $set: {
+              status:
+                'manual',
+              matchedTransaction:
+                transaction._id,
+              matchedAt:
+                new Date()
+            }
+          }
         );
       }
+
+      manual++;
+
+    } else {
+
+      // WAITING / NO_MATCH: a bank payment exists but
+      // matchBankPayment could not tie it to this transaction --
+      // most likely a duplicate-UTR edge case where a different
+      // pending recharge claimed the match first. Leave as-is;
+      // retried next tick.
+
+      skipped++;
     }
-
-    /* Not auto-approved — flag for manual review */
-
-    await BankPayment.findOneAndUpdate(
-      {
-        _id:
-          bankPayment._id
-      },
-      {
-        $set: {
-          status:
-            'manual',
-          matchedTransaction:
-            transaction._id,
-          matchedAt:
-            new Date()
-        }
-      }
-    );
-
-    manual++;
   }
 
   return {
@@ -1588,14 +1573,14 @@ router.post(
     try {
 
       const result =
-        await expirePendingRecharges();
+        await sweepPendingRecharges();
 
       return res.json(result);
 
     } catch (err) {
 
       console.error(
-        'Expire pending recharge error:',
+        'Recharge sweep error:',
         err
       );
 
@@ -1615,12 +1600,12 @@ router.post(
    app.use('/api/payment-automation', require(...)) keeps
    working unchanged.
 
-   expirePendingRecharges and matchBankPayment are attached to
+   sweepPendingRecharges and matchBankPayment are attached to
    it so the scheduler and the /sms route can call them
    directly, with no HTTP hop and no secret header to
    misconfigure.
    ============================================================ */
 
 module.exports = router;
-module.exports.expirePendingRecharges = expirePendingRecharges;
+module.exports.sweepPendingRecharges = sweepPendingRecharges;
 module.exports.matchBankPayment = matchBankPayment;
