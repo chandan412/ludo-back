@@ -3,15 +3,19 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
+const Referral = require('../models/Referral');
 const crypto = require('crypto');
 const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
-// ✅ Referral config + unique-code generator. Codes are 6 chars from an unambiguous
+// ✅ Unique referral-code generator. Codes are 6 chars from an unambiguous
 // alphabet (no 0/O/1/I), checked against existing users so they never collide.
-const REFERRAL_BONUS = parseInt(process.env.REFERRAL_BONUS || 50, 10);
+//
+// NOTE: the reward AMOUNT is no longer read here. It lives in the admin-editable
+// Setting collection (utils/referral.js) and is resolved at PAYOUT time, not at
+// signup, so changing it in the admin panel takes effect without a redeploy.
 const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 async function generateUniqueReferralCode() {
   for (let attempt = 0; attempt < 12; attempt++) {
@@ -86,31 +90,41 @@ router.post('/register', async (req, res) => {
       phoneVerifiedAt: phoneVerified ? new Date() : null,
     });
 
-    // ✅ Pay the REFERRER ₹50 as BONUS — playable but NOT withdrawable (credited into
-    // `balance` and simultaneously tracked in `bonusBalance`). This kills the "refer my own
-    // fake accounts and withdraw the reward" fraud: the ₹50 can be played but never cashed
-    // out. One credit per signup, logged as 'referral'.
-    // Non-fatal: the new account already exists; never fail signup over a bonus write.
+    // ========================================================================
+    // ✅ REFERRAL: OPEN A PENDING LEDGER ROW — DO NOT PAY YET.
+    //
+    // This used to credit the referrer ₹50 the instant a signup completed. That
+    // made a referral worth exactly as much as filling in a form, and the result
+    // was a flood of accounts created purely to be referred, none of which ever
+    // played a game. They cost phone verifications, index space, and a slot in
+    // every admin query, forever.
+    //
+    // Now the money is deferred: we record that this signup HAPPENED, and the
+    // reward is released later, by utils/referral.js, only once this new player
+    // has completed the number of genuine games the admin requires — and only
+    // if the referrer is still under their reward cap.
+    //
+    // referralCount still increments here because it means "friends joined",
+    // which is true right now. referralEarnings does NOT, because nothing has
+    // been earned yet; it moves at payout time.
+    //
+    // Non-fatal throughout: the account already exists, and no bookkeeping
+    // failure should turn a successful signup into an error the user sees.
+    // ========================================================================
     if (referrer) {
       try {
-        const before = referrer.balance;
-        referrer.balance         += REFERRAL_BONUS;
-        // ✅ Tag this credit as BONUS — it sits inside `balance` (so it's playable) but is
-        // NOT withdrawable. Withdrawals subtract bonusBalance; see wallet.js.
-        referrer.bonusBalance     = (referrer.bonusBalance || 0) + REFERRAL_BONUS;
-        referrer.referralCount    = (referrer.referralCount || 0) + 1;
-        referrer.referralEarnings = (referrer.referralEarnings || 0) + REFERRAL_BONUS;
-        await referrer.save();
-        await Transaction.create({
-          user: referrer._id,
-          type: 'referral',
-          amount: REFERRAL_BONUS,
-          balanceBefore: before,
-          balanceAfter: referrer.balance,
-          status: 'completed',
+        await Referral.create({
+          referrer: referrer._id,
+          referred: user._id,
+          code: enteredCode,
+          status: 'pending',
         });
+        await User.updateOne({ _id: referrer._id }, { $inc: { referralCount: 1 } });
       } catch (refErr) {
-        console.error('referral credit error:', refErr);
+        // Duplicate key (11000) means a ledger row for this account already
+        // exists — impossible in practice since the account was just created,
+        // but if it ever happens it is precisely the protection working.
+        if (refErr.code !== 11000) console.error('referral ledger error:', refErr);
       }
     }
 
