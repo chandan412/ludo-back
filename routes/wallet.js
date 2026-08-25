@@ -417,6 +417,116 @@ router.post('/withdraw-request', auth, async (req, res) => {
 });
 
 // ============================================================================
+// POST /api/wallet/cancel-withdrawal — the PLAYER withdraws their own request.
+//
+// Until now only an admin could end a pending withdrawal. A player who typed
+// the wrong UPI ID, or simply changed their mind, had their money locked and
+// no way to release it — they had to message you and wait. That is support
+// work for you and a frozen balance for them, over something they should be
+// able to undo themselves.
+//
+// MONEY HANDLING — mirrors the admin REJECT path exactly.
+// Requesting a withdrawal only LOCKED the money (`lockedBalance += amount`);
+// `balance` was never reduced. So cancelling only has to RELEASE the lock.
+// There is no `balance +=` anywhere below, and there must never be: adding to
+// balance here would mint money out of a cancelled request.
+//
+// THE RACE THAT MATTERS
+// You cancel and the admin approves in the same second. Both paths would
+// otherwise unlock and settle the same transaction. The atomic status flip
+// below is the guard: `status: 'pending'` is part of the FILTER, so whichever
+// call lands first flips it and the other matches nothing and is told the
+// request was already processed. Only one side can ever act.
+// ============================================================================
+router.post('/cancel-withdrawal', auth, async (req, res) => {
+  try {
+    const { transactionId } = req.body || {};
+
+    // Claim atomically. `user: req.user._id` in the filter means a player can
+    // only ever cancel their OWN request, even if they send someone else's id.
+    const filter = {
+      user: req.user._id,
+      type: 'withdraw',
+      status: 'pending',
+    };
+    if (transactionId) filter._id = transactionId;
+
+    const transaction = await Transaction.findOneAndUpdate(
+      filter,
+      { $set: { status: 'cancelled', processedAt: new Date(), withdrawNote: 'Cancelled by player' } },
+      { new: true, sort: { createdAt: -1 } }
+    );
+
+    if (!transaction) {
+      return res.status(400).json({
+        message: 'No pending withdrawal to cancel. It may have already been processed by admin.',
+      });
+    }
+
+    const amount = transaction.amount;
+
+    // Release the lock atomically. The `$gte` guard means the decrement can
+    // never drive lockedBalance negative — which would silently inflate the
+    // player's withdrawable balance, since withdrawable is
+    // (balance − lockedBalance − bonusBalance).
+    let user = await User.findOneAndUpdate(
+      { _id: req.user._id, lockedBalance: { $gte: amount } },
+      { $inc: { lockedBalance: -amount } },
+      { new: true }
+    );
+
+    if (!user) {
+      // lockedBalance was already lower than this request — data drift from
+      // some earlier issue. Clamp to zero rather than leaving it stuck, and log
+      // it loudly because it means something upstream mis-tracked a lock.
+      console.error(
+        `cancel-withdrawal: lockedBalance < amount for user ${req.user._id} ` +
+        `(tx ${transaction._id}, amount ${amount}) — clamping to 0`
+      );
+      user = await User.findOneAndUpdate(
+        { _id: req.user._id },
+        { $set: { lockedBalance: 0 } },
+        { new: true }
+      );
+    }
+
+    const availableAfter = Math.max(0, user.balance - user.lockedBalance);
+
+    // Audit row, matching the shape the admin reject path writes so the
+    // player's wallet history reads consistently either way.
+    await Transaction.create({
+      user: req.user._id,
+      type: 'withdraw',
+      amount,
+      balanceBefore: Math.max(0, availableAfter - amount),
+      balanceAfter: availableAfter,
+      status: 'cancelled',
+      withdrawNote: 'Withdrawal cancelled by player — amount unlocked',
+      processedAt: new Date(),
+    });
+
+    // Tell the admin panel so the request disappears from the pending list
+    // instead of sitting there until someone clicks it and gets an error.
+    notifyAdmins(req, {
+      kind: 'withdraw-cancelled',
+      username: req.user.username,
+      amount,
+    });
+
+    res.json({
+      message: `Withdrawal request cancelled. ₹${amount} unlocked.`,
+      amount,
+      balance: user.balance,
+      lockedBalance: user.lockedBalance,
+      available: availableAfter,
+    });
+  } catch (err) {
+    console.error('cancel-withdrawal error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ============================================================================
 // GET /api/wallet/withdraw-limit — how many requests the player has left.
 //
 // Read-only; peeking never consumes a slot. Lets the wallet screen show the
