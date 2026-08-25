@@ -12,7 +12,12 @@ const transactionSchema = new mongoose.Schema({
   balanceAfter: { type: Number, required: true },
   status: {
     type: String,
-    enum: ['pending', 'approved', 'rejected', 'completed'],
+    // ✅ 'cancelled' = withdrawn by the PLAYER before an admin acted on it.
+    // Deliberately distinct from 'rejected', which means an admin refused it.
+    // Collapsing the two would make the ledger unreadable: you could no longer
+    // tell "I changed my mind" from "you were turned down", and the player
+    // would see a rejection card for something they did themselves.
+    enum: ['pending', 'approved', 'rejected', 'completed', 'cancelled'],
     default: 'completed'
   },
   rechargeNote: { type: String },
