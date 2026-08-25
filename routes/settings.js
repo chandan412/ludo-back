@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
 const { adminAuth } = require('../middleware/auth');
+const { getWithdrawLimits, saveWithdrawLimits } = require('../utils/withdrawLimit');
  
 // Simple Setting schema
 const settingSchema = new mongoose.Schema({
@@ -96,6 +97,48 @@ router.post('/apk-url', adminAuth, async (req, res) => {
     );
     res.json({ message: 'APK URL updated' });
   } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── WITHDRAWAL REQUEST RATE LIMIT ───────────────────────────────────────────
+// How many withdrawal requests a player may submit per rolling window.
+// Enforcement lives in utils/withdrawLimit.js; these endpoints only read and
+// write the numbers.
+
+// GET /api/settings/withdraw-limits — admin only
+router.get('/withdraw-limits', adminAuth, async (req, res) => {
+  try {
+    const limits = await getWithdrawLimits(true);
+    res.json(limits);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/settings/withdraw-limits — admin only
+router.put('/withdraw-limits', adminAuth, async (req, res) => {
+  try {
+    const { maxRequests, windowHours } = req.body;
+
+    if (maxRequests !== undefined) {
+      const n = Number(maxRequests);
+      if (!Number.isInteger(n) || n < 0 || n > 100)
+        return res.status(400).json({ message: 'Requests allowed must be a whole number between 0 and 100' });
+    }
+    if (windowHours !== undefined) {
+      const n = Number(windowHours);
+      // Capped at a week. A window measured in months is indistinguishable from
+      // "withdrawals are switched off", and should be done deliberately by
+      // another means rather than by typing a large number here.
+      if (!Number.isInteger(n) || n < 1 || n > 168)
+        return res.status(400).json({ message: 'Window must be a whole number of hours between 1 and 168' });
+    }
+
+    const updated = await saveWithdrawLimits({ maxRequests, windowHours });
+    res.json({ message: 'Withdrawal limits updated', ...updated });
+  } catch (err) {
+    console.error('withdraw-limits save error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
