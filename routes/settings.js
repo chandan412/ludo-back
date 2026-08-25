@@ -102,6 +102,103 @@ router.post('/apk-url', adminAuth, async (req, res) => {
   }
 });
 
+// ── TELEGRAM GROUP LINK ─────────────────────────────────────────────────────
+// Shown on the Login page. Public GET so the page can render it before anyone
+// has signed in; admin-only POST to change it.
+
+// ✅ Normalise whatever the admin pastes into a working https link.
+//
+// Telegram links arrive in several shapes and most of them are broken if used
+// as-is in an href on an https site:
+//
+//   @ludoking              → a username, not a URL
+//   ludoking               → bare username
+//   t.me/ludoking          → no scheme; the browser treats it as a relative
+//                            path and sends the player to ludo-king.in/t.me/...
+//   http://t.me/ludoking   → blocked as mixed content, button silently dead
+//   https://t.me/+AbC123   → private group invite, already correct
+//
+// Every one of those fails SILENTLY — the button renders and does nothing, so
+// you would only find out from a player complaining. Normalising here means the
+// stored value is always a real link.
+function normalizeTelegram(input) {
+  let s = String(input || '').trim();
+  if (!s) return '';
+
+  // Only trim — deliberately NOT stripping internal whitespace. Collapsing
+  // "random text here" into "randomtexthere" would make junk input look like a
+  // valid username and get silently saved as https://t.me/randomtexthere.
+  // Leaving the spaces in means it fails the username test below, falls through
+  // to validation, and the admin gets told what's wrong.
+
+  // Bare @username or username → build the canonical URL.
+  if (s.startsWith('@')) return 'https://t.me/' + s.slice(1);
+  if (!/^https?:\/\//i.test(s) && !/^(t|telegram)\.me\//i.test(s)) {
+    // Only treat it as a username if it looks like one — otherwise leave it
+    // alone so validation below can reject it with a useful message.
+    if (/^[A-Za-z0-9_+]{3,64}$/.test(s)) return 'https://t.me/' + s;
+  }
+
+  // Add or upgrade the scheme. http:// is forced to https:// because the site
+  // is served over https and a plain http link is blocked by the browser.
+  if (/^http:\/\//i.test(s)) s = 'https://' + s.slice(7);
+  else if (!/^https:\/\//i.test(s)) s = 'https://' + s;
+
+  return s;
+}
+
+function isValidTelegram(url) {
+  return /^https:\/\/(t\.me|telegram\.me|telegram\.dog)\/.+/i.test(url);
+}
+
+// GET /api/settings/telegram — public
+router.get('/telegram', async (req, res) => {
+  try {
+    const setting = await Setting.findOne({ key: 'telegram_url' });
+    res.json({ url: setting?.value || '' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/settings/telegram — admin only
+router.post('/telegram', adminAuth, async (req, res) => {
+  try {
+    const raw = req.body?.url;
+
+    // Empty is legitimate — it's how you HIDE the button, so it must not be
+    // treated as a validation failure.
+    if (!String(raw || '').trim()) {
+      await Setting.findOneAndUpdate(
+        { key: 'telegram_url' },
+        { key: 'telegram_url', value: '' },
+        { upsert: true, new: true }
+      );
+      return res.json({ message: 'Telegram link removed', url: '' });
+    }
+
+    const url = normalizeTelegram(raw);
+    if (!isValidTelegram(url)) {
+      return res.status(400).json({
+        message: 'Enter a valid Telegram link, e.g. https://t.me/yourgroup or @yourgroup',
+      });
+    }
+
+    await Setting.findOneAndUpdate(
+      { key: 'telegram_url' },
+      { key: 'telegram_url', value: url },
+      { upsert: true, new: true }
+    );
+    // Return the NORMALISED value so the admin panel shows what was actually
+    // stored, not what they typed — otherwise the input keeps showing "@group"
+    // while the database holds the full URL.
+    res.json({ message: 'Telegram link updated', url });
+  } catch (err) {
+    console.error('telegram save error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // ── WITHDRAWAL REQUEST RATE LIMIT ───────────────────────────────────────────
 // How many withdrawal requests a player may submit per rolling window.
 // Enforcement lives in utils/withdrawLimit.js; these endpoints only read and
