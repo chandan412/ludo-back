@@ -79,8 +79,25 @@ const userSchema = new mongoose.Schema({
   // ✅ Referral system
   referralCode:     { type: String, unique: true, sparse: true, uppercase: true, trim: true },
   referredBy:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+
+  // How many people SIGNED UP with this user's code. Counts every signup,
+  // including ones that never play — it is a share-reach number, not a money
+  // number, and is shown to the player as "friends joined".
   referralCount:    { type: Number, default: 0 },
+
+  // Total value actually PAID OUT to this user for referrals.
   referralEarnings: { type: Number, default: 0 },
+
+  // ✅ THE CAP COUNTER — how many times this user has actually been PAID a
+  // referral reward. Deliberately separate from referralCount, because they now
+  // mean different things: you may refer a hundred people and be paid five
+  // times. This field is compared against the admin's `referral_max_rewards`
+  // setting inside an atomic findOneAndUpdate filter, which is what makes the
+  // cap race-proof — see utils/referral.js payReferral().
+  //
+  // Starts at 0 for EVERYONE, including users who referred people under the old
+  // instant-payout rules. Past referrals do not eat the new allowance.
+  referralRewardCount: { type: Number, default: 0 },
 
   createdAt: {
     type: Date,
