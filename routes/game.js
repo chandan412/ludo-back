@@ -5,6 +5,7 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
+const { recordQualifyingGame } = require('../utils/referral');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -503,6 +504,19 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
       status: 'completed',
       gameId: game._id,
     });
+
+    // ✅ REFERRAL PROGRESS — this route settles money by itself rather than
+    // going through settleGame() in gameSocket.js, so it needs its own hook or
+    // forfeited games would silently never count toward a referral.
+    //
+    // Note this does NOT mean a forfeit automatically earns progress: the
+    // qualification checks in utils/referral.js still apply, and a game that was
+    // thrown away in the first few seconds fails the minimum-moves and
+    // minimum-duration tests. That is the point — "join and instantly quit,
+    // three times" was the obvious way to game a play-N-games requirement.
+    recordQualifyingGame(game._id).catch(e =>
+      console.error('referral progress error (non-fatal):', e.message)
+    );
 
     res.json({
       message: 'Forfeited. Opponent wins.',
