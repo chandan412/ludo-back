@@ -99,6 +99,20 @@ const userSchema = new mongoose.Schema({
   // instant-payout rules. Past referrals do not eat the new allowance.
   referralRewardCount: { type: Number, default: 0 },
 
+  // ✅ WITHDRAWAL REQUEST RATE LIMIT — see utils/withdrawLimit.js.
+  //
+  // These two fields exist so the limit can be claimed ATOMICALLY. Counting
+  // recent withdraw Transactions instead would mean read-then-write, which two
+  // simultaneous requests can both pass; on a path that locks balance, that is
+  // not a race worth leaving open. A conditional $inc on a single document
+  // cannot be raced.
+  //
+  // withdrawWindowStart is when the player's current window opened. Absent/null
+  // on existing accounts, which the claim logic treats as "no active window" —
+  // so no migration is needed and nobody starts out already limited.
+  withdrawWindowStart: { type: Date,   default: null },
+  withdrawWindowCount: { type: Number, default: 0 },
+
   createdAt: {
     type: Date,
     default: Date.now
