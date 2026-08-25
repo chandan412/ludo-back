@@ -113,6 +113,19 @@ const userSchema = new mongoose.Schema({
   withdrawWindowStart: { type: Date,   default: null },
   withdrawWindowCount: { type: Number, default: 0 },
 
+  // ✅ SIGNUP BONUS — how much welcome bonus this account was given, and when.
+  //
+  // Recorded on the user rather than inferred from the Transaction log because
+  // it answers the support question directly ("did this player get the bonus,
+  // and how much was it at the time?") without a query, and because the amount
+  // is admin-editable — a player who joined when it was ₹25 should not appear
+  // to have received today's ₹50.
+  //
+  // Non-zero also acts as the has-been-paid marker, so any future backfill or
+  // retry can skip accounts that were already credited.
+  signupBonus:      { type: Number, default: 0 },
+  signupBonusAt:    { type: Date,   default: null },
+
   createdAt: {
     type: Date,
     default: Date.now
