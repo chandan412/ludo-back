@@ -4,6 +4,11 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Game = require('../models/Game');
 const { auth } = require('../middleware/auth');
+const {
+  claimWithdrawSlot,
+  releaseWithdrawSlot,
+  peekWithdrawSlots,
+} = require('../utils/withdrawLimit');
 
 // ============================================================================
 // ✅ notifyAdmins — fire-and-forget push to the admin panel.
@@ -337,18 +342,52 @@ router.post('/withdraw-request', auth, async (req, res) => {
       return res.status(400).json({ message: 'Provide UPI ID or full bank account details' });
     const pending = await Transaction.findOne({ user: req.user._id, type: 'withdraw', status: 'pending' });
     if (pending) return res.status(400).json({ message: 'You already have a pending withdrawal request' });
+
+    // ========================================================================
+    // ✅ RATE LIMIT — default 2 requests per 6 hours, admin-configurable.
+    //
+    // Claimed LAST, immediately before the write, and deliberately AFTER every
+    // validation above. Order matters: if this ran first, a player who fat-
+    // fingered their UPI ID or asked for more than their balance would burn one
+    // of their two attempts on a request that was never going to be created.
+    // They'd be locked out for six hours over a typo.
+    //
+    // The claim is atomic (a conditional $inc), so two requests fired at the
+    // same moment cannot both take the last remaining slot.
+    // ========================================================================
+    const slot = await claimWithdrawSlot(req.user._id);
+    if (!slot.allowed) {
+      return res.status(429).json({
+        message: slot.message,
+        rateLimited: true,
+        used: slot.used,
+        max: slot.max,
+        windowHours: slot.windowHours,
+        resetAt: slot.resetAt,
+      });
+    }
+
     // ✅ Create transaction first, then lock balance (safer if either fails)
-    const transaction = await Transaction.create({
-      user: req.user._id,
-      type: 'withdraw',
-      amount,
-      balanceBefore: user.balance,
-      balanceAfter: user.balance,
-      status: 'pending',
-      bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
-    });
-    user.lockedBalance += amount;
-    await user.save();
+    let transaction;
+    try {
+      transaction = await Transaction.create({
+        user: req.user._id,
+        type: 'withdraw',
+        amount,
+        balanceBefore: user.balance,
+        balanceAfter: user.balance,
+        status: 'pending',
+        bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
+      });
+      user.lockedBalance += amount;
+      await user.save();
+    } catch (writeErr) {
+      // The slot was consumed by the claim above but the request does not
+      // exist. Hand it back — otherwise a transient database error silently
+      // costs the player an attempt, and they have no way to know why.
+      await releaseWithdrawSlot(req.user._id);
+      throw writeErr;
+    }
 
     // ✅ Push to any admin with the panel open — no polling required.
     notifyAdmins(req, {
@@ -359,9 +398,36 @@ router.post('/withdraw-request', auth, async (req, res) => {
 
     res.status(201).json({
       message: 'Withdrawal request submitted. Admin will process within 24 hours.',
-      transaction
+      transaction,
+      // Echo the limit back so the wallet screen can tell the player how many
+      // attempts they have left, rather than them discovering the limit only by
+      // hitting it.
+      withdrawLimit: slot.unlimited ? null : {
+        used: slot.used,
+        remaining: Math.max(0, slot.max - slot.used),
+        max: slot.max,
+        windowHours: slot.windowHours,
+        resetAt: slot.resetAt,
+      },
     });
   } catch (err) {
+    console.error('withdraw request error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ============================================================================
+// GET /api/wallet/withdraw-limit — how many requests the player has left.
+//
+// Read-only; peeking never consumes a slot. Lets the wallet screen show the
+// rule up front instead of the player finding out by being refused.
+// ============================================================================
+router.get('/withdraw-limit', auth, async (req, res) => {
+  try {
+    const info = await peekWithdrawSlots(req.user._id);
+    res.json(info);
+  } catch (err) {
+    console.error('withdraw-limit error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
