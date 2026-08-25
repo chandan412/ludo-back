@@ -3,6 +3,7 @@ const router = express.Router();
 const mongoose = require('mongoose');
 const { adminAuth } = require('../middleware/auth');
 const { getWithdrawLimits, saveWithdrawLimits } = require('../utils/withdrawLimit');
+const { getSignupBonus, saveSignupBonus } = require('../utils/signupBonus');
  
 // Simple Setting schema
 const settingSchema = new mongoose.Schema({
@@ -139,6 +140,56 @@ router.put('/withdraw-limits', adminAuth, async (req, res) => {
     res.json({ message: 'Withdrawal limits updated', ...updated });
   } catch (err) {
     console.error('withdraw-limits save error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── NEW PLAYER SIGNUP BONUS ─────────────────────────────────────────────────
+
+// GET /api/settings/signup-bonus — PUBLIC.
+// Lets the register / login page advertise the bonus ("Sign up and get ₹50 to
+// play with"). Public on purpose: it is a marketing number, and hard-coding it
+// in the frontend would mean the banner keeps promising an old amount after the
+// admin changes it.
+router.get('/signup-bonus', async (req, res) => {
+  try {
+    const s = await getSignupBonus();
+    res.json({ enabled: s.enabled, amount: s.amount });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/settings/signup-bonus/admin — admin only
+router.get('/signup-bonus/admin', adminAuth, async (req, res) => {
+  try {
+    const s = await getSignupBonus(true);
+    res.json(s);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/settings/signup-bonus — admin only
+router.put('/signup-bonus', adminAuth, async (req, res) => {
+  try {
+    const { enabled, amount } = req.body;
+
+    if (amount !== undefined) {
+      const n = Number(amount);
+      if (!Number.isInteger(n) || n < 0)
+        return res.status(400).json({ message: 'Bonus amount must be a whole number of 0 or more' });
+      // Sanity ceiling. This value is paid automatically to every account that
+      // registers, with no human in the loop — a mistyped extra digit here is
+      // not caught by anything downstream.
+      if (n > 10000)
+        return res.status(400).json({ message: 'Bonus amount looks too large — maximum is 10,000' });
+    }
+
+    const updated = await saveSignupBonus({ enabled, amount });
+    res.json({ message: 'Signup bonus updated', ...updated });
+  } catch (err) {
+    console.error('signup-bonus save error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
