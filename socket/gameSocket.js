@@ -4,6 +4,7 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
+const { recordQualifyingGame } = require('../utils/referral');
 
 const activeRooms = new Map();
 const roomTimers = new Map(); // tracks 2-min auto-abort timers
@@ -627,6 +628,27 @@ async function settleGame(game, winnerId, loserId, winAmount, platformFee) {
     });
 
   console.log(`Game settled: Winner ${winner.username} +₹${netWin}, Loser ${loser.username} -₹${game.betAmount}, Fee ₹${platformFee}`);
+
+  // ==========================================================================
+  // ✅ REFERRAL PROGRESS — deliberately the LAST thing, and deliberately unable
+  // to affect anything above it.
+  //
+  // Placed inside settleGame() rather than at each call site because there are
+  // FIVE paths that finish a game (normal win, turn-timeout, opponent
+  // disconnect, absence re-arm, exit). Hooking each one separately would mean
+  // five chances to forget one, and a missed hook is a player who never gets
+  // paid for a referral they earned. One hook at the single point every path
+  // already funnels through cannot be skipped.
+  //
+  // Wrapped and swallowed: the money above has already moved and been recorded.
+  // A referral is a marketing bonus, and no bonus is worth throwing out of a
+  // settlement path and leaving the caller to think the payout failed.
+  // ==========================================================================
+  try {
+    await recordQualifyingGame(game._id);
+  } catch (e) {
+    console.error('referral progress error (non-fatal):', e.message);
+  }
 }
 
 // ============================
