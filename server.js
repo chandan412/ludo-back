@@ -11,6 +11,7 @@ const gameRoutes = require('./routes/game');
 const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
 const chatRoutes = require('./routes/chat');
+const referralRoutes = require('./routes/referral');
 const paymentAutomationRoutes = require('./routes/paymentAutomation');
 
 // In-process expiry sweeps. Replaces the n8n schedule trigger,
@@ -183,6 +184,11 @@ app.use(
 app.use(
   '/api/chat',
   chatRoutes
+);
+
+app.use(
+  '/api/referral',
+  referralRoutes
 );
 
 // ============================================================================
@@ -466,6 +472,38 @@ const connectDB =
 
         console.error(
           'phoneVerified grandfather error (non-fatal):',
+          e.message
+        );
+      }
+
+      // ================================================================
+      // Grandfather EXISTING referrals as already paid
+      //
+      // Every user who already carries `referredBy` earned their referrer
+      // ₹50 instantly under the old rules. This writes them into the new
+      // ledger as 'rewarded', which both preserves the fact that they were
+      // paid and — via the unique index on `referred` — makes it
+      // impossible for them to be paid a SECOND time now that payouts are
+      // deferred until the friend plays.
+      //
+      // Without this, every historical referral would sit at 'pending' and
+      // start earning all over again.
+      //
+      // Guarded by a Setting flag, so this full scan runs once, not on
+      // every boot and every Railway restart.
+      // ================================================================
+
+      try {
+
+        const { grandfatherExistingReferrals } =
+          require('./utils/referral');
+
+        await grandfatherExistingReferrals();
+
+      } catch (e) {
+
+        console.error(
+          'referral grandfather error (non-fatal):',
           e.message
         );
       }
