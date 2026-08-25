@@ -7,6 +7,7 @@ const Referral = require('../models/Referral');
 const crypto = require('crypto');
 const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
+const { resolveSignupBonus } = require('../utils/signupBonus');
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
@@ -79,6 +80,17 @@ router.post('/register', async (req, res) => {
     // ✅ Every new user gets their own unique referral code.
     const myReferralCode = await generateUniqueReferralCode();
 
+    // ✅ SIGNUP BONUS — resolved BEFORE the account is created so it can be
+    // folded into the same write. Doing it as a second update would leave a
+    // window where a brand new account exists showing ₹0, which is exactly when
+    // the player is looking at their balance for the first time.
+    //
+    // Credited into `balance` (playable) AND tracked in `bonusBalance` (not
+    // withdrawable). See utils/signupBonus.js — a withdrawable welcome bonus is
+    // a cash machine, since minting an account costs nothing but a phone
+    // number.
+    const bonusAmount = await resolveSignupBonus();
+
     const user = await User.create({
       username: usernameTrimmed,
       email: emailLower,
@@ -88,7 +100,30 @@ router.post('/register', async (req, res) => {
       referredBy: referrer ? referrer._id : null,
       phoneVerified,
       phoneVerifiedAt: phoneVerified ? new Date() : null,
+      balance:       bonusAmount,
+      bonusBalance:  bonusAmount,
+      signupBonus:   bonusAmount,
+      signupBonusAt: bonusAmount > 0 ? new Date() : null,
     });
+
+    // Ledger entry for the bonus. Non-fatal: the money is already on the
+    // account, and failing a successful signup over a logging write would be
+    // the wrong trade. A missing row here is an accounting gap, not a balance
+    // error — `signupBonus` on the user remains the authoritative record.
+    if (bonusAmount > 0) {
+      try {
+        await Transaction.create({
+          user: user._id,
+          type: 'signup_bonus',
+          amount: bonusAmount,
+          balanceBefore: 0,
+          balanceAfter: bonusAmount,
+          status: 'completed',
+        });
+      } catch (bErr) {
+        console.error('signup bonus transaction error (non-fatal):', bErr.message);
+      }
+    }
 
     // ========================================================================
     // ✅ REFERRAL: OPEN A PENDING LEDGER ROW — DO NOT PAY YET.
