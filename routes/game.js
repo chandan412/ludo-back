@@ -6,6 +6,7 @@ const Transaction = require('../models/Transaction');
 const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
 const { recordQualifyingGame } = require('../utils/referral');
+const { getAmountLimits } = require('../utils/amountLimits');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -94,8 +95,14 @@ router.get('/my-games/history', auth, async (req, res) => {
 router.post('/create', auth, async (req, res) => {
   try {
     const { betAmount } = req.body;
-    if (!betAmount || betAmount < 10)
-      return res.status(400).json({ message: 'Minimum bet is ₹10' });
+
+    // ✅ Minimum bet is admin-configurable now (was hard-coded ₹10).
+    // Enforced HERE, on the server, not just in the lobby's tier buttons — the
+    // frontend list is a convenience, and a crafted request would otherwise
+    // walk straight past it.
+    const amountLimits = await getAmountLimits();
+    if (!betAmount || betAmount < amountLimits.minBet)
+      return res.status(400).json({ message: `Minimum bet is ₹${amountLimits.minBet}` });
 
     const user = await User.findById(req.user._id);
     // ✅ Phone-verification gate — new players must verify before they can play. Existing
