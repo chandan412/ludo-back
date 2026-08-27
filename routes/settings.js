@@ -360,4 +360,100 @@ router.put('/amount-limits', adminAuth, async (req, res) => {
   }
 });
 
+// ── ANNOUNCEMENT BANNER ─────────────────────────────────────────────────────
+// A pinned message shown to every player in chat. Stored as a Setting, so you
+// change it from the admin panel with no redeploy.
+//
+// WHY A SETTING AND NOT A CHAT MESSAGE
+// Posting an announcement as a normal chat message looks equivalent, but it
+// scrolls away within minutes and ChatMessage has a 24h TTL index — the notice
+// would delete itself. A pinned banner outside the message list stays put and
+// stays visible, which is the whole point of an announcement.
+
+// ✅ Push the change to every connected client immediately.
+// Same fire-and-forget pattern as notifyAdmins() in routes/wallet.js: the row is
+// already saved by the time this runs, so a socket problem must never turn a
+// successful save into an error. Without this, players would only see a new
+// announcement after a refresh — and the reason you post one is usually that
+// something needs saying NOW.
+function broadcastAnnouncement(req, payload) {
+  try {
+    const io = req.app.get('io');
+    if (!io) return;   // not wired yet, or running under a test harness
+    io.emit('announcement-updated', payload);
+  } catch (e) {
+    console.error('broadcastAnnouncement failed (non-fatal):', e.message);
+  }
+}
+
+// GET /api/settings/announcement — public
+router.get('/announcement', async (req, res) => {
+  try {
+    const [textRow, enabledRow] = await Promise.all([
+      Setting.findOne({ key: 'announcement_text' }),
+      Setting.findOne({ key: 'announcement_enabled' }),
+    ]);
+    const text = textRow?.value || '';
+    // Enabled defaults to FALSE. A banner that switches itself on at deploy
+    // time and shows an empty box to every player is not a good surprise.
+    const enabled = enabledRow?.value === 'true';
+    res.json({ text, enabled: enabled && !!text.trim() });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/settings/announcement/admin — admin only.
+// Returns the RAW stored values, unlike the public route which hides the text
+// when the banner is off. You need to see your draft in order to edit it.
+router.get('/announcement/admin', adminAuth, async (req, res) => {
+  try {
+    const [textRow, enabledRow] = await Promise.all([
+      Setting.findOne({ key: 'announcement_text' }),
+      Setting.findOne({ key: 'announcement_enabled' }),
+    ]);
+    res.json({
+      text: textRow?.value || '',
+      enabled: enabledRow?.value === 'true',
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/settings/announcement — admin only
+router.post('/announcement', adminAuth, async (req, res) => {
+  try {
+    const rawText = String(req.body?.text ?? '').trim();
+    const enabled = Boolean(req.body?.enabled);
+
+    // 500 chars is about six lines on a phone. Longer than that and the banner
+    // starts eating the chat it is pinned above.
+    if (rawText.length > 500) {
+      return res.status(400).json({ message: 'Announcement must be 500 characters or less' });
+    }
+
+    await Promise.all([
+      Setting.findOneAndUpdate(
+        { key: 'announcement_text' },
+        { key: 'announcement_text', value: rawText },
+        { upsert: true, new: true }
+      ),
+      Setting.findOneAndUpdate(
+        { key: 'announcement_enabled' },
+        { key: 'announcement_enabled', value: String(enabled) },
+        { upsert: true, new: true }
+      ),
+    ]);
+
+    const live = { text: rawText, enabled: enabled && !!rawText };
+    broadcastAnnouncement(req, live);
+
+    res.json({ message: 'Announcement updated', text: rawText, enabled, live: live.enabled });
+  } catch (err) {
+    console.error('announcement save error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 module.exports = router;
