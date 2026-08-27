@@ -4,6 +4,7 @@ const mongoose = require('mongoose');
 const { adminAuth } = require('../middleware/auth');
 const { getWithdrawLimits, saveWithdrawLimits } = require('../utils/withdrawLimit');
 const { getSignupBonus, saveSignupBonus } = require('../utils/signupBonus');
+const { getAmountLimits, saveAmountLimits } = require('../utils/amountLimits');
  
 // Simple Setting schema
 const settingSchema = new mongoose.Schema({
@@ -287,6 +288,74 @@ router.put('/signup-bonus', adminAuth, async (req, res) => {
     res.json({ message: 'Signup bonus updated', ...updated });
   } catch (err) {
     console.error('signup-bonus save error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ── AMOUNT LIMITS (min deposit / min bet / tiered min withdrawal) ───────────
+
+// GET /api/settings/amount-limits — PUBLIC.
+// The wallet and lobby screens need these to show correct figures. Hard-coding
+// "Min: ₹100" in the frontend would keep displaying an old number the moment
+// you change it here, and a wrong minimum on screen produces a rejected
+// request the player can't explain.
+router.get('/amount-limits', async (req, res) => {
+  try {
+    const l = await getAmountLimits();
+    res.json(l);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// GET /api/settings/amount-limits/admin — admin only, cache-bypassing.
+router.get('/amount-limits/admin', adminAuth, async (req, res) => {
+  try {
+    res.json(await getAmountLimits(true));
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/settings/amount-limits — admin only
+router.put('/amount-limits', adminAuth, async (req, res) => {
+  try {
+    const { minDeposit, minBet, minWithdraw, withdrawTierAfter, minWithdrawTier } = req.body;
+
+    // withdrawTierAfter may legitimately be 0 (tiering off); everything else
+    // must be at least 1. A minimum of 0 is not a minimum.
+    const rules = [
+      ['minDeposit',        minDeposit,        1],
+      ['minBet',            minBet,            1],
+      ['minWithdraw',       minWithdraw,       1],
+      ['withdrawTierAfter', withdrawTierAfter, 0],
+      ['minWithdrawTier',   minWithdrawTier,   1],
+    ];
+    for (const [name, val, floor] of rules) {
+      if (val === undefined) continue;
+      const n = Number(val);
+      if (!Number.isInteger(n) || n < floor)
+        return res.status(400).json({ message: `${name} must be a whole number of ${floor} or more` });
+      if (n > 1000000)
+        return res.status(400).json({ message: `${name} is unrealistically large` });
+    }
+
+    // A raised tier that is BELOW the base would silently do nothing — the
+    // resolver takes the base in that case. Catch it here so you find out at
+    // save time rather than wondering why the setting has no effect.
+    const base = minWithdraw !== undefined ? Number(minWithdraw) : (await getAmountLimits()).minWithdraw;
+    const tier = minWithdrawTier !== undefined ? Number(minWithdrawTier) : (await getAmountLimits()).minWithdrawTier;
+    const after = withdrawTierAfter !== undefined ? Number(withdrawTierAfter) : (await getAmountLimits()).withdrawTierAfter;
+    if (after > 0 && tier <= base) {
+      return res.status(400).json({
+        message: `The raised withdrawal minimum (₹${tier}) must be higher than the base (₹${base}), otherwise it has no effect.`,
+      });
+    }
+
+    const updated = await saveAmountLimits({ minDeposit, minBet, minWithdraw, withdrawTierAfter, minWithdrawTier });
+    res.json({ message: 'Amount limits updated', ...updated });
+  } catch (err) {
+    console.error('amount-limits save error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
