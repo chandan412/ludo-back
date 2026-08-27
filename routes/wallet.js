@@ -9,6 +9,7 @@ const {
   releaseWithdrawSlot,
   peekWithdrawSlots,
 } = require('../utils/withdrawLimit');
+const { getAmountLimits, resolveWithdrawMinimum } = require('../utils/amountLimits');
 
 // ============================================================================
 // ✅ notifyAdmins — fire-and-forget push to the admin panel.
@@ -245,8 +246,11 @@ router.get('/transactions', auth, async (req, res) => {
 router.post('/recharge-request', auth, async (req, res) => {
   try {
     const { amount, paymentNote } = req.body;
-    if (!amount || amount < 10)
-      return res.status(400).json({ message: 'Minimum recharge amount is ₹10' });
+
+    // ✅ Minimum deposit is admin-configurable now (was hard-coded ₹10).
+    const limits = await getAmountLimits();
+    if (!amount || amount < limits.minDeposit)
+      return res.status(400).json({ message: `Minimum recharge amount is ₹${limits.minDeposit}` });
 
     const note = String(paymentNote || '').trim();
 
@@ -325,8 +329,24 @@ router.post('/withdraw-request', auth, async (req, res) => {
   try {
     const { amount, bankDetails } = req.body;
     const { accountHolderName, accountNumber, ifscCode, bankName, upiId } = bankDetails || {};
-    if (!amount || amount < 100)
-      return res.status(400).json({ message: 'Minimum withdrawal amount is ₹100' });
+
+    // ✅ TIERED MINIMUM — see utils/amountLimits.js.
+    // The bar rises once a player has been paid out a set number of times, so a
+    // new player's first cash-out stays easy while regulars batch into fewer,
+    // larger payouts. The message explains WHY the number changed; a bare
+    // "minimum is ₹200" reads as a bug to someone who withdrew ₹100 last week.
+    const wMin = await resolveWithdrawMinimum(req.user._id);
+    if (!amount || amount < wMin.min) {
+      const why = wMin.tierApplied
+        ? ` You've completed ${wMin.paidCount} withdrawal${wMin.paidCount === 1 ? '' : 's'},` +
+          ` so your minimum is now ₹${wMin.min}.`
+        : '';
+      return res.status(400).json({
+        message: `Minimum withdrawal amount is ₹${wMin.min}.${why}`,
+        minWithdraw: wMin.min,
+        tierApplied: wMin.tierApplied,
+      });
+    }
     const user = await User.findById(req.user._id);
     // ✅ Bonus is NON-withdrawable. Withdrawable money = real balance minus locks minus the
     // bonus marker. If they try to withdraw into the bonus portion, tell them clearly.
@@ -535,7 +555,18 @@ router.post('/cancel-withdrawal', auth, async (req, res) => {
 router.get('/withdraw-limit', auth, async (req, res) => {
   try {
     const info = await peekWithdrawSlots(req.user._id);
-    res.json(info);
+    // Include the resolved MINIMUM as well, so the wallet screen can show the
+    // real figure for THIS player instead of a hard-coded ₹100 that may be
+    // wrong for them.
+    const wMin = await resolveWithdrawMinimum(req.user._id);
+    res.json({
+      ...info,
+      minWithdraw: wMin.min,
+      minWithdrawBase: wMin.base,
+      tierApplied: wMin.tierApplied,
+      paidWithdrawals: wMin.paidCount,
+      tierAfter: wMin.tierAfter,
+    });
   } catch (err) {
     console.error('withdraw-limit error:', err);
     res.status(500).json({ message: 'Server error' });
