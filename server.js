@@ -12,6 +12,7 @@ const adminRoutes = require('./routes/admin');
 const settingsRoutes = require('./routes/settings');
 const chatRoutes = require('./routes/chat');
 const referralRoutes = require('./routes/referral');
+const analyticsRoutes = require('./routes/analytics');
 const paymentAutomationRoutes = require('./routes/paymentAutomation');
 
 // In-process expiry sweeps. Replaces the n8n schedule trigger,
@@ -189,6 +190,11 @@ app.use(
 app.use(
   '/api/referral',
   referralRoutes
+);
+
+app.use(
+  '/api/analytics',
+  analyticsRoutes
 );
 
 // ============================================================================
