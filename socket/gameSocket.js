@@ -35,6 +35,48 @@ const MOVE_HISTORY_LIMIT = 50;
 const TURN_GRACE_MS = 40 * 1000;   // silent window before the warning fires
 const TURN_FINAL_MS = 150 * 1000;  // warned window before the turn is lost
 
+// ============================================================================
+// ⏳ SLOW-TURN STRIKES — the deliberate-staller rule
+//
+// The timer above only catches TOTAL inaction. Players learned to sit on the
+// clock instead: act at 38 seconds, every single turn, staying just inside the
+// 40s grace so the warning never fires. Legal under the old rule, and it makes
+// a game unbearable for the opponent — who can only escape by pressing Exit,
+// which forfeits their bet. Same griefing incentive as before, one layer down.
+//
+// So: any action slower than SLOW_ACTION_MS earns a strike, and STRIKE_LIMIT
+// strikes loses the game. The staller now pays for the time they take.
+//
+// MEASURED PER ACTION, not per turn — same reasoning as the timer above. Rolling
+// instantly and then sitting on the token stalls just as effectively, and a
+// per-turn measure would miss it entirely.
+//
+// TUNABLE WITHOUT A DEPLOY via Railway env vars. These decide who loses money,
+// so they should be adjustable the moment a value turns out to be wrong.
+// ============================================================================
+const SLOW_ACTION_MS   = parseInt(process.env.SLOW_TURN_MS || 30000, 10);
+const SLOW_STRIKE_LIMIT = parseInt(process.env.SLOW_TURN_STRIKES || 4, 10);
+
+// roomCode -> { counts: { [userId]: n }, touchedAt }
+// In-memory, matching turnTimers. Strikes are per-GAME and a restart forgiving
+// them is the safe direction to fail: worst case a staller gets a clean slate,
+// versus a restart costing an honest player their stake.
+const slowStrikes = new Map();
+
+function bumpStrike(roomCode, userId) {
+  const key = String(roomCode || '').toUpperCase();
+  const uid = String(userId);
+  const entry = slowStrikes.get(key) || { counts: {}, touchedAt: Date.now() };
+  entry.counts[uid] = (entry.counts[uid] || 0) + 1;
+  entry.touchedAt = Date.now();
+  slowStrikes.set(key, entry);
+  return entry.counts[uid];
+}
+
+function clearStrikes(roomCode) {
+  slowStrikes.delete(String(roomCode || '').toUpperCase());
+}
+
 // roomCode -> { graceTimer, finalTimer, userId, token, warned }
 const turnTimers = new Map();
 let turnTokenSeq = 0; // monotonic guard against a stale timer firing after a re-arm
@@ -172,9 +214,129 @@ function armTurnTimer(io, roomCode, userId, { onlyIfAbsent = false } = {}) {
     }
   }, TURN_GRACE_MS);
 
-  turnTimers.set(key, { graceTimer, finalTimer: null, userId: uid, token, warned: false });
+  // armedAt is what the slow-turn rule measures against. wasAway starts false and
+  // is flipped by player-away / disconnect while this player holds the turn — a
+  // window they spent backgrounded or offline is not counted as stalling.
+  turnTimers.set(key, {
+    graceTimer, finalTimer: null, userId: uid, token, warned: false,
+    armedAt: Date.now(), wasAway: false,
+  });
 }
 
+
+// ============================================================================
+// checkSlowAction — call at the START of a validated roll or move.
+//
+// Returns true if the game was ENDED by this call (staller hit the limit), in
+// which case the caller must return immediately and not process the action.
+//
+// WHY IT ENDS THE GAME BEFORE PROCESSING THE MOVE: the alternative is applying
+// the move, emitting token-moved, then emitting game-over a moment later — two
+// conflicting outcomes racing to the same screen, with an animation running
+// between them. Ending first is unambiguous: the player stalled past their last
+// strike, so the turn is not played.
+//
+// MONEY SAFETY: settlement goes through the same ATOMIC status flip every other
+// path uses. If a normal win, forfeit, disconnect or turn-timeout already ended
+// this game, the filter matches nothing and this no-ops rather than paying out
+// twice.
+// ============================================================================
+async function checkSlowAction(io, roomCode, userId, username) {
+  try {
+    const key = String(roomCode || '').toUpperCase();
+    const uid = String(userId);
+    const t = turnTimers.get(key);
+
+    // No armed timer for this player — first action after a join, or a restart
+    // wiped it. Nothing to measure against, so never penalise.
+    if (!t || t.userId !== uid || !t.armedAt) return false;
+
+    const elapsed = Date.now() - t.armedAt;
+    if (elapsed <= SLOW_ACTION_MS) return false;
+
+    // ✅ FAIRNESS GUARD. A player who backgrounded the app or dropped off the
+    // network looks identical to one who is deliberately running the clock — the
+    // elapsed time is the same. Penalising that would take the stake of someone
+    // on weak 4G for something they did not choose. The disconnect path has its
+    // own 60s rule; this one is only for players who were present and idle.
+    if (t.wasAway) return false;
+
+    const strikes = bumpStrike(key, uid);
+    const secs = Math.round(elapsed / 1000);
+
+    // Tell BOTH players every single time. Someone about to lose ₹200 must have
+    // watched it coming three times first — otherwise the first they know of it
+    // is the money being gone, and that arrives as a support message.
+    io.to(key).emit('slow-turn', {
+      roomCode: key,
+      userId:   uid,
+      username: username || 'Player',
+      seconds:  secs,
+      strikes,
+      limit:    SLOW_STRIKE_LIMIT,
+    });
+
+    if (strikes < SLOW_STRIKE_LIMIT) {
+      console.log(`Slow turn: ${username} took ${secs}s in ${key} — strike ${strikes}/${SLOW_STRIKE_LIMIT}`);
+      return false;
+    }
+
+    // ── Limit reached — the staller loses ────────────────────────────────────
+    const finished = await Game.findOneAndUpdate(
+      { roomCode: key, status: 'active', 'players.user': userId },
+      { $set: { status: 'finished', finishedAt: new Date() } },
+      { new: true, projection: { moveHistory: 0 } }
+    ).populate('players.user', 'username');
+    if (!finished) { clearStrikes(key); return false; }
+
+    const loserIdx  = finished.players.findIndex(p => p.user._id.toString() === uid);
+    const winnerIdx = loserIdx === 0 ? 1 : 0;
+    if (loserIdx === -1) { clearStrikes(key); return false; }
+
+    const winnerId = finished.players[winnerIdx].user._id;
+    const loserId  = finished.players[loserIdx].user._id;
+
+    const pot         = finished.betAmount * 2;
+    const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+    const winAmount   = pot - platformFee;
+
+    finished.winner      = winnerId;
+    finished.loser       = loserId;
+    finished.winAmount   = winAmount;
+    finished.platformFee = platformFee;
+    await finished.save();
+
+    try {
+      await settleGame(finished, winnerId, loserId, winAmount, platformFee);
+    } catch (se) {
+      console.error('CRITICAL: settlement failed (slow-turn strikes)', finished._id, se);
+      Game.findByIdAndUpdate(finished._id, { $set: { settlementFailed: true } }).catch(() => {});
+    }
+
+    io.to(key).emit('game-over', {
+      reason:      'slow_play',
+      winner:      { id: winnerId.toString(), username: finished.players[winnerIdx].user.username },
+      loser:       { id: loserId.toString(),  username: finished.players[loserIdx].user.username },
+      winAmount,
+      platformFee,
+      pot,
+      strikes,
+      limit:       SLOW_STRIKE_LIMIT,
+      message:     `${finished.players[loserIdx].user.username} played too slowly ${strikes} times. You win!`,
+    });
+
+    clearTurnTimer(key, io);
+    clearStrikes(key);
+    await syncInviteCard(io, key);
+    console.log(`Slow-play forfeit: ${finished.players[loserIdx].user.username} hit ${strikes} slow turns in ${key} — ${finished.players[winnerIdx].user.username} wins ₹${winAmount}`);
+    return true;
+  } catch (e) {
+    // Never let this break a real move. A missed strike is nothing; a thrown
+    // error inside roll/move would strand the player mid-turn.
+    console.error('checkSlowAction error (non-fatal):', e.message);
+    return false;
+  }
+}
 
 // ============================
 // Per-room lock — serializes game-mutating handlers (roll-dice, move-token)
@@ -959,6 +1121,11 @@ module.exports = (io) => {
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
 
+        // ⏳ Slow-turn strike check. Placed AFTER the turn validation (so a stray
+        // event from the wrong player can never earn someone a strike) and BEFORE
+        // any state change, so a game ended here leaves nothing half-applied.
+        if (await checkSlowAction(io, roomCode, socket.user._id, socket.user.username)) return;
+
         // ✅ ANTI-CHEAT: if a dice value is already committed for this turn (player
         // refreshed or re-emitted roll-dice), DO NOT roll again. Re-send the existing
         // value + valid moves so the UI restores, but the number cannot change.
@@ -1124,6 +1291,10 @@ module.exports = (io) => {
 
         if (game.currentTurn.toString() !== socket.user._id.toString())
           return socket.emit('error', { message: 'Not your turn' });
+
+        // ⏳ Slow-turn strike check — rolling fast and then sitting on the token
+        // stalls exactly as well, so the move is measured too.
+        if (await checkSlowAction(io, roomCode, socket.user._id, socket.user.username)) return;
 
         // ✅ FIX: Capture diceRoll into a local variable FIRST before nulling game.lastDiceRoll
         const diceRoll = game.lastDiceRoll;
@@ -1363,7 +1534,15 @@ module.exports = (io) => {
     socket.on('player-away', ({ roomCode } = {}) => {
       socket._away = true;
       const room = roomCode || socket.currentRoom;
-      if (room) socket.to(room).emit('opponent-away', { username: socket.user.username });
+      // ⏳ If this player currently holds the turn, mark the window as "away" so
+      // the slow-turn rule does not charge them a strike for time spent with the
+      // app backgrounded. They can still lose the turn to the 190s timer — that
+      // rule is unchanged — but they will not accrue strikes for it.
+      if (room) {
+        const t = turnTimers.get(String(room).toUpperCase());
+        if (t && t.userId === socket.user._id.toString()) t.wasAway = true;
+        socket.to(room).emit('opponent-away', { username: socket.user.username });
+      }
     });
 
     socket.on('player-back', ({ roomCode } = {}) => {
@@ -1491,6 +1670,14 @@ module.exports = (io) => {
         // or an unexpected network drop? Drives a calm "away" UI vs a Wi-Fi alarm on
         // the opponent's screen. The 60s reconnect→forfeit window is identical either way.
         const wasAway = socket._away === true;
+
+        // ⏳ Same fairness guard as player-away: a window spent disconnected is
+        // not stalling, whatever the wall clock says.
+        {
+          const t = turnTimers.get(String(socket.currentRoom).toUpperCase());
+          if (t && t.userId === socket.user._id.toString()) t.wasAway = true;
+        }
+
         socket.to(socket.currentRoom).emit('player-disconnected', {
           username: socket.user.username,
           reason: wasAway ? 'away' : 'network',
@@ -1743,6 +1930,13 @@ module.exports = (io) => {
           message: 'Game ended after a server restart — both bets refunded.',
         });
         console.log(`🧹 Orphan active sweep: aborted ${aborted.roomCode}, refunded both (₹${aborted.betAmount} each).`);
+      }
+      // ⏳ Prune slow-turn strike entries for rooms that finished without passing
+      // through a path that cleared them. Piggybacking on the existing sweep
+      // avoids another interval; two hours is far longer than any real game.
+      const strikeCutoff = Date.now() - 2 * 60 * 60 * 1000;
+      for (const [code, entry] of slowStrikes) {
+        if ((entry.touchedAt || 0) < strikeCutoff) slowStrikes.delete(code);
       }
     } catch (e) {
       console.error('orphan active sweep error (non-fatal):', e.message);
