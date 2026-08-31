@@ -8,6 +8,16 @@ const crypto = require('crypto');
 const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
 const { resolveSignupBonus } = require('../utils/signupBonus');
+const otp = require('../utils/otp');
+
+// Client IP behind Railway's proxy. req.ip is the proxy unless trust proxy is
+// set, so the forwarded header is the only reliable source here — and per-IP
+// limiting is what catches one machine cycling through many phone numbers.
+function clientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) return String(fwd).split(',')[0].trim();
+  return req.ip || req.connection?.remoteAddress || '';
+}
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
@@ -31,7 +41,7 @@ async function generateUniqueReferralCode() {
 // ── REGISTER ──────────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, phone, password, referralCode, verificationId } = req.body;
+    const { username, email, phone, password, referralCode, verificationId, phoneToken } = req.body;
     if (!username || !email || !phone || !password)
       return res.status(400).json({ message: 'All fields are required' });
 
@@ -54,7 +64,25 @@ router.post('/register', async (req, res) => {
     // number being registered. Duplicate checks above run first, so a verified number is
     // never wasted on an "already registered" error.
     let phoneVerified = false;
-    if (lineverify.isEnabled()) {
+
+    // ── OTP PATH (Fast2SMS / MSG91) ──────────────────────────────────────────
+    // The browser sends a short-lived token that this server issued only after
+    // the correct code was entered. Re-checking the number INSIDE the token
+    // against the number being registered is the load-bearing line: without it
+    // a token earned by verifying your own phone could create an account on
+    // someone else's.
+    if (otp.isEnabled()) {
+      const verifiedPhone = phoneToken ? otp.readPhoneToken(phoneToken) : null;
+      if (!verifiedPhone)
+        return res.status(400).json({ message: 'Phone verification required', needsPhoneVerification: true });
+      if (otp.toE164(verifiedPhone) !== otp.toE164(phoneTrimmed))
+        return res.status(400).json({ message: 'Verification does not match this number. Please verify again.', needsPhoneVerification: true });
+      phoneVerified = true;
+
+    // ── LEGACY POPUP PATH (LineVerify) ───────────────────────────────────────
+    // Kept so PHONE_VERIFICATION_PROVIDER=off + LineVerify enabled still works,
+    // and so switching back is a variable rather than a redeploy.
+    } else if (lineverify.isEnabled()) {
       if (!verificationId)
         return res.status(400).json({ message: 'Phone verification required', needsPhoneVerification: true });
       try {
@@ -162,6 +190,9 @@ router.post('/register', async (req, res) => {
         if (refErr.code !== 11000) console.error('referral ledger error:', refErr);
       }
     }
+
+    // Burn the verification so one SMS can't create two accounts.
+    if (phoneVerified && otp.isEnabled()) otp.consumeSignupOtp(phoneTrimmed);
 
     const token = generateToken(user._id);
     res.status(201).json({ token, user: user.toSafeObject() });
@@ -347,7 +378,11 @@ router.post('/forgot-reset', async (req, res) => {
 // resulting verification_id to /register, which confirms it before creating the account.
 router.post('/phone/start-signup', async (req, res) => {
   try {
-    if (!lineverify.isEnabled()) return res.json({ enabled: false });
+    // ✅ Neither provider enabled → signup proceeds with no verification. The
+    // frontend reads enabled:false and goes straight to /register, which is how
+    // PHONE_VERIFICATION_ENABLED=false unblocks registration in an emergency
+    // without a code change.
+    if (!otp.isEnabled() && !lineverify.isEnabled()) return res.json({ enabled: false });
 
     const { phone, email, username } = req.body;
     if (!phone) return res.status(400).json({ message: 'Phone number is required' });
@@ -367,9 +402,32 @@ router.post('/phone/start-signup', async (req, res) => {
       return res.status(400).json({ message: 'Account already exists' });
     }
 
+    // ── OTP MODE ─────────────────────────────────────────────────────────────
+    // Duplicate checks above run FIRST on purpose: an SMS costs money, and
+    // spending one to then tell the player their email is already taken wastes
+    // it and annoys them.
+    if (otp.isEnabled()) {
+      const r = await otp.startSignupOtp(phoneTrimmed, clientIp(req));
+      if (!r.ok) {
+        // 429 for the rate-limit reasons so the client can tell "slow down"
+        // apart from "something broke".
+        const code = ['send_limit', 'ip_limit', 'daily_cap'].includes(r.reason) ? 429 : 502;
+        return res.status(code).json({ message: r.message, reason: r.reason });
+      }
+      return res.json({
+        enabled: true,
+        mode: 'otp',
+        resendAfter: r.resendAfter || 60,
+        alreadySent: !!r.alreadySent,
+        length: otp.LIMITS.CODE_LENGTH,
+      });
+    }
+
+    // ── LEGACY POPUP MODE ────────────────────────────────────────────────────
     const result = await lineverify.startVerification(phoneTrimmed, { signup: true });
     res.json({
       enabled: true,
+      mode: 'popup',
       id: result.id,
       verify_url: result.verify_url,
       whatsapp_url: result.whatsapp_url || null,
@@ -377,6 +435,28 @@ router.post('/phone/start-signup', async (req, res) => {
   } catch (err) {
     console.error('phone/start-signup error:', err.message);
     res.status(502).json({ message: 'Could not start verification. Please try again.' });
+  }
+});
+
+// ── VERIFY SIGNUP OTP (no auth — the account does not exist yet) ─────────────
+// Exchanges a correct code for a short-lived token that /register requires.
+// Deliberately does NOT create the account: keeping "prove the number" and
+// "create the account" as separate steps means a failure in the second one
+// doesn't waste the SMS spent on the first.
+router.post('/phone/verify-otp', async (req, res) => {
+  try {
+    if (!otp.isEnabled()) return res.json({ enabled: false, verified: true });
+
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).json({ message: 'Phone and code are required' });
+
+    const r = await otp.verifySignupOtp(String(phone).trim(), code);
+    if (!r.ok) return res.status(400).json({ verified: false, message: r.message });
+
+    res.json({ verified: true, phoneToken: r.phoneToken });
+  } catch (err) {
+    console.error('phone/verify-otp error:', err.message);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
