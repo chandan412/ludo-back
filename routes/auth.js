@@ -118,7 +118,10 @@ router.post('/register', async (req, res) => {
     // withdrawable). See utils/signupBonus.js — a withdrawable welcome bonus is
     // a cash machine, since minting an account costs nothing but a phone
     // number.
-    const bonusAmount = await resolveSignupBonus();
+    // ✅ Referred signups get the lower amount. `referrer` is resolved above from
+    // the referral code, so this is the same signal the referral ledger uses —
+    // the two can't disagree about whether a signup was referred.
+    const bonusAmount = await resolveSignupBonus({ referred: !!referrer });
 
     const user = await User.create({
       username: usernameTrimmed,
