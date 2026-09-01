@@ -387,27 +387,77 @@ router.post('/withdraw-request', auth, async (req, res) => {
       });
     }
 
-    // ✅ Create transaction first, then lock balance (safer if either fails)
+    // ========================================================================
+    // ✅ ATOMIC LOCK, THEN ATOMIC INSERT.
+    //
+    // The previous version did `user.lockedBalance += amount; await user.save()`
+    // — a read-modify-write on a document already read further up. Under
+    // concurrent taps every request read lockedBalance as 0 and wrote the same
+    // value, so three of four locks silently vanished: ₹4,000 of pending
+    // withdrawals sat against a ₹1,000 balance with only ₹1,000 locked.
+    //
+    // Now the lock is a single conditional $inc. The $expr in the FILTER
+    // re-evaluates withdrawable balance against the CURRENT document, inside the
+    // same operation that applies the increment — so the second concurrent
+    // request sees the first one's lock and matches nothing. Over-locking is
+    // arithmetically impossible rather than merely unlikely.
+    // ========================================================================
+    const locked = await User.findOneAndUpdate(
+      {
+        _id: req.user._id,
+        $expr: {
+          $gte: [
+            { $subtract: [
+              '$balance',
+              { $add: [{ $ifNull: ['$lockedBalance', 0] }, { $ifNull: ['$bonusBalance', 0] }] },
+            ] },
+            amount,
+          ],
+        },
+      },
+      { $inc: { lockedBalance: amount } },
+      { new: true }
+    );
+
+    if (!locked) {
+      // Another request claimed the balance between the check above and here.
+      await releaseWithdrawSlot(req.user._id);
+      return res.status(400).json({ message: `Insufficient balance. Available: ₹${available}` });
+    }
+
     let transaction;
     try {
       transaction = await Transaction.create({
         user: req.user._id,
         type: 'withdraw',
         amount,
-        balanceBefore: user.balance,
-        balanceAfter: user.balance,
+        balanceBefore: locked.balance,
+        balanceAfter: locked.balance,
         status: 'pending',
         bankDetails: { accountHolderName, accountNumber, ifscCode, bankName, upiId }
       });
-      user.lockedBalance += amount;
-      await user.save();
     } catch (writeErr) {
-      // The slot was consumed by the claim above but the request does not
-      // exist. Hand it back — otherwise a transient database error silently
-      // costs the player an attempt, and they have no way to know why.
+      // Money first: the lock is already applied, so release it before anything
+      // else. Leaving it would freeze the player's balance with no request to
+      // show for it and no way for them to clear it.
+      await User.updateOne(
+        { _id: req.user._id, lockedBalance: { $gte: amount } },
+        { $inc: { lockedBalance: -amount } }
+      );
       await releaseWithdrawSlot(req.user._id);
+
+      // 11000 = the partial unique index rejected a second pending withdrawal.
+      // This is the guard working, not a fault — report it as the same friendly
+      // message the pre-check gives.
+      if (writeErr.code === 11000) {
+        return res.status(400).json({ message: 'You already have a pending withdrawal request' });
+      }
       throw writeErr;
     }
+
+    // Kept only so the response below can report the post-lock figures.
+    user.balance = locked.balance;
+    user.lockedBalance = locked.lockedBalance;
 
     // ✅ Push to any admin with the panel open — no polling required.
     notifyAdmins(req, {
