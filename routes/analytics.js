@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
+const SignupSource = require('../models/SignupSource');
 const Game = require('../models/Game');
 const { adminAuth } = require('../middleware/auth');
 
@@ -218,6 +219,98 @@ router.get('/recent-days', adminAuth, async (req, res) => {
     res.json({ days, series });
   } catch (err) {
     console.error('recent-days error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ============================================================================
+// GET /api/analytics/signup-sources?days=30
+//
+// Answers "how many players came from Telegram vs referrals" — and, more
+// usefully, how many of each actually deposited and played. Signup counts alone
+// can't tell you whether a channel is worth running: 400 players who never
+// deposit are worth less than 40 who do.
+//
+// OVERLAP IS REPORTED, NOT HIDDEN. Someone can arrive from a Telegram ad AND
+// use a referral code. Silently assigning them to one bucket would make the
+// numbers add up while being wrong; the `both` figure makes it visible.
+// ============================================================================
+router.get('/signup-sources', adminAuth, async (req, res) => {
+  try {
+    const days = Math.min(365, Math.max(1, parseInt(req.query.days || 30, 10)));
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const range = { $gte: since };
+
+    // Referral signups — from the data that already exists. Not re-derived from
+    // SignupSource, so this number can never disagree with the referral system.
+    const referralIds = await User.find({ role: 'player', createdAt: range, referredBy: { $ne: null } })
+      .select('_id').lean();
+    const referralSet = new Set(referralIds.map(u => String(u._id)));
+
+    const sourceRows = await SignupSource.find({ createdAt: range })
+      .select('user source').lean();
+
+    const bySource = {};
+    let both = 0;
+    for (const r of sourceRows) {
+      const key = r.source || 'unknown';
+      bySource[key] = bySource[key] || { source: key, signups: 0, ids: [] };
+      bySource[key].signups += 1;
+      bySource[key].ids.push(r.user);
+      if (referralSet.has(String(r.user))) both += 1;
+    }
+
+    const totalPlayers = await User.countDocuments({ role: 'player', createdAt: range });
+    const taggedIds = new Set(sourceRows.map(r => String(r.user)));
+    const untracked = totalPlayers - new Set([...taggedIds, ...referralSet]).size;
+
+    // For each source: how many deposited, how much, and what they generated in
+    // platform fees. This is the column that decides whether an ad pays.
+    const enrich = async (ids) => {
+      if (!ids.length) return { depositors: 0, deposited: 0, fees: 0, games: 0 };
+      const [dep, fee, games] = await Promise.all([
+        Transaction.aggregate([
+          { $match: { user: { $in: ids }, type: 'recharge', status: { $in: PAID } } },
+          { $group: { _id: '$user', total: { $sum: '$amount' } } },
+        ]),
+        Transaction.aggregate([
+          { $match: { user: { $in: ids }, type: 'platform_fee', status: 'completed' } },
+          { $group: { _id: null, total: { $sum: '$amount' } } },
+        ]),
+        User.aggregate([
+          { $match: { _id: { $in: ids } } },
+          { $group: { _id: null, total: { $sum: '$gamesPlayed' } } },
+        ]),
+      ]);
+      return {
+        depositors: dep.length,
+        deposited: dep.reduce((a, d) => a + d.total, 0),
+        fees: fee[0]?.total || 0,
+        games: games[0]?.total || 0,
+      };
+    };
+
+    const sources = [];
+    for (const key of Object.keys(bySource)) {
+      const e = await enrich(bySource[key].ids);
+      sources.push({ source: key, signups: bySource[key].signups, ...e });
+    }
+
+    const refIdList = referralIds.map(u => u._id);
+    const refStats = await enrich(refIdList);
+    sources.push({ source: 'referral', signups: referralSet.size, ...refStats });
+
+    sources.sort((a, b) => b.signups - a.signups);
+
+    res.json({
+      days,
+      totalPlayers,
+      untracked: Math.max(0, untracked),
+      both,
+      sources,
+    });
+  } catch (err) {
+    console.error('signup-sources error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
