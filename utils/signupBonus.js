@@ -41,6 +41,15 @@ const Setting = mongoose.models.Setting || mongoose.model('Setting', settingSche
 const KEYS = {
   enabled: 'signup_bonus_enabled',
   amount:  'signup_bonus_amount',
+  // ✅ Separate amount for signups that arrived via a referral code.
+  //
+  // The two are not the same kind of signup. A player from a Telegram ad cost
+  // you ad spend and is a stranger; a referred player was introduced by someone
+  // already collecting a referral reward for them. Paying both the same made
+  // the referred route the cheapest way to manufacture accounts — the farmer
+  // gets the referral reward AND a full signup bonus on every account they
+  // create. Splitting the amounts prices that difference in.
+  referralAmount: 'signup_bonus_referral_amount',
 };
 
 const DEFAULTS = {
@@ -48,6 +57,7 @@ const DEFAULTS = {
   // handing out money before anyone chose an amount is not a good surprise.
   enabled: String(process.env.SIGNUP_BONUS_ENABLED || 'false') === 'true',
   amount:  parseInt(process.env.SIGNUP_BONUS_AMOUNT || 0, 10),
+  referralAmount: parseInt(process.env.SIGNUP_BONUS_REFERRAL_AMOUNT || 0, 10),
 };
 
 let cache = null;
@@ -68,6 +78,12 @@ async function getSignupBonus(force = false) {
     cache = {
       enabled: map[KEYS.enabled] === undefined ? DEFAULTS.enabled : map[KEYS.enabled] === 'true',
       amount:  Math.max(0, toInt(map[KEYS.amount], DEFAULTS.amount)),
+      // Falls back to the main amount when never configured, so deploying this
+      // changes nothing until you set a different figure — referred players
+      // keep getting exactly what they got before.
+      referralAmount: map[KEYS.referralAmount] === undefined
+        ? Math.max(0, toInt(map[KEYS.amount], DEFAULTS.amount))
+        : Math.max(0, toInt(map[KEYS.referralAmount], DEFAULTS.referralAmount)),
     };
     cacheAt = Date.now();
   } catch (e) {
@@ -76,7 +92,7 @@ async function getSignupBonus(force = false) {
     // that silently starts paying an unintended amount to every new account is
     // worse than one that pays nothing; nobody is harmed by a missing bonus,
     // and it is trivially fixed by registering again later.
-    cache = { enabled: false, amount: 0 };
+    cache = { enabled: false, amount: 0, referralAmount: 0 };
     cacheAt = Date.now();
   }
   return cache;
@@ -88,6 +104,8 @@ async function saveSignupBonus(patch) {
     ops.push({ key: KEYS.enabled, value: String(Boolean(patch.enabled)) });
   if (patch.amount !== undefined)
     ops.push({ key: KEYS.amount, value: String(Math.max(0, toInt(patch.amount, DEFAULTS.amount))) });
+  if (patch.referralAmount !== undefined)
+    ops.push({ key: KEYS.referralAmount, value: String(Math.max(0, toInt(patch.referralAmount, DEFAULTS.referralAmount))) });
 
   for (const op of ops) {
     await Setting.findOneAndUpdate({ key: op.key }, op, { upsert: true, new: true });
@@ -103,11 +121,15 @@ async function saveSignupBonus(patch) {
 // the User.create() call rather than doing a second write, so a brand new
 // account is never briefly visible with the wrong balance.
 // ============================================================================
-async function resolveSignupBonus() {
+async function resolveSignupBonus(opts = {}) {
   try {
     const s = await getSignupBonus();
-    if (!s.enabled || s.amount <= 0) return 0;
-    return s.amount;
+    if (!s.enabled) return 0;
+    // `referred: true` -> the lower amount. Called with no argument anywhere
+    // that predates this change, which resolves to the standard amount, so
+    // nothing silently shifts.
+    const amount = opts.referred ? s.referralAmount : s.amount;
+    return amount > 0 ? amount : 0;
   } catch (e) {
     console.error('resolveSignupBonus error (crediting 0):', e.message);
     return 0;
