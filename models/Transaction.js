@@ -71,4 +71,36 @@ transactionSchema.index({ status: 1, createdAt: -1 });
 transactionSchema.index({ type: 1, createdAt: -1 });
 transactionSchema.index({ createdAt: -1 });
 
+// ============================================================================
+// ✅ ONE PENDING WITHDRAWAL PER PLAYER — enforced by MongoDB, not by code.
+//
+// The route already checked for an existing pending request, but that check was
+// a READ followed later by a WRITE with several awaits in between. Five taps
+// 100ms apart all read "no pending request" and four of them created one:
+// ₹4,000 of pending withdrawals against a ₹1,000 balance, any of which an admin
+// could have approved.
+//
+// A partial unique index closes it at the only layer that can't be raced. Two
+// concurrent inserts hit the same index entry and MongoDB rejects the second
+// with duplicate-key error 11000 — which the route catches and turns into the
+// normal "you already have a pending request" message.
+//
+// The partialFilterExpression is what makes this workable: uniqueness applies
+// ONLY to withdrawals that are currently pending. Approved, rejected and
+// cancelled rows are outside the filter, so a player can withdraw again once
+// the first request is resolved, and their history is unaffected.
+//
+// ⚠️ DEPLOY NOTE: if any player currently has more than one pending withdrawal,
+// this index will FAIL TO BUILD and Mongoose logs the error at startup. Clean
+// duplicates first — see the query in the deploy notes.
+// ============================================================================
+transactionSchema.index(
+  { user: 1 },
+  {
+    unique: true,
+    name: 'one_pending_withdraw_per_user',
+    partialFilterExpression: { type: 'withdraw', status: 'pending' },
+  }
+);
+
 module.exports = mongoose.model('Transaction', transactionSchema);
