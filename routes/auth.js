@@ -9,6 +9,7 @@ const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
 const { resolveSignupBonus } = require('../utils/signupBonus');
 const otp = require('../utils/otp');
+const SignupSource = require('../models/SignupSource');
 
 // Client IP behind Railway's proxy. req.ip is the proxy unless trust proxy is
 // set, so the forwarded header is the only reliable source here — and per-IP
@@ -41,7 +42,7 @@ async function generateUniqueReferralCode() {
 // ── REGISTER ──────────────────────────────────────────────────────────────────
 router.post('/register', async (req, res) => {
   try {
-    const { username, email, phone, password, referralCode, verificationId, phoneToken } = req.body;
+    const { username, email, phone, password, referralCode, verificationId, phoneToken, source, campaign } = req.body;
     if (!username || !email || !phone || !password)
       return res.status(400).json({ message: 'All fields are required' });
 
@@ -188,6 +189,26 @@ router.post('/register', async (req, res) => {
         // exists — impossible in practice since the account was just created,
         // but if it ever happens it is precisely the protection working.
         if (refErr.code !== 11000) console.error('referral ledger error:', refErr);
+      }
+    }
+
+    // ✅ Record where this signup came from — but ONLY when it isn't a referral.
+    // Referrals are already counted by referredBy and the Referral ledger;
+    // writing them here too would produce a second number that can drift from
+    // the first, and then neither can be trusted.
+    //
+    // Non-fatal by design: the account exists, and an analytics write must never
+    // be the thing that turns a completed signup into an error the player sees.
+    if (!referrer && source) {
+      const clean = String(source).toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
+      if (clean) {
+        SignupSource.create({
+          user: user._id,
+          source: clean,
+          campaign: String(campaign || '').slice(0, 60),
+        }).catch(e => {
+          if (e.code !== 11000) console.error('signup source write failed (non-fatal):', e.message);
+        });
       }
     }
 
