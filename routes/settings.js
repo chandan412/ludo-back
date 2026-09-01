@@ -252,7 +252,10 @@ router.put('/withdraw-limits', adminAuth, async (req, res) => {
 router.get('/signup-bonus', async (req, res) => {
   try {
     const s = await getSignupBonus();
-    res.json({ enabled: s.enabled, amount: s.amount });
+    // Both amounts are public so the register page can show the correct figure
+    // the moment a referral code is typed, instead of promising one number and
+    // crediting another.
+    res.json({ enabled: s.enabled, amount: s.amount, referralAmount: s.referralAmount });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -271,7 +274,16 @@ router.get('/signup-bonus/admin', adminAuth, async (req, res) => {
 // PUT /api/settings/signup-bonus — admin only
 router.put('/signup-bonus', adminAuth, async (req, res) => {
   try {
-    const { enabled, amount } = req.body;
+    const { enabled, amount, referralAmount } = req.body;
+
+    for (const [label, val] of [['Bonus amount', amount], ['Referral signup bonus', referralAmount]]) {
+      if (val === undefined) continue;
+      const n = Number(val);
+      if (!Number.isInteger(n) || n < 0)
+        return res.status(400).json({ message: `${label} must be a whole number of 0 or more` });
+      if (n > 10000)
+        return res.status(400).json({ message: `${label} looks too large — maximum is 10,000` });
+    }
 
     if (amount !== undefined) {
       const n = Number(amount);
@@ -284,7 +296,7 @@ router.put('/signup-bonus', adminAuth, async (req, res) => {
         return res.status(400).json({ message: 'Bonus amount looks too large — maximum is 10,000' });
     }
 
-    const updated = await saveSignupBonus({ enabled, amount });
+    const updated = await saveSignupBonus({ enabled, amount, referralAmount });
     res.json({ message: 'Signup bonus updated', ...updated });
   } catch (err) {
     console.error('signup-bonus save error:', err);
