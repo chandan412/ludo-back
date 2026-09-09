@@ -944,6 +944,8 @@ function sanitizeGame(game, userId) {
 // ============================
 // Main socket module
 // ============================
+console.log('🔧 GAMESOCKET_BUILD: ban-forfeit + chat-rate-limit v1 loaded');
+
 module.exports = (io) => {
 
   // Auth middleware
