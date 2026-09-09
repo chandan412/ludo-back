@@ -392,6 +392,39 @@ const chatSockets = new Set(); // socket ids currently in chat — used for the 
 const ChatMessage = require('../models/ChatMessage');
 
 // ============================================================================
+// ✅ CHAT RATE LIMIT — max CHAT_RATE_LIMIT messages per CHAT_RATE_WINDOW_MS,
+// per user (not per socket, so it survives a refresh mid-burst).
+//
+// Sliding window, not a hard "3 then locked for 30s from message #1": each
+// user gets a fresh 30s window the moment their previous window has fully
+// elapsed. Sending a 4th message inside an active window is REJECTED outright
+// (not queued, not delayed, not silently dropped) — they get an 'error' event
+// telling them how many seconds remain, so the input box isn't silently eating
+// keystrokes with no feedback.
+//
+// In-memory, matching the slowStrikes/turnTimers pattern already used in this
+// file. Pruned on the same periodic sweep at the bottom (see ORPHAN_SWEEP).
+// ============================================================================
+const CHAT_RATE_LIMIT     = 3;
+const CHAT_RATE_WINDOW_MS = 30 * 1000;
+const chatRateLimits = new Map(); // userId -> { count, windowStart }
+
+function checkChatRateLimit(userId) {
+  const uid = String(userId);
+  const now = Date.now();
+  const entry = chatRateLimits.get(uid);
+  if (!entry || now - entry.windowStart >= CHAT_RATE_WINDOW_MS) {
+    chatRateLimits.set(uid, { count: 1, windowStart: now });
+    return { limited: false };
+  }
+  if (entry.count < CHAT_RATE_LIMIT) {
+    entry.count += 1;
+    return { limited: false };
+  }
+  return { limited: true, retryAfterMs: CHAT_RATE_WINDOW_MS - (now - entry.windowStart) };
+}
+
+// ============================================================================
 // Helper: syncInviteCard — SINGLE SOURCE OF TRUTH for an invite card's state
 //
 // Every invite posted in global chat is a ChatMessage with type:'invite' and a
@@ -600,6 +633,89 @@ function isUserLiveInRoom(io, roomCode, userId) {
     if (s && s.user && s.user._id && s.user._id.toString() === userId.toString()) return true;
   }
   return false;
+}
+
+// ============================================================================
+// ✅ getLiveSocketsForUser — every currently-connected socket for a user,
+// across ALL rooms (chat-only, in a game, or both). Unlike isUserLiveInRoom
+// (which is scoped to one room), this is used by admin ban to find and kill
+// EVERY session this user currently has open, wherever it is.
+// ============================================================================
+function getLiveSocketsForUser(io, userId) {
+  const uid = String(userId);
+  const matches = [];
+  for (const [, s] of io.sockets.sockets) {
+    if (s.user && s.user._id && s.user._id.toString() === uid) matches.push(s);
+  }
+  return matches;
+}
+
+// ============================================================================
+// ✅ forfeitPlayerFromGame — used by admin ban to end this player's ACTIVE
+// game immediately: opponent wins the pot, same settlement as a normal
+// forfeit. Does NOT touch a 'waiting' room the player created (no opponent to
+// award a win to) — that's left to the existing disconnect grace/abort path,
+// which will refund it once their socket (force-closed on ban) disconnects.
+//
+// MONEY SAFETY: identical atomic guard to the player-initiated 'forfeit'
+// handler below — flips active→finished only if the game is STILL active, so
+// this can never double-settle against a normal win, a timeout, or a
+// disconnect that beat it to the punch.
+// ============================================================================
+async function forfeitPlayerFromGame(io, userId, reason = 'banned') {
+  try {
+    const game = await Game.findOneAndUpdate(
+      { status: 'active', 'players.user': userId },
+      { $set: { status: 'finished', finishedAt: new Date() } },
+      { new: true, projection: { moveHistory: 0 } }
+    ).populate('players.user', 'username');
+
+    if (!game) return false; // no active game for this user right now
+
+    const loserIdx  = game.players.findIndex(p => p.user._id.toString() === String(userId));
+    const winnerIdx = loserIdx === 0 ? 1 : 0;
+    if (loserIdx === -1) return false; // shouldn't happen given the query filter, but never trust it blindly
+
+    const winnerId = game.players[winnerIdx].user._id;
+    const loserId  = game.players[loserIdx].user._id;
+
+    const pot         = game.betAmount * 2;
+    const platformFee = Math.floor(pot * (parseInt(process.env.PLATFORM_FEE_PERCENT || 5) / 100));
+    const winAmount   = pot - platformFee;
+
+    game.winner      = winnerId;
+    game.loser       = loserId;
+    game.forfeitedBy = loserId;
+    game.winAmount   = winAmount;
+    game.platformFee = platformFee;
+    await game.save();
+
+    try {
+      await settleGame(game, winnerId, loserId, winAmount, platformFee);
+    } catch (se) {
+      console.error('CRITICAL: settlement failed (admin ban forfeit)', game._id, se);
+      Game.findByIdAndUpdate(game._id, { $set: { settlementFailed: true } }).catch(() => {});
+    }
+
+    io.to(game.roomCode).emit('game-over', {
+      reason:      'banned',
+      winner:      { id: winnerId.toString(), username: game.players[winnerIdx].user.username },
+      loser:       { id: loserId.toString(),  username: game.players[loserIdx].user.username },
+      winAmount,
+      platformFee,
+      pot,
+      message:     `${game.players[loserIdx].user.username} was banned. You win!`,
+    });
+
+    clearTurnTimer(game.roomCode, io);
+    await syncInviteCard(io, game.roomCode);
+
+    console.log(`Admin ban forfeit: ${game.players[loserIdx].user.username} banned mid-game in ${game.roomCode} — ${game.players[winnerIdx].user.username} wins ₹${winAmount}`);
+    return true;
+  } catch (e) {
+    console.error('forfeitPlayerFromGame error:', e);
+    return false;
+  }
 }
 
 // Re-arm the 60s forfeit/refund window for an ACTIVE game based on who is ACTUALLY
@@ -873,6 +989,22 @@ module.exports = (io) => {
       try {
         const clean = (text || '').toString().trim().slice(0, 200);
         if (!clean) return;
+
+        // ✅ RATE LIMIT: max CHAT_RATE_LIMIT messages per CHAT_RATE_WINDOW_MS
+        // per user. Checked before anything is written or broadcast — a
+        // limited message never reaches the database and never reaches other
+        // players. The sender gets an 'error' event with how long to wait.
+        const rl = checkChatRateLimit(socket.user._id);
+        if (rl.limited) {
+          const secondsLeft = Math.ceil(rl.retryAfterMs / 1000);
+          socket.emit('error', {
+            code: 'CHAT_RATE_LIMITED',
+            message: `You're sending messages too fast. Wait ${secondsLeft}s.`,
+            retryAfterMs: rl.retryAfterMs,
+          });
+          return;
+        }
+
         const msg = await ChatMessage.create({
           userId:   socket.user._id,
           username: socket.user.username,
@@ -1938,9 +2070,31 @@ module.exports = (io) => {
       for (const [code, entry] of slowStrikes) {
         if ((entry.touchedAt || 0) < strikeCutoff) slowStrikes.delete(code);
       }
+      // ✅ Prune chat rate-limit entries the same way — bounded memory for
+      // users who sent a couple of messages once and never came back.
+      const chatRlCutoff = Date.now() - 5 * 60 * 1000;
+      for (const [uid, entry] of chatRateLimits) {
+        if ((entry.windowStart || 0) < chatRlCutoff) chatRateLimits.delete(uid);
+      }
     } catch (e) {
       console.error('orphan active sweep error (non-fatal):', e.message);
     }
   }, ORPHAN_SWEEP_INTERVAL_MS);
 
 }; // end module.exports
+
+// ============================================================================
+// ✅ EXPORTED HELPERS — used by routes/admin.js so the admin ban action reuses
+// the exact same, already-tested settlement/timer/invite-card logic instead of
+// a second copy of it living in the routes file. `module.exports` above is the
+// function server.js calls as `gameSocket(io)`; attaching properties to it
+// (functions are objects) lets admin.js do:
+//     const { forfeitPlayerFromGame, getLiveSocketsForUser } = require('../socket/gameSocket');
+// without any circular-require risk, since admin.js never needs the `io`
+// instance from this module — it gets `io` from `req.app.get('io')` instead.
+// ============================================================================
+module.exports.settleGame            = settleGame;
+module.exports.clearTurnTimer        = clearTurnTimer;
+module.exports.syncInviteCard        = syncInviteCard;
+module.exports.forfeitPlayerFromGame = forfeitPlayerFromGame;
+module.exports.getLiveSocketsForUser = getLiveSocketsForUser;
