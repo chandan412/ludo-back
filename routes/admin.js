@@ -4,6 +4,13 @@ const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Game = require('../models/Game');
 const { adminAuth } = require('../middleware/auth');
+// ✅ Reuses the already-tested settlement/disconnect helpers from the socket
+// layer instead of re-implementing forfeit/settlement logic here. Safe to
+// require at module load time: this file never needs the `io` instance FROM
+// this module (that comes from req.app.get('io') per-request), so there is no
+// circular-require timing issue — by the time any request reaches ban-player,
+// gameSocket.js has already been fully evaluated at server startup regardless.
+const { forfeitPlayerFromGame, getLiveSocketsForUser } = require('../socket/gameSocket');
 
 // ============================================================================
 // GET /api/admin/players
@@ -337,14 +344,71 @@ router.get('/all-transactions', adminAuth, async (req, res) => {
   }
 });
 
+// ============================================================================
 // POST /api/admin/ban-player
+//
+// ⚠️ FIXED: banning previously only flipped `isBanned: true` in the database.
+// The socket auth middleware in gameSocket.js checks `isBanned`, but ONLY at
+// the moment a socket first connects — so a player who was ALREADY connected
+// when banned kept their live socket fully working (chat, and any active
+// game) until it happened to disconnect on its own. Only their NEXT connection
+// attempt would actually be blocked. That's what let a banned player keep
+// chatting.
+//
+// Now, in the same request:
+//   1. Flip isBanned (unchanged from before).
+//   2. If they're in an ACTIVE game right now, forfeit it immediately — the
+//      opponent wins the pot, via the exact same settlement path a normal
+//      forfeit uses (forfeitPlayerFromGame reuses settleGame(), the atomic
+//      active→finished guard, clearTurnTimer, and syncInviteCard — no new
+//      money logic written here).
+//   3. Find every live socket this user currently has open (chat-only, in a
+//      game, or both) and force-disconnect them, after telling them why.
+//
+// A 'waiting' room (created, no opponent yet) is deliberately NOT touched
+// here — there's no opponent to award a win to. It's left to the existing
+// disconnect grace/abort path, which will refund it once the forced
+// disconnect above actually fires.
+// ============================================================================
 router.post('/ban-player', adminAuth, async (req, res) => {
   try {
     const { userId } = req.body;
     const user = await User.findByIdAndUpdate(userId, { isBanned: true }, { new: true }).select('-password');
     if (!user) return res.status(404).json({ message: 'Player not found' });
-    res.json({ message: `${user.username} has been banned`, user });
+
+    const io = req.app.get('io');
+    let forfeited = false;
+
+    if (io) {
+      try {
+        forfeited = await forfeitPlayerFromGame(io, user._id, 'banned');
+      } catch (e) {
+        console.error('ban-player forfeit error (non-fatal):', e.message);
+      }
+
+      try {
+        const liveSockets = getLiveSocketsForUser(io, user._id);
+        for (const s of liveSockets) {
+          s.emit('banned', { message: 'Your account has been banned by an admin.' });
+          s.disconnect(true);
+        }
+      } catch (e) {
+        console.error('ban-player disconnect error (non-fatal):', e.message);
+      }
+    } else {
+      // Should never happen (server.js sets this at startup) — but if the io
+      // instance is somehow unavailable, the ban itself has still gone through
+      // (isBanned is already saved above), so log loudly rather than fail the
+      // whole request.
+      console.error('ban-player: io instance not available on req.app — live session was NOT force-disconnected');
+    }
+
+    res.json({
+      message: `${user.username} has been banned${forfeited ? ' (active game forfeited)' : ''}`,
+      user,
+    });
   } catch (err) {
+    console.error('ban-player error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
