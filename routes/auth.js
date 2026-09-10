@@ -312,25 +312,36 @@ router.post('/fcm-token', auth, async (req, res) => {
   }
 });
 
-// ── FORGOT PASSWORD: STEP 1 — VERIFY IDENTITY ──────────────────────────────────
-// User provides registered phone + email. If BOTH match the same account, we issue
-// a short-lived (15-min) reset token. No email/SMS is sent — verification is by
-// matching the two stored fields, then the user sets a new password directly.
-router.post('/forgot-verify', async (req, res) => {
+// ============================================================================
+// ── FORGOT PASSWORD: STEP 1 — SEND OTP ──────────────────────────────────────
+//
+// ⚠️ REPLACES the old email+phone-match /forgot-verify. Email is no longer
+// part of password reset at all — identity is proven by receiving an OTP on
+// the phone NUMBER ALREADY ON THE ACCOUNT, the same way signup proves phone
+// ownership (utils/otp.js, purpose='password_reset' — see that file for why
+// it shares the daily/IP caps with signup but never shares a row or cooldown).
+//
+// The account lookup happens BEFORE spending an SMS, same order as
+// /phone/start-signup: telling someone "no account with that number" costs
+// nothing, telling them via a wasted text message costs money for no reason.
+// ============================================================================
+router.post('/forgot/send-otp', async (req, res) => {
   try {
-    const { phone, email } = req.body;
-    if (!phone || !email) {
-      return res.status(400).json({ message: 'Phone and email are both required' });
+    if (!otp.isEnabled()) {
+      return res.status(503).json({
+        message: 'Password reset by OTP is not available right now. Please contact support.',
+        contactAdmin: true,
+      });
     }
 
-    const normEmail = String(email).trim().toLowerCase();
-    const normPhone = String(phone).trim();
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Phone number is required' });
+    const phoneTrimmed = String(phone).trim();
 
-    // Both must belong to the SAME user
-    const user = await User.findOne({ phone: normPhone, email: normEmail });
+    const user = await User.findOne({ phone: phoneTrimmed });
     if (!user) {
       return res.status(404).json({
-        message: "Phone and email don't match any account",
+        message: "No account found with this phone number",
         contactAdmin: true,
       });
     }
@@ -338,23 +349,66 @@ router.post('/forgot-verify', async (req, res) => {
       return res.status(403).json({ message: 'Account is banned. Contact admin.' });
     }
 
-    // Short-lived token scoped specifically to password reset for this user.
-    // The `pwReset` flag + `pwHash` binding ensures it can't be used as a login token
-    // and is invalidated the moment the password actually changes.
+    const r = await otp.startPasswordResetOtp(phoneTrimmed, clientIp(req));
+    if (!r.ok) {
+      const code = ['send_limit', 'ip_limit', 'daily_cap'].includes(r.reason) ? 429 : 502;
+      return res.status(code).json({ message: r.message, reason: r.reason });
+    }
+
+    res.json({
+      enabled: true,
+      resendAfter: r.resendAfter || 60,
+      alreadySent: !!r.alreadySent,
+      length: otp.LIMITS.CODE_LENGTH,
+    });
+  } catch (err) {
+    console.error('forgot/send-otp error:', err.message);
+    res.status(502).json({ message: 'Could not send verification code. Please try again.' });
+  }
+});
+
+// ============================================================================
+// ── FORGOT PASSWORD: STEP 2 — VERIFY OTP ────────────────────────────────────
+//
+// On a correct code, mints the resetToken in the EXACT SAME shape the
+// pre-existing /forgot-reset endpoint below already expects
+// ({ id, pwReset: true, pwHash }) — so /forgot-reset needed ZERO changes.
+// The OTP row is burned immediately after success so one code can't be reused.
+// ============================================================================
+router.post('/forgot/verify-otp', async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) return res.status(400).json({ message: 'Phone and code are required' });
+    const phoneTrimmed = String(phone).trim();
+
+    const r = await otp.verifyPasswordResetOtp(phoneTrimmed, code);
+    if (!r.ok) return res.status(400).json({ verified: false, message: r.message });
+
+    // Fresh lookup (not reused from send-otp) so the token binds to the
+    // CURRENT password hash, same care /forgot-verify used to take.
+    const user = await User.findOne({ phone: phoneTrimmed });
+    if (!user) return res.status(404).json({ message: 'Account not found' });
+    if (user.isBanned) return res.status(403).json({ message: 'Account is banned. Contact admin.' });
+
+    await otp.consumePasswordResetOtp(phoneTrimmed);
+
     const resetToken = jwt.sign(
       { id: user._id, pwReset: true, pwHash: user.password.slice(-10) },
       process.env.JWT_SECRET,
       { expiresIn: '15m' }
     );
 
-    res.json({ resetToken, message: 'Identity verified' });
+    res.json({ resetToken, message: 'Phone verified' });
   } catch (err) {
-    console.error('forgot-verify error:', err);
+    console.error('forgot/verify-otp error:', err.message);
     res.status(500).json({ message: 'Server error' });
   }
 });
 
-// ── FORGOT PASSWORD: STEP 2 — RESET ─────────────────────────────────────────────
+// ── FORGOT PASSWORD: STEP 3 — RESET ─────────────────────────────────────────────
+// ✅ UNCHANGED. Only ever consumes a resetToken of the shape minted above — it
+// has no idea whether that token came from an OTP flow, the old email+phone
+// flow, or anything else, so nothing here needed to change when step 1 did.
 router.post('/forgot-reset', async (req, res) => {
   try {
     const { resetToken, newPassword } = req.body;
