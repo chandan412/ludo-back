@@ -65,11 +65,23 @@ function getSender() {
   return null;
 }
 
+// ============================================================================
+// ✅ SHARED INTERNAL IMPLEMENTATION — startSignupOtp/verifySignupOtp and
+// startPasswordResetOtp/verifyPasswordResetOtp are thin wrappers around these
+// two functions, parameterized by `purpose`. This is what makes the two flows
+// share the SAME daily cap, per-IP cap, resend-cooldown and attempt-limit
+// logic without copy-pasting it — a fix or a tuned limit here covers both
+// purposes automatically, and there is only one place this logic can drift.
+//
+// signup's public behavior is UNCHANGED: startSignupOtp/verifySignupOtp call
+// these with purpose='signup', identical to what they did inline before.
+// ============================================================================
+
 /**
- * Start (or resend) a signup OTP.
+ * Start (or resend) an OTP for the given purpose ('signup' | 'password_reset').
  * Returns { ok, reason?, message?, resendAfter?, alreadySent? }
  */
-async function startSignupOtp(phoneRaw, ip = '') {
+async function _startOtp(phoneRaw, ip, purpose) {
   const phone = toE164(phoneRaw);
   const now = Date.now();
 
@@ -78,11 +90,7 @@ async function startSignupOtp(phoneRaw, ip = '') {
     return { ok: false, reason: 'not_configured', message: 'Verification is not configured.' };
   }
 
-  // ── Daily platform ceiling ────────────────────────────────────────────────
-  // The single most important line in this file. Pumping attacks don't cost 15%
-  // more than normal — they cost 10x, overnight, while you're asleep. This
-  // turns the worst case from a ₹20,000 morning into a capped one. Deliberately
-  // checked FIRST, before any per-number logic.
+  // ── Daily platform ceiling (shared across ALL purposes, deliberately) ────
   const since = new Date(now - 24 * 60 * 60 * 1000);
   const todaySends = await OtpRequest.countDocuments({ createdAt: { $gte: since } });
   if (todaySends >= DAILY_CAP) {
@@ -90,9 +98,7 @@ async function startSignupOtp(phoneRaw, ip = '') {
     return { ok: false, reason: 'daily_cap', message: 'Verification is temporarily unavailable. Please try again later.' };
   }
 
-  // ── Per-IP ceiling ────────────────────────────────────────────────────────
-  // Catches one machine cycling through many numbers, which the per-phone limit
-  // below cannot see at all.
+  // ── Per-IP ceiling (also shared across purposes) ─────────────────────────
   if (ip) {
     const ipSends = await OtpRequest.countDocuments({ ip, createdAt: { $gte: new Date(now - WINDOW_MS) } });
     if (ipSends >= MAX_IP_PER_HR) {
@@ -100,16 +106,11 @@ async function startSignupOtp(phoneRaw, ip = '') {
     }
   }
 
-  const existing = await OtpRequest.findOne({ phone, purpose: 'signup', consumedAt: null })
+  const existing = await OtpRequest.findOne({ phone, purpose, consumedAt: null })
     .sort({ createdAt: -1 });
 
   if (existing) {
     // ── Resend cooldown — the cheapest saving available ─────────────────────
-    // A player who taps Resend twice, or double-taps the button, would
-    // otherwise buy a second SMS for nothing. Returning the EXISTING code
-    // rather than minting a new one means the message they already received is
-    // still the right one — regenerating would invalidate a code that may be
-    // sitting on their screen.
     const sinceSent = now - new Date(existing.lastSentAt).getTime();
     if (sinceSent < RESEND_COOLDOWN) {
       return {
@@ -145,7 +146,7 @@ async function startSignupOtp(phoneRaw, ip = '') {
     if (ip) existing.ip = ip;
     await existing.save();
   } else {
-    await OtpRequest.create({ phone, purpose: 'signup', codeHash, ip, expiresAt, sends: 1 });
+    await OtpRequest.create({ phone, purpose, codeHash, ip, expiresAt, sends: 1 });
   }
 
   const sent = await sender.sendOtp(to10(phone), code);
@@ -157,18 +158,20 @@ async function startSignupOtp(phoneRaw, ip = '') {
 }
 
 /**
- * Check a submitted code. On success returns a short-lived signed token proving
- * this phone was verified — /register requires it and re-checks the number.
+ * Check a submitted code for the given purpose. On success returns a
+ * short-lived signed token proving this phone was verified FOR THAT PURPOSE —
+ * `tokenPurpose` is embedded in the JWT so a token minted for signup can never
+ * be replayed to verify a password reset, or vice versa (readPhoneToken only
+ * accepts 'signup_phone'; readPasswordResetPhoneToken only accepts
+ * 'password_reset_phone').
  */
-async function verifySignupOtp(phoneRaw, code) {
+async function _verifyOtp(phoneRaw, code, purpose, tokenPurpose) {
   const phone = toE164(phoneRaw);
-  const row = await OtpRequest.findOne({ phone, purpose: 'signup', consumedAt: null })
+  const row = await OtpRequest.findOne({ phone, purpose, consumedAt: null })
     .sort({ createdAt: -1 });
 
   if (!row) return { ok: false, message: 'No code found. Please request a new one.' };
 
-  // Code lifetime is shorter than the row's TTL — the row sticks around so the
-  // send counter still means something, but the CODE itself expires sooner.
   if (Date.now() - new Date(row.lastSentAt).getTime() > CODE_TTL_MS) {
     return { ok: false, message: 'Code expired. Please request a new one.' };
   }
@@ -199,18 +202,39 @@ async function verifySignupOtp(phoneRaw, code) {
   row.verifiedAt = new Date();
   await row.save();
 
-  // Stateless proof of ownership, bound to this number and short-lived. The
-  // browser holds it only between "code accepted" and "account created", which
-  // is seconds — and /register re-checks that the number inside the token is
-  // the number being registered, so a token for one phone can't create an
-  // account on another.
   const phoneToken = jwt.sign(
-    { phone, purpose: 'signup_phone' },
+    { phone, purpose: tokenPurpose },
     process.env.JWT_SECRET,
     { expiresIn: '15m' }
   );
 
   return { ok: true, phoneToken };
+}
+
+// Burn a row once its purpose's job is done, so the same verification can't be
+// replayed. Generic over purpose — consumeSignupOtp below is a thin wrapper.
+async function _consumeOtp(phoneRaw, purpose) {
+  try {
+    await OtpRequest.updateOne(
+      { phone: toE164(phoneRaw), purpose, consumedAt: null },
+      { $set: { consumedAt: new Date() } }
+    );
+  } catch (e) {
+    console.error(`consumeOtp(${purpose}) failed (non-fatal):`, e.message);
+  }
+}
+
+// ============================================================================
+// PUBLIC API — SIGNUP (unchanged behavior; now thin wrappers over the shared
+// internals above instead of duplicating the logic inline)
+// ============================================================================
+
+async function startSignupOtp(phoneRaw, ip = '') {
+  return _startOtp(phoneRaw, ip, 'signup');
+}
+
+async function verifySignupOtp(phoneRaw, code) {
+  return _verifyOtp(phoneRaw, code, 'signup', 'signup_phone');
 }
 
 /**
@@ -226,26 +250,67 @@ function readPhoneToken(token) {
   }
 }
 
-// Burn the row once the account exists, so the same verification can't be
-// replayed to create a second account on one SMS.
 async function consumeSignupOtp(phoneRaw) {
+  return _consumeOtp(phoneRaw, 'signup');
+}
+
+// ============================================================================
+// ✅ PUBLIC API — PASSWORD RESET (new)
+//
+// Mirrors the signup functions exactly, scoped to purpose='password_reset', so
+// it never shares a row, resend-cooldown, or attempt counter with a signup OTP
+// on the same number — while still counting against the same daily/IP caps
+// (see _startOtp above).
+//
+// otp.js deliberately does NOT know about the User model or the password-reset
+// JWT shape ({id, pwReset, pwHash}) that routes/auth.js's existing, UNCHANGED
+// /forgot-reset endpoint expects. This module only proves "this phone answered
+// the code sent to it" — readPasswordResetPhoneToken hands the caller back the
+// verified phone number, and routes/auth.js is responsible for looking up the
+// matching User and minting the actual reset token. Keeping that boundary here
+// is what let /forgot-reset stay completely untouched by this feature.
+// ============================================================================
+
+async function startPasswordResetOtp(phoneRaw, ip = '') {
+  return _startOtp(phoneRaw, ip, 'password_reset');
+}
+
+async function verifyPasswordResetOtp(phoneRaw, code) {
+  return _verifyOtp(phoneRaw, code, 'password_reset', 'password_reset_phone');
+}
+
+/**
+ * Called by the forgot-password verify-otp route. Returns the verified E.164
+ * number, or null. Mirrors readPhoneToken but scoped to the password-reset
+ * token purpose, so the two token types can never be used interchangeably.
+ */
+function readPasswordResetPhoneToken(token) {
   try {
-    await OtpRequest.updateOne(
-      { phone: toE164(phoneRaw), purpose: 'signup', consumedAt: null },
-      { $set: { consumedAt: new Date() } }
-    );
-  } catch (e) {
-    console.error('consumeSignupOtp failed (non-fatal):', e.message);
+    const d = jwt.verify(token, process.env.JWT_SECRET);
+    if (d.purpose !== 'password_reset_phone' || !d.phone) return null;
+    return d.phone;
+  } catch {
+    return null;
   }
+}
+
+async function consumePasswordResetOtp(phoneRaw) {
+  return _consumeOtp(phoneRaw, 'password_reset');
 }
 
 module.exports = {
   isEnabled,
   provider: PROVIDER,
   toE164,
+  // signup (unchanged)
   startSignupOtp,
   verifySignupOtp,
   readPhoneToken,
   consumeSignupOtp,
+  // password reset (new)
+  startPasswordResetOtp,
+  verifyPasswordResetOtp,
+  readPasswordResetPhoneToken,
+  consumePasswordResetOtp,
   LIMITS: { CODE_LENGTH, CODE_TTL_MS, RESEND_COOLDOWN, MAX_SENDS_PER_HR, MAX_ATTEMPTS, MAX_IP_PER_HR, DAILY_CAP },
 };
