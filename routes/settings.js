@@ -372,6 +372,82 @@ router.put('/amount-limits', adminAuth, async (req, res) => {
   }
 });
 
+// ── CHAT MODE — NUMBERS ONLY ────────────────────────────────────────────────
+// One switch, stored in the same Setting collection as everything else on this
+// page. OFF (default) is exactly today's behaviour: players type whatever they
+// like in global chat. ON means a chat message must be digits only.
+//
+// WHERE IT IS ACTUALLY ENFORCED
+// In socket/gameSocket.js, on the 'send-chat' handler — the single server path
+// a chat message can take. The client also blocks non-digits as you type, but
+// that is convenience, not security: anyone can open a console and emit the
+// event by hand, so the server has to be the one that says no.
+//
+// NOT CACHED, deliberately. The other settings on this page cache for 60s
+// because they are read on hot paths. Chat is already capped at 3 messages per
+// 30s per user, so one indexed findOne per message costs nothing — and reading
+// it fresh means flipping the toggle takes effect on the very next message
+// instead of up to a minute later.
+//
+// WHAT IT DOES NOT TOUCH
+// Challenge/invite cards, bet amounts, room joining, admin delete — all
+// unchanged. This governs the text of a plain chat message and nothing else.
+
+// ✅ Push the flip to every connected client immediately, same fire-and-forget
+// pattern as broadcastAnnouncement below. The setting is already saved by the
+// time this runs, so a socket failure must never turn a successful save into an
+// error. Without it, players would keep typing letters into an input that the
+// server has already started refusing — and the rejection would look like the
+// chat being broken.
+function broadcastChatMode(req, payload) {
+  try {
+    const io = req.app.get('io');
+    if (!io) return;   // not wired yet, or running under a test harness
+    io.emit('chat-mode-updated', payload);
+  } catch (e) {
+    console.error('broadcastChatMode failed (non-fatal):', e.message);
+  }
+}
+
+// GET /api/settings/chat-mode — PUBLIC.
+// The chat screen needs it to set up its input before a message is sent, and
+// the admin panel reads the same route. Public is correct: it is a UI rule, not
+// a secret, and every player is subject to it anyway.
+router.get('/chat-mode', async (req, res) => {
+  try {
+    const row = await Setting.findOne({ key: 'chat_numbers_only' });
+    // Defaults to FALSE — a fresh deploy with no row must behave exactly as the
+    // chat did before this existed.
+    res.json({ numbersOnly: row?.value === 'true' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// PUT /api/settings/chat-mode — admin only
+router.put('/chat-mode', adminAuth, async (req, res) => {
+  try {
+    // Boolean() rather than a validation error: any junk value reads as false,
+    // which is the safe direction — worst case the switch stays off.
+    const numbersOnly = Boolean(req.body?.numbersOnly);
+
+    await Setting.findOneAndUpdate(
+      { key: 'chat_numbers_only' },
+      { key: 'chat_numbers_only', value: String(numbersOnly) },
+      { upsert: true, new: true }
+    );
+
+    broadcastChatMode(req, { numbersOnly });
+    res.json({
+      message: numbersOnly ? 'Chat is now numbers only' : 'Chat is back to normal text',
+      numbersOnly,
+    });
+  } catch (err) {
+    console.error('chat-mode save error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // ── ANNOUNCEMENT BANNER ─────────────────────────────────────────────────────
 // A pinned message shown to every player in chat. Stored as a Setting, so you
 // change it from the admin panel with no redeploy.
