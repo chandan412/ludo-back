@@ -63,6 +63,42 @@ const userSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
+
+  // ==========================================================================
+  // ✅ PUSH NOTIFICATION TOKEN (FCM)
+  //
+  // ⚠️ THIS FIELD WAS MISSING, AND THAT WAS THE WHOLE BUG.
+  //
+  // routes/auth.js has always had POST /api/auth/fcm-token, and it does:
+  //
+  //     await User.findByIdAndUpdate(req.user._id, { fcmToken });
+  //
+  // Mongoose runs with strict: true by default, which SILENTLY DROPS any path
+  // not declared in the schema. No error, no warning, a 200 response, and the
+  // token discarded. src/firebase.js even logged "✅ FCM token saved" — the
+  // request genuinely succeeded; it just saved nothing.
+  //
+  // So every token every player has ever granted was thrown away, and the
+  // database has none to send to. Declaring the field here is the entire fix
+  // for the storage half; nothing in auth.js needs to change.
+  //
+  // ONE TOKEN PER USER, deliberately. A player on both a phone and a laptop
+  // will have the newer device overwrite the older one, so only the most
+  // recently used device gets the push. The alternative — an array — means
+  // deciding when a token is stale, and dead tokens are what get a sender
+  // rate-limited by FCM. One fresh token is the safer default; it can become an
+  // array later if multi-device turns out to matter.
+  //
+  // Sparse index: only documents that HAVE a token are indexed, which is what
+  // the prune-invalid-tokens query in utils/push.js filters on. Existing users
+  // have no token and cost nothing.
+  // ==========================================================================
+  fcmToken: {
+    type: String,
+    default: null,
+    index: { sparse: true }
+  },
+
   isActive: {
     type: Boolean,
     default: true
