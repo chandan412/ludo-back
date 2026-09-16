@@ -15,6 +15,12 @@ const referralRoutes = require('./routes/referral');
 const analyticsRoutes = require('./routes/analytics');
 const paymentAutomationRoutes = require('./routes/paymentAutomation');
 
+// ✅ PUSH NOTIFICATIONS — routes/notifications.js existed in the repo but was
+// never required or mounted here, so every request to /api/notifications/*
+// returned 404. That is why the admin panel's Notify tab could not load its
+// stats, and why the original POST /send in that file had never worked either.
+const notificationRoutes = require('./routes/notifications');
+
 // In-process expiry sweeps. Replaces the n8n schedule trigger,
 // which cost ~1,440 executions a day against a 1,000/month plan.
 const { startPaymentSchedulers } = require('./jobs/paymentScheduler');
@@ -195,6 +201,20 @@ app.use(
 app.use(
   '/api/analytics',
   analyticsRoutes
+);
+
+// ============================================================================
+// PUSH NOTIFICATIONS
+//
+// Serves:
+//   GET  /api/notifications/admin/stats   — reach counts for the Notify tab
+//   POST /api/notifications/admin/send    — broadcast, or test to yourself
+//   POST /api/notifications/send          — the original route, unchanged
+// ============================================================================
+
+app.use(
+  '/api/notifications',
+  notificationRoutes
 );
 
 // ============================================================================
