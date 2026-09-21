@@ -1,5 +1,4 @@
 const express  = require('express');
-const mongoose = require('mongoose');
 const router   = express.Router();
 
 const { auth, adminAuth } = require('../middleware/auth');
@@ -8,7 +7,7 @@ const Transaction = require('../models/Transaction');
 const DiceRound   = require('../models/DiceRound');
 const DiceBet     = require('../models/DiceBet');
 const { getConfig, setConfig } = require('../utils/diceConfig');
-const { adjustCoins, lockCoins } = require('../utils/diceCoins');
+const { adjustWallet, lockWallet } = require('../utils/diceCoins');
 const diceSocket  = require('../socket/diceSocket');
 
 // ============================================================================
@@ -19,8 +18,8 @@ const diceSocket  = require('../socket/diceSocket');
 // validation and real status codes. A socket event would need all of that
 // rebuilt, and a failed bet would have no natural way to answer "why".
 //
-// ⚠️ COINS ONLY. Nothing in this file reads or writes `balance`, `lockedBalance`
-// or `bonusBalance`, and nothing in it may ever convert coins into rupees.
+// ✅ SHARED WALLET. Instant Ludo uses the same `balance` + `lockedBalance`
+// wallet as Classic Ludo. There is no separate coin balance.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
@@ -30,9 +29,9 @@ router.get('/current', auth, async (req, res) => {
   try {
     const cfg = await getConfig();
 
-    const me = await User.findById(req.user._id).select('coins lockedCoins').lean();
-    const coins       = me?.coins || 0;
-    const lockedCoins = me?.lockedCoins || 0;
+    const me = await User.findById(req.user._id).select('balance lockedBalance').lean();
+    const balance       = me?.balance || 0;
+    const lockedBalance = me?.lockedBalance || 0;
 
     const round = await DiceRound.findOne({ status: 'betting' })
       .sort({ createdAt: -1 })
@@ -51,9 +50,9 @@ router.get('/current', auth, async (req, res) => {
       minBet:     cfg.minBet,
       maxBet:     cfg.maxBet,
       maxNumbers: cfg.maxNumbers,
-      coins,
-      lockedCoins,
-      spendable:  Math.max(0, coins - lockedCoins),
+      balance,
+      lockedBalance,
+      spendable: Math.max(0, balance - lockedBalance),
       // serverTime lets the client correct for device clock drift instead of
       // trusting its own clock against bettingEndsAt.
       serverTime: new Date().toISOString(),
@@ -87,10 +86,10 @@ router.post('/bet', auth, async (req, res) => {
       return res.status(400).json({ message: 'Pick a number from 1 to 6' });
     }
     if (!Number.isInteger(amount) || amount < cfg.minBet) {
-      return res.status(400).json({ message: `Minimum bet is ${cfg.minBet} coins` });
+      return res.status(400).json({ message: `Minimum bet is ₹${cfg.minBet}` });
     }
     if (amount > cfg.maxBet) {
-      return res.status(400).json({ message: `Maximum bet is ${cfg.maxBet} coins` });
+      return res.status(400).json({ message: `Maximum bet is ₹${cfg.maxBet}` });
     }
 
     // ✅ The window is checked HERE, on the server, against the server's own
@@ -129,30 +128,30 @@ router.post('/bet', auth, async (req, res) => {
     // ✅ ATOMIC LOCK.
     //
     // The balance check and the lock are ONE operation. $expr evaluates
-    // (coins - lockedCoins) >= amount inside the same update that increments
-    // lockedCoins, against the document as it is at that instant.
+    // (balance - lockedBalance) >= amount inside the same update that increments
+    // lockedBalance, against the document as it is at that instant.
     //
     // Read-then-write is what this replaces, and it is exactly the shape that
     // the withdrawal race was: five taps 100ms apart all read the same
     // spendable total and all pass. Here, four of the five simply match no
     // document and get null back.
     //
-    // `coins` is NOT reduced — only locked. That is what makes a cancelled
-    // round refundable without any coins having moved.
+    // `balance` is NOT reduced — only locked. That is what makes a cancelled
+    // round refundable without any balance having moved.
     // ========================================================================
-    const locked = await lockCoins(req.user._id, amount);
+    const locked = await lockWallet(req.user._id, amount);
 
     if (!locked) {
-      return res.status(400).json({ message: 'Not enough coins' });
+      return res.status(400).json({ message: 'Insufficient wallet balance' });
     }
 
-    // From here on, coins are locked. Every failure path below MUST release
-    // them — an orphaned lock is coins the player can see but never spend.
+    // From here on, the stake is locked in lockedBalance. Every failure path
+    // below MUST release it — an orphaned lock is money the player can see but never spend.
     let bet;
     try {
       // ✅ A plain create, and the unique index on (round, user, number) is what
       // actually holds the line — the check above is only for the friendlier
-      // error. A losing concurrent insert throws 11000 here, gets its coins
+      // error. A losing concurrent insert throws 11000 here, gets its balance
       // released in the catch, and exactly one bet survives.
       bet = await DiceBet.create({
         round: round._id, user: req.user._id, number, amount,
@@ -168,18 +167,18 @@ router.post('/bet', auth, async (req, res) => {
 
       await Transaction.create({
         user:          req.user._id,
-        type:          'coin_lock',
-        currency:      'COIN',
+        type:          'game_lock',
+        currency:      'INR',
         amount,
         // Unchanged on both sides: a lock moves nothing out of the wallet.
-        balanceBefore: locked.coins,
-        balanceAfter:  locked.coins,
+        balanceBefore: locked.balance,
+        balanceAfter:  locked.balance,
         status:        'completed',
         diceRoundId:   round._id,
       });
     } catch (err) {
       // Compensate: undo the lock, and undo the stake we just added.
-      await adjustCoins(req.user._id, { delta: 0, unlock: amount }).catch(() => {});
+      await adjustWallet(req.user._id, { delta: 0, unlock: amount }).catch(() => {});
 
       // Only clean up a row we actually created. A duplicate-key failure created
       // nothing, so there is nothing to delete — and deleting by (round, user,
@@ -205,9 +204,9 @@ router.post('/bet', auth, async (req, res) => {
     res.json({
       message:     'Bet placed',
       roundNumber: round.roundNumber,
-      coins:       locked.coins,
-      lockedCoins: locked.lockedCoins,
-      spendable:   Math.max(0, locked.coins - locked.lockedCoins),
+      balance:       locked.balance,
+      lockedBalance: locked.lockedBalance,
+      spendable:     Math.max(0, locked.balance - locked.lockedBalance),
       myBets,
     });
   } catch (err) {
@@ -325,8 +324,9 @@ router.get('/admin/stats', adminAuth, async (req, res) => {
     const actualMargin = staked > 0 ? ((staked - paidOut) / staked) * 100 : 0;
     const theoretical  = (1 - (cfg.multiplier / 6)) * 100;
 
-    const totalCoins = await User.aggregate([
-      { $group: { _id: null, coins: { $sum: '$coins' }, locked: { $sum: '$lockedCoins' } } }
+    const totalWallet = await User.aggregate([
+      { $match: { role: 'player' } },
+      { $group: { _id: null, balance: { $sum: '$balance' }, locked: { $sum: '$lockedBalance' } } }
     ]);
 
     res.json({
@@ -336,63 +336,12 @@ router.get('/admin/stats', adminAuth, async (req, res) => {
       paidOut,
       actualMargin:      Math.round(actualMargin * 100) / 100,
       theoreticalMargin: Math.round(theoretical * 100) / 100,
-      coinsInCirculation: totalCoins[0]?.coins  || 0,
-      coinsLocked:        totalCoins[0]?.locked || 0,
+      walletBalance: totalWallet[0]?.balance || 0,
+      walletLocked:  totalWallet[0]?.locked || 0,
       config: cfg,
     });
   } catch (err) {
     console.error('[dice] /admin/stats error:', err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ----------------------------------------------------------------------------
-// POST /api/dice/admin/grant-coins   { userId, amount, note }
-//
-// The ONLY way coins enter the system. There is deliberately no purchase route
-// and no rupee-to-coin conversion anywhere in this codebase.
-// ----------------------------------------------------------------------------
-router.post('/admin/grant-coins', adminAuth, async (req, res) => {
-  try {
-    const { userId, note } = req.body || {};
-    const amount = parseInt(req.body?.amount, 10);
-
-    if (!mongoose.isValidObjectId(userId)) {
-      return res.status(400).json({ message: 'Invalid user' });
-    }
-    // Negative amounts are allowed — an admin needs to be able to take back a
-    // mistaken grant — but the $max clamp below stops it going below zero.
-    if (!Number.isInteger(amount) || amount === 0) {
-      return res.status(400).json({ message: 'Amount must be a non-zero whole number' });
-    }
-
-    const exists = await User.exists({ _id: userId });
-    if (!exists) return res.status(404).json({ message: 'User not found' });
-
-    const updated = await adjustCoins(userId, { delta: amount });
-    if (!updated) return res.status(404).json({ message: 'User not found' });
-
-    await Transaction.create({
-      user:          userId,
-      type:          'coin_grant',
-      currency:      'COIN',
-      amount:        Math.abs(amount),
-      balanceBefore: Math.max(0, updated.coins - amount),
-      balanceAfter:  updated.coins,
-      status:        'completed',
-      adminRemark:   String(note || '').slice(0, 200),
-      processedBy:   req.user._id,
-      processedAt:   new Date(),
-    });
-
-    res.json({
-      message:  amount > 0 ? 'Coins granted' : 'Coins removed',
-      username: updated.username,
-      coins:    updated.coins,
-      lockedCoins: updated.lockedCoins,
-    });
-  } catch (err) {
-    console.error('[dice] /admin/grant-coins error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
