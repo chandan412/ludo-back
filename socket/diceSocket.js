@@ -5,7 +5,7 @@ const Transaction = require('../models/Transaction');
 const DiceRound   = require('../models/DiceRound');
 const DiceBet     = require('../models/DiceBet');
 const { getConfig } = require('../utils/diceConfig');
-const { adjustCoins } = require('../utils/diceCoins');
+const { adjustWallet } = require('../utils/diceCoins');
 
 // ============================================================================
 // INSTANT LUDO — round engine + real-time layer
@@ -141,9 +141,9 @@ async function lockRound(roundId) {
 // ============================================================================
 // SETTLE
 //
-// Credit PROFIT, not payout.
+// Credit PROFIT, not the full payout.
 //
-// The stake was never taken out of `coins` — it was moved into `lockedCoins`.
+// The stake is reserved in `lockedBalance` but remains inside the shared `balance` until settlement.
 // So a winner is owed (payout - stake), and releasing the lock returns the
 // stake itself. Crediting the full payout here would pay every winner their
 // stake twice.
@@ -195,11 +195,10 @@ async function settleRound(roundId) {
 
   for (const [userId, acc] of perUser.entries()) {
     try {
-      // Release the lock and apply the net result in one write, clamped at
-      // zero. See utils/diceCoins.js for why this is not a pipeline update.
-      const updated = await adjustCoins(userId, { delta: acc.delta, unlock: acc.unlock });
+      // Release the lock and apply the net result in one shared-wallet write.
+      const updated = await adjustWallet(userId, { delta: acc.delta, unlock: acc.unlock });
 
-      const after  = updated ? updated.coins : 0;
+      const after  = updated ? updated.balance : 0;
       const before = Math.max(0, after - acc.delta);
 
       for (const r of acc.bets) {
@@ -210,8 +209,8 @@ async function settleRound(roundId) {
 
         await Transaction.create({
           user:        userId,
-          type:        r.won ? 'coin_win' : 'coin_loss',
-          currency:    'COIN',
+          type:        r.won ? 'game_win' : 'game_loss',
+          currency:    'INR',
           amount:      Math.abs(r.profit),
           balanceBefore: before,
           balanceAfter:  after,
@@ -232,8 +231,8 @@ async function settleRound(roundId) {
             payout: r.payout,
           })),
           myPayout: acc.bets.reduce((s, r) => s + r.payout, 0),
-          coins:       after,
-          lockedCoins: updated ? updated.lockedCoins : 0,
+          balance:       after,
+          lockedBalance: updated ? updated.lockedBalance : 0,
         });
       }
     } catch (err) {
@@ -260,8 +259,8 @@ async function settleRound(roundId) {
 // ============================================================================
 // CANCEL — refund every pending bet.
 //
-// Releases the lock and leaves `coins` ALONE, because nothing was ever taken
-// out of it. Touching coins here would hand every player their stake a second
+// Releases the lock and leaves `balance` ALONE, because nothing was ever taken
+// out of it. Touching balance here would hand every player their stake a second
 // time. This is the whole payoff of locking instead of deducting.
 // ============================================================================
 async function cancelRound(roundId, reason = 'cancelled') {
@@ -282,18 +281,18 @@ async function cancelRound(roundId, reason = 'cancelled') {
 
   for (const [userId, unlock] of perUser.entries()) {
     try {
-      // delta 0 — `coins` is deliberately untouched. Only the lock is released.
-      const updated = await adjustCoins(userId, { delta: 0, unlock });
+      // delta 0 — `balance` is deliberately untouched. Only the shared lock is released.
+      const updated = await adjustWallet(userId, { delta: 0, unlock });
 
       await Transaction.create({
         user:          userId,
-        type:          'coin_refund',
-        currency:      'COIN',
+        type:          'game_unlock',
+        currency:      'INR',
         amount:        unlock,
         // Unchanged on both sides, deliberately: a refund of a lock moves no
-        // spendable coins. The row exists so the player can see what happened.
-        balanceBefore: updated ? updated.coins : 0,
-        balanceAfter:  updated ? updated.coins : 0,
+        // spendable balance. The row exists so the player can see what happened.
+        balanceBefore: updated ? updated.balance : 0,
+        balanceAfter:  updated ? updated.balance : 0,
         status:        'completed',
         diceRoundId:   round._id,
       });
@@ -303,8 +302,8 @@ async function cancelRound(roundId, reason = 'cancelled') {
           roundNumber: round.roundNumber,
           reason,
           refunded:    unlock,
-          coins:       updated ? updated.coins : 0,
-          lockedCoins: updated ? updated.lockedCoins : 0,
+          balance:       updated ? updated.balance : 0,
+          lockedBalance: updated ? updated.lockedBalance : 0,
         });
       }
     } catch (err) {
@@ -325,7 +324,7 @@ async function cancelRound(roundId, reason = 'cancelled') {
 // BOOT RECOVERY
 //
 // A deploy or a crash mid-round leaves a round stuck in 'betting' or 'locked'
-// with players' coins locked and no timer alive to release them. Railway
+// with players' wallet locks and no timer alive to release them. Railway
 // redeploys on every push, so this is not a rare edge case — it is most
 // deploys. Sweep on start.
 // ============================================================================
