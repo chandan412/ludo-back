@@ -52,6 +52,40 @@ const userSchema = new mongoose.Schema({
     default: 0,
     min: 0
   },
+  // ==========================================================================
+  // ✅ COINS — Instant Ludo wallet. A SEPARATE, NON-CONVERTIBLE balance.
+  //
+  // This is NOT rupees and it is NOT part of `balance`. The two never touch:
+  //
+  //   balance      → real money. Recharged by UPI, withdrawable to a bank.
+  //   coins        → play chips. Granted by admin only. No withdrawal path.
+  //
+  // There is deliberately no route, helper or admin action anywhere in this
+  // codebase that converts coins into balance, or credits balance from a coin
+  // win. routes/wallet.js does not read these fields and must not start to.
+  // That separation is the entire reason the field exists — the moment coins
+  // become cashable by any route, direct or indirect, Instant Ludo stops being
+  // a play-chip game.
+  //
+  // lockedCoins mirrors lockedBalance exactly: a placed bet moves coins into
+  // lockedCoins and does NOT reduce coins. Spendable = coins - lockedCoins.
+  // Locking rather than deducting is what makes a cancelled round refundable
+  // without any money having moved — see routes/dice.js.
+  //
+  // Both default to 0, so every existing account is unaffected until an admin
+  // grants coins. No migration needed.
+  // ==========================================================================
+  coins: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+  lockedCoins: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+
   // ✅ Phone verification (LineVerify). NEW users must verify their number before they can
   // play. EXISTING users (created before this feature) are grandfathered to `true` by a
   // one-time migration in server.js, so they're never blocked.
