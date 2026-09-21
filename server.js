@@ -21,6 +21,13 @@ const paymentAutomationRoutes = require('./routes/paymentAutomation');
 // stats, and why the original POST /send in that file had never worked either.
 const notificationRoutes = require('./routes/notifications');
 
+// ✅ INSTANT LUDO — second game mode. Coins only; never touches `balance`.
+// Both lines below matter: requiring without mounting is exactly the bug that
+// left notifications.js and cricket.js returning 404 despite being fully
+// written. Verify with curl after deploy, not by re-reading this file.
+const diceRoutes = require('./routes/dice');
+const diceSocket = require('./socket/diceSocket');
+
 // In-process expiry sweeps. Replaces the n8n schedule trigger,
 // which cost ~1,440 executions a day against a 1,000/month plan.
 const { startPaymentSchedulers } = require('./jobs/paymentScheduler');
@@ -233,10 +240,33 @@ app.use(
 );
 
 // ============================================================================
+// INSTANT LUDO
+// ============================================================================
+
+app.use(
+  '/api/dice',
+  diceRoutes
+);
+
+// ============================================================================
 // GAME SOCKET
 // ============================================================================
 
 gameSocket(io);
+
+// ============================================================================
+// INSTANT LUDO SOCKET
+//
+// ⚠️ MUST come after gameSocket(io). gameSocket registers the io.use() auth
+// middleware that verifies the JWT and populates socket.user; diceSocket reads
+// socket.user to put a player in their own result room. Swap the order and
+// every dice socket is anonymous.
+//
+// Starts nothing unless the admin switch is on — on a fresh deploy the loop
+// checks the setting, finds `dice_enabled` unset (default false) and returns.
+// ============================================================================
+
+diceSocket(io);
 
 // ============================================================================
 // ADMIN LIVE UPDATES
