@@ -4,31 +4,20 @@ const transactionSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   type: {
     type: String,
-    // ✅ coin_* types belong to Instant Ludo and are denominated in COINS, not
-    // rupees. They are listed here so coin activity lands in the same ledger a
-    // support query already searches, but they are deliberately NOT added to
-    // any of the money aggregates.
-    //
-    // Verified before adding: every rupee total in routes/analytics.js and
-    // routes/admin.js matches on an explicit type whitelist
-    // (['recharge','withdraw','platform_fee','referral','signup_bonus']), so a
-    // coin row cannot be summed into revenue, recharge or withdrawal figures.
-    // If a new aggregate is ever written WITHOUT a type filter, add
-    // `currency: 'INR'` to its $match — that is what the field below is for.
+    // All game and wallet transactions use the shared INR wallet.
+    // Instant Ludo uses the same game_* transaction types as Classic Ludo.
     enum: [
       'recharge', 'withdraw', 'game_win', 'game_loss', 'game_lock',
-      'game_unlock', 'platform_fee', 'refund', 'referral', 'signup_bonus',
-      'coin_grant', 'coin_lock', 'coin_win', 'coin_loss', 'coin_refund'
+      'game_unlock', 'platform_fee', 'refund', 'referral', 'signup_bonus'
     ],
     required: true
   },
 
-  // ✅ Which wallet this row moved. 'INR' is the real-money balance; 'COIN' is
-  // the non-convertible Instant Ludo wallet. Defaults to 'INR' so every row
-  // ever written before this field existed reads correctly with no migration.
+  // All transaction rows in this application are denominated in INR and
+  // point at the shared player wallet.
   currency: {
     type: String,
-    enum: ['INR', 'COIN'],
+    enum: ['INR'],
     default: 'INR'
   },
   amount: { type: Number, required: true },
