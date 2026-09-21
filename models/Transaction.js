@@ -4,8 +4,32 @@ const transactionSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   type: {
     type: String,
-    enum: ['recharge', 'withdraw', 'game_win', 'game_loss', 'game_lock', 'game_unlock', 'platform_fee', 'refund', 'referral', 'signup_bonus'],
+    // ✅ coin_* types belong to Instant Ludo and are denominated in COINS, not
+    // rupees. They are listed here so coin activity lands in the same ledger a
+    // support query already searches, but they are deliberately NOT added to
+    // any of the money aggregates.
+    //
+    // Verified before adding: every rupee total in routes/analytics.js and
+    // routes/admin.js matches on an explicit type whitelist
+    // (['recharge','withdraw','platform_fee','referral','signup_bonus']), so a
+    // coin row cannot be summed into revenue, recharge or withdrawal figures.
+    // If a new aggregate is ever written WITHOUT a type filter, add
+    // `currency: 'INR'` to its $match — that is what the field below is for.
+    enum: [
+      'recharge', 'withdraw', 'game_win', 'game_loss', 'game_lock',
+      'game_unlock', 'platform_fee', 'refund', 'referral', 'signup_bonus',
+      'coin_grant', 'coin_lock', 'coin_win', 'coin_loss', 'coin_refund'
+    ],
     required: true
+  },
+
+  // ✅ Which wallet this row moved. 'INR' is the real-money balance; 'COIN' is
+  // the non-convertible Instant Ludo wallet. Defaults to 'INR' so every row
+  // ever written before this field existed reads correctly with no migration.
+  currency: {
+    type: String,
+    enum: ['INR', 'COIN'],
+    default: 'INR'
   },
   amount: { type: Number, required: true },
   balanceBefore: { type: Number, required: true },
@@ -46,6 +70,11 @@ const transactionSchema = new mongoose.Schema({
   adminRemark: { type: String, default: '' },
   remarkAck:   { type: Boolean, default: false },
   gameId: { type: mongoose.Schema.Types.ObjectId, ref: 'Game' },
+
+  // ✅ Instant Ludo round this row belongs to. Separate from gameId because it
+  // points at a different collection (DiceRound, not Game) — reusing gameId
+  // would give you a ref that populate() resolves to null.
+  diceRoundId: { type: mongoose.Schema.Types.ObjectId, ref: 'DiceRound' },
   processedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   processedAt: { type: Date },
   createdAt: { type: Date, default: Date.now }
@@ -70,6 +99,12 @@ transactionSchema.index({ type: 1, status: 1 });
 transactionSchema.index({ status: 1, createdAt: -1 });
 transactionSchema.index({ type: 1, createdAt: -1 });
 transactionSchema.index({ createdAt: -1 });
+
+// ✅ Coin ledger: "this player's Instant Ludo history, newest first" and the
+// admin's coin-only transaction view. Without it those queries fall back to
+// { user, createdAt } and then filter in memory across every rupee row the
+// player has — which, for an active player, is most of their history.
+transactionSchema.index({ currency: 1, user: 1, createdAt: -1 });
 
 // ============================================================================
 // ✅ ONE PENDING WITHDRAWAL PER PLAYER — enforced by MongoDB, not by code.
