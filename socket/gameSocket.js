@@ -5,6 +5,7 @@ const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
 const { recordQualifyingGame } = require('../utils/referral');
+const { isTokenError } = require('../middleware/auth');
 
 const activeRooms = new Map();
 const roomTimers = new Map(); // tracks 2-min auto-abort timers
@@ -959,7 +960,11 @@ module.exports = (io) => {
       socket.user = user;
       next();
     } catch (err) {
-      next(new Error('Invalid token'));
+      // ✅ A DB hiccup during the handshake is NOT a bad token. The client treats
+      // 'Server busy' as retryable and keeps reconnecting; an auth error stops it.
+      if (isTokenError(err)) return next(new Error('Invalid token'));
+      console.error('socket auth error (not a token problem):', err.message);
+      next(new Error('Server busy'));
     }
   });
 
