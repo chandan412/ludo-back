@@ -7,6 +7,7 @@ const { auth } = require('../middleware/auth');
 const lineverify = require('../utils/lineverify');
 const { recordQualifyingGame } = require('../utils/referral');
 const { getAmountLimits } = require('../utils/amountLimits');
+const cache = require('../utils/cache');
 
 const generateRoomCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -19,20 +20,36 @@ const freshTokens = () => ([
 ]);
 
 // GET /api/game/lobby
+//
+// ⚡ CACHED. Every player on the Lobby screen polls this every few seconds, and
+// they all want the same list. It used to be one query + one populate PER
+// PLAYER PER POLL; now the open rooms are read once and shared for up to 3s.
+// Creating, joining, cancelling or aborting a room clears the cache at once.
+//
+// The per-player parts (hide my own room, optional bet range) are applied in
+// memory. 100 rooms are cached so there is headroom after that filtering —
+// waiting rooms auto-abort after 2 minutes, so there are never that many.
+const LOBBY_CACHE_SIZE = 100;
+
 router.get('/lobby', auth, async (req, res) => {
   try {
     const { minBet, maxBet } = req.query;
-    const query = { status: 'waiting' };
-    if (minBet || maxBet) {
-      query.betAmount = {};
-      if (minBet) query.betAmount.$gte = parseInt(minBet);
-      if (maxBet) query.betAmount.$lte = parseInt(maxBet);
-    }
-    query.createdBy = { $ne: req.user._id };
-    const games = await Game.find(query)
-      .populate('createdBy', 'username gamesPlayed gamesWon')
-      .sort({ createdAt: -1 })
-      .limit(50);
+    const min = minBet ? parseInt(minBet) : null;
+    const max = maxBet ? parseInt(maxBet) : null;
+    const me = req.user._id.toString();
+
+    const waiting = await cache.lobby.wrap('waiting', () =>
+      Game.find({ status: 'waiting' })
+        .populate('createdBy', 'username gamesPlayed gamesWon')
+        .sort({ createdAt: -1 })
+        .limit(LOBBY_CACHE_SIZE)
+        .lean()
+    );
+
+    const games = waiting
+      .filter(g => String(g.createdBy?._id || g.createdBy) !== me)
+      .filter(g => (min === null || g.betAmount >= min) && (max === null || g.betAmount <= max))
+      .slice(0, 50);
     res.json(games);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
@@ -170,6 +187,7 @@ router.post('/create', auth, async (req, res) => {
       return res.status(400).json({ message: `Insufficient balance. Available: ${available}` });
     }
 
+    cache.lobby.clear(); // show the new room to everyone on their next poll
     await game.populate('createdBy', 'username');
     res.status(201).json({
       matched: false,
@@ -290,6 +308,10 @@ router.post('/join/:roomCode', auth, async (req, res) => {
       return res.status(409).json({ message: 'Game is already full or has started' });
     }
 
+    // The room is full — take it off everyone's lobby list now. (The rollback
+    // below reopens it; clearing again there brings it back just as fast.)
+    cache.lobby.clear();
+
     // ── 3. Lock the stake, atomically and without overdrawing ────────────────
     // Conditional $inc: the balance condition is re-evaluated by MongoDB at write
     // time, so a stake can never be locked against money that has since been
@@ -314,6 +336,7 @@ router.post('/join/:roomCode', auth, async (req, res) => {
           $set: { status: 'waiting', currentTurn: null, startedAt: null },
         }
       ).catch(e => console.error('join rollback failed:', e.message));
+      cache.lobby.clear();
 
       return res.status(400).json({ message: 'Insufficient balance to join this game' });
     }
@@ -357,6 +380,7 @@ router.post('/cancel/:roomCode', auth, async (req, res) => {
     game.status = 'aborted';
     game.finishedAt = new Date();
     await game.save();
+    cache.lobby.clear();
 
     res.json({ message: 'Game cancelled. Bet refunded.' });
   } catch (err) {
@@ -537,12 +561,22 @@ router.post('/forfeit/:roomCode', auth, async (req, res) => {
 });
 
 // GET /api/game/:roomCode — ALWAYS LAST
+//
+// ⚡ The most-polled route in the app: the game screen's watchdog asks for it
+// every few seconds for every player in every game. Trimmed accordingly:
+//   • moveHistory excluded — every socket path already skips it; nothing reads it.
+//   • createdBy no longer populated — the game screen never reads it, and it
+//     was one extra query per poll.
+//   • .lean() — plain objects, no Mongoose document overhead. Same JSON.
+// NOT cached: this is live game state, and the watchdog exists to catch the
+// client drifting from it.
 router.get('/:roomCode', auth, async (req, res) => {
   try {
     const game = await Game.findOne({ roomCode: req.params.roomCode.toUpperCase() })
+      .select('-moveHistory')
       .populate('players.user', 'username')
       .populate('winner', 'username')
-      .populate('createdBy', 'username');
+      .lean();
     if (!game) return res.status(404).json({ message: 'Game not found' });
 
     const isPlayer = game.players.some(

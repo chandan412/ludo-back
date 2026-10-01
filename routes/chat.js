@@ -3,6 +3,7 @@ const router = express.Router();
 const ChatMessage = require('../models/ChatMessage');
 const Game = require('../models/Game');
 const { auth } = require('../middleware/auth');
+const cache = require('../utils/cache');
 
 // ============================================================================
 // GET /api/chat/messages
@@ -28,72 +29,82 @@ const { auth } = require('../middleware/auth');
 // MONEY SAFETY: this route is READ-ONLY with respect to games and balances. It
 // never touches Game, User, or Transaction documents — it only writes display
 // fields onto chat messages.
+//
+// ⚡ CACHED. The history is the same for every player, and every chat open,
+// reconnect and return-to-tab reloads it — after a network blip, everyone
+// reconnects at once and asks for it together. The result is shared for up to
+// 10s, and gameSocket.js clears it the moment a message is sent, deleted, or
+// an invite card changes, so nobody is served a list missing a message.
 // ============================================================================
 router.get('/messages', auth, async (req, res) => {
   try {
-    const messages = await ChatMessage.find()
-      .sort({ createdAt: -1 })
-      .limit(100)
-      .lean();
-    messages.reverse(); // oldest -> newest for display
-
-    // ── Which invite cards still need their state checked? ───────────────────
-    // 'finished' and 'expired' are terminal — the result never changes again.
-    const TERMINAL = new Set(['finished', 'expired']);
-    const openInvites = messages.filter(
-      m => m.type === 'invite' && m.roomCode && !TERMINAL.has(m.status)
-    );
-
-    if (openInvites.length > 0) {
-      const codes = [...new Set(openInvites.map(m => String(m.roomCode).toUpperCase()))];
-
-      const games = await Game.find({ roomCode: { $in: codes } })
-        .populate('players.user', 'username')
-        .select('roomCode status players winner winAmount betAmount')
-        .lean();
-
-      const gameByCode = new Map(games.map(g => [String(g.roomCode).toUpperCase(), g]));
-      const ops = [];
-
-      for (const msg of openInvites) {
-        const game = gameByCode.get(String(msg.roomCode).toUpperCase());
-        const derived = deriveInviteState(game);
-        if (!derived) continue;
-
-        // Only write when something actually changed — avoids pointless writes
-        // on every single page load.
-        const changed = Object.keys(derived).some(
-          k => String(msg[k] ?? '') !== String(derived[k] ?? '')
-        );
-
-        // Apply to the object we're about to send back, so the client gets the
-        // corrected state on THIS request, not the next one.
-        Object.assign(msg, derived);
-
-        if (changed) {
-          ops.push({
-            updateOne: {
-              filter: { _id: msg._id },
-              update: { $set: derived },
-            },
-          });
-        }
-      }
-
-      // Fire the repairs, but never let a write failure break history loading.
-      if (ops.length > 0) {
-        ChatMessage.bulkWrite(ops, { ordered: false }).catch(e =>
-          console.error('invite state backfill error (non-fatal):', e.message)
-        );
-      }
-    }
-
-    res.json(messages);
+    res.json(await cache.chatHistory.wrap('last100', loadHistory));
   } catch (err) {
     console.error('chat history error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+async function loadHistory() {
+  const messages = await ChatMessage.find()
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .lean();
+  messages.reverse(); // oldest -> newest for display
+
+  // ── Which invite cards still need their state checked? ───────────────────
+  // 'finished' and 'expired' are terminal — the result never changes again.
+  const TERMINAL = new Set(['finished', 'expired']);
+  const openInvites = messages.filter(
+    m => m.type === 'invite' && m.roomCode && !TERMINAL.has(m.status)
+  );
+
+  if (openInvites.length > 0) {
+    const codes = [...new Set(openInvites.map(m => String(m.roomCode).toUpperCase()))];
+
+    const games = await Game.find({ roomCode: { $in: codes } })
+      .populate('players.user', 'username')
+      .select('roomCode status players winner winAmount betAmount')
+      .lean();
+
+    const gameByCode = new Map(games.map(g => [String(g.roomCode).toUpperCase(), g]));
+    const ops = [];
+
+    for (const msg of openInvites) {
+      const game = gameByCode.get(String(msg.roomCode).toUpperCase());
+      const derived = deriveInviteState(game);
+      if (!derived) continue;
+
+      // Only write when something actually changed — avoids pointless writes
+      // on every single page load.
+      const changed = Object.keys(derived).some(
+        k => String(msg[k] ?? '') !== String(derived[k] ?? '')
+      );
+
+      // Apply to the object we're about to send back, so the client gets the
+      // corrected state on THIS request, not the next one.
+      Object.assign(msg, derived);
+
+      if (changed) {
+        ops.push({
+          updateOne: {
+            filter: { _id: msg._id },
+            update: { $set: derived },
+          },
+        });
+      }
+    }
+
+    // Fire the repairs, but never let a write failure break history loading.
+    if (ops.length > 0) {
+      ChatMessage.bulkWrite(ops, { ordered: false }).catch(e =>
+        console.error('invite state backfill error (non-fatal):', e.message)
+      );
+    }
+  }
+
+  return messages;
+}
 
 // ============================================================================
 // Derive an invite card's display state from its Game document.

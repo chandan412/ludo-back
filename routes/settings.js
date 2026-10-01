@@ -5,6 +5,7 @@ const { adminAuth } = require('../middleware/auth');
 const { getWithdrawLimits, saveWithdrawLimits } = require('../utils/withdrawLimit');
 const { getSignupBonus, saveSignupBonus } = require('../utils/signupBonus');
 const { getAmountLimits, saveAmountLimits } = require('../utils/amountLimits');
+const cache = require('../utils/cache');
  
 // Simple Setting schema
 const settingSchema = new mongoose.Schema({
@@ -413,12 +414,19 @@ function broadcastChatMode(req, payload) {
 // The chat screen needs it to set up its input before a message is sent, and
 // the admin panel reads the same route. Public is correct: it is a UI rule, not
 // a secret, and every player is subject to it anyway.
+//
+// ⚡ Cached for 60s like the other public settings — the chat screen asks on
+// every open, reconnect and return-to-tab. The PUT below clears it, so a switch
+// flip is still visible immediately.
 router.get('/chat-mode', async (req, res) => {
   try {
-    const row = await Setting.findOne({ key: 'chat_numbers_only' });
-    // Defaults to FALSE — a fresh deploy with no row must behave exactly as the
-    // chat did before this existed.
-    res.json({ numbersOnly: row?.value === 'true' });
+    const mode = await cache.settings.wrap('chat-mode', async () => {
+      const row = await Setting.findOne({ key: 'chat_numbers_only' }).lean();
+      // Defaults to FALSE — a fresh deploy with no row must behave exactly as the
+      // chat did before this existed.
+      return { numbersOnly: row?.value === 'true' };
+    });
+    res.json(mode);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -436,6 +444,7 @@ router.put('/chat-mode', adminAuth, async (req, res) => {
       { key: 'chat_numbers_only', value: String(numbersOnly) },
       { upsert: true, new: true }
     );
+    cache.settings.delete('chat-mode');
 
     broadcastChatMode(req, { numbersOnly });
     res.json({
@@ -475,17 +484,21 @@ function broadcastAnnouncement(req, payload) {
 }
 
 // GET /api/settings/announcement — public
+// ⚡ Cached for 60s; the POST below clears it. Same reasoning as chat-mode.
 router.get('/announcement', async (req, res) => {
   try {
-    const [textRow, enabledRow] = await Promise.all([
-      Setting.findOne({ key: 'announcement_text' }),
-      Setting.findOne({ key: 'announcement_enabled' }),
-    ]);
-    const text = textRow?.value || '';
-    // Enabled defaults to FALSE. A banner that switches itself on at deploy
-    // time and shows an empty box to every player is not a good surprise.
-    const enabled = enabledRow?.value === 'true';
-    res.json({ text, enabled: enabled && !!text.trim() });
+    const banner = await cache.settings.wrap('announcement', async () => {
+      const [textRow, enabledRow] = await Promise.all([
+        Setting.findOne({ key: 'announcement_text' }).lean(),
+        Setting.findOne({ key: 'announcement_enabled' }).lean(),
+      ]);
+      const text = textRow?.value || '';
+      // Enabled defaults to FALSE. A banner that switches itself on at deploy
+      // time and shows an empty box to every player is not a good surprise.
+      const enabled = enabledRow?.value === 'true';
+      return { text, enabled: enabled && !!text.trim() };
+    });
+    res.json(banner);
   } catch (err) {
     res.status(500).json({ message: 'Server error' });
   }
@@ -533,6 +546,8 @@ router.post('/announcement', adminAuth, async (req, res) => {
         { upsert: true, new: true }
       ),
     ]);
+
+    cache.settings.delete('announcement');
 
     const live = { text: rawText, enabled: enabled && !!rawText };
     broadcastAnnouncement(req, live);

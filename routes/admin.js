@@ -3,7 +3,7 @@ const router = express.Router();
 const User = require('../models/User');
 const Transaction = require('../models/Transaction');
 const Game = require('../models/Game');
-const { adminAuth } = require('../middleware/auth');
+const { adminAuth, invalidateAuthUser } = require('../middleware/auth');
 // ✅ Reuses the already-tested settlement/disconnect helpers from the socket
 // layer instead of re-implementing forfeit/settlement logic here. Safe to
 // require at module load time: this file never needs the `io` instance FROM
@@ -375,6 +375,9 @@ router.post('/ban-player', adminAuth, async (req, res) => {
     const { userId } = req.body;
     const user = await User.findByIdAndUpdate(userId, { isBanned: true }, { new: true }).select('-password');
     if (!user) return res.status(404).json({ message: 'Player not found' });
+    // The auth check caches users for 30s — drop this one so the ban applies
+    // to their very next request, not up to 30 seconds later.
+    invalidateAuthUser(user._id);
 
     const io = req.app.get('io');
     let forfeited = false;
@@ -419,6 +422,7 @@ router.post('/unban-player', adminAuth, async (req, res) => {
     const { userId } = req.body;
     const user = await User.findByIdAndUpdate(userId, { isBanned: false }, { new: true }).select('-password');
     if (!user) return res.status(404).json({ message: 'Player not found' });
+    invalidateAuthUser(user._id);
     res.json({ message: `${user.username} has been unbanned`, user });
   } catch (err) {
     res.status(500).json({ message: 'Server error' });

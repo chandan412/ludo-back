@@ -5,7 +5,8 @@ const Transaction = require('../models/Transaction');
 const LudoEngine = require('./ludoEngine');
 const jwt = require('jsonwebtoken');
 const { recordQualifyingGame } = require('../utils/referral');
-const { isTokenError } = require('../middleware/auth');
+const { isTokenError, loadAuthUser } = require('../middleware/auth');
+const cache = require('../utils/cache');
 
 const activeRooms = new Map();
 const roomTimers = new Map(); // tracks 2-min auto-abort timers
@@ -467,6 +468,7 @@ async function syncInviteCard(io, roomCode) {
     if (!patch) return;
 
     await ChatMessage.updateOne({ _id: card._id }, { $set: patch });
+    cache.chatHistory.clear();
 
     io.to(CHAT_ROOM).emit('invite-updated', { roomCode: code, ...patch });
   } catch (e) {
@@ -563,6 +565,7 @@ function startWaitingTimer(io, roomCode) {
       game.status = 'aborted';
       game.finishedAt = new Date();
       await game.save();
+      cache.lobby.clear(); // the room just left the lobby list
 
       // Refund creator
       const creator = await User.findById(game.players[0].user);
@@ -955,9 +958,11 @@ module.exports = (io) => {
       const token = socket.handshake.auth.token;
       if (!token) return next(new Error('Authentication required'));
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const user = await User.findById(decoded.id).select('-password');
+      // ⚡ Same cached lookup as the HTTP middleware — a reconnect storm after a
+      // network blip no longer re-reads every user from the database.
+      const user = await loadAuthUser(decoded.id);
       if (!user || user.isBanned) return next(new Error('Unauthorized'));
-      socket.user = user;
+      socket.user = { ...user };
       next();
     } catch (err) {
       // ✅ A DB hiccup during the handshake is NOT a bad token. The client treats
@@ -1018,6 +1023,7 @@ module.exports = (io) => {
           type:     'chat',
           text:     clean,
         });
+        cache.chatHistory.clear();
         io.to(CHAT_ROOM).emit('chat-message', {
           _id:       msg._id.toString(),
           userId:    socket.user._id.toString(),
@@ -1053,6 +1059,7 @@ module.exports = (io) => {
           text:      '',
           status:    'waiting',
         });
+        cache.chatHistory.clear();
         io.to(CHAT_ROOM).emit('chat-message', {
           _id:       msg._id.toString(),
           userId:    socket.user._id.toString(),
@@ -1084,6 +1091,7 @@ module.exports = (io) => {
         if (!socket.user || socket.user.role !== 'admin') return; // only admins may delete
         if (!messageId) return;
         await ChatMessage.findByIdAndDelete(messageId);
+        cache.chatHistory.clear();
         io.to(CHAT_ROOM).emit('chat-deleted', { messageId: messageId.toString() });
       } catch (err) {
         console.error('delete-chat error:', err);
@@ -1762,6 +1770,7 @@ module.exports = (io) => {
               fresh.status = 'aborted';
               fresh.finishedAt = new Date();
               await fresh.save();
+              cache.lobby.clear(); // the room just left the lobby list
 
               const creator = await User.findById(fresh.players[0].user);
               if (creator) {

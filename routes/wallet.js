@@ -294,12 +294,17 @@ router.post('/recharge-request', auth, async (req, res) => {
       });
     }
 
+    // Read fresh: req.user comes from the auth cache and deliberately carries no
+    // balance (see middleware/auth.js).
+    const me = await User.findById(req.user._id).select('balance').lean();
+    const currentBalance = me?.balance || 0;
+
     const transaction = await Transaction.create({
       user: req.user._id,
       type: 'recharge',
       amount,
-      balanceBefore: req.user.balance,
-      balanceAfter: req.user.balance,
+      balanceBefore: currentBalance,
+      balanceAfter: currentBalance,
       status: 'pending',
       rechargeNote: note
     });

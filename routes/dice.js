@@ -23,6 +23,24 @@ const diceSocket  = require('../socket/diceSocket');
 // ============================================================================
 
 // ----------------------------------------------------------------------------
+// GET /api/dice/status
+//
+// ⚡ Just the on/off switch, for the Dashboard card. The Dashboard used to call
+// /current for this, which costs a wallet read, a round lookup and a bet lookup
+// on every Dashboard visit only to read one boolean. getConfig() is cached, so
+// this is normally zero database calls.
+// ----------------------------------------------------------------------------
+router.get('/status', auth, async (req, res) => {
+  try {
+    const cfg = await getConfig();
+    res.json({ enabled: cfg.enabled });
+  } catch (err) {
+    console.error('[dice] /status error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ----------------------------------------------------------------------------
 // GET /api/dice/current
 // ----------------------------------------------------------------------------
 router.get('/current', auth, async (req, res) => {
