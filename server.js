@@ -144,7 +144,14 @@ app.use(
       'Content-Type',
       'Authorization',
       'x-payment-automation-secret'
-    ]
+    ],
+
+    // ⚡ Let browsers remember the preflight answer for 2 hours (Chrome's cap).
+    // Without this header Chrome re-asks every 5 SECONDS, so almost every
+    // polled API call cost the phone an extra round trip to the server first:
+    // in Railway's logs, 37% of all requests were these OPTIONS preflights,
+    // each adding ~95ms from India before the real request could even start.
+    maxAge: 7200
   })
 );
 
